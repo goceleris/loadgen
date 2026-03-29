@@ -34,12 +34,12 @@ type BenchmarkConfig struct {
 
 // SystemMetrics holds server-side and client-side resource metrics.
 type SystemMetrics struct {
-	ServerCPUPercent     float64                  `json:"server_cpu_percent,omitempty"`
-	ServerCPUUserPercent float64                  `json:"server_cpu_user_percent,omitempty"`
-	ServerCPUSysPercent  float64                  `json:"server_cpu_sys_percent,omitempty"`
-	ServerMemoryRSSMB    float64                  `json:"server_memory_rss_mb,omitempty"`
-	ClientCPUPercent     float64                  `json:"client_cpu_percent,omitempty"`
-	GCPauses             *GCPauseStats            `json:"server_gc,omitempty"`
+	ServerCPUPercent     float64                   `json:"server_cpu_percent,omitempty"`
+	ServerCPUUserPercent float64                   `json:"server_cpu_user_percent,omitempty"`
+	ServerCPUSysPercent  float64                   `json:"server_cpu_sys_percent,omitempty"`
+	ServerMemoryRSSMB    float64                   `json:"server_memory_rss_mb,omitempty"`
+	ClientCPUPercent     float64                   `json:"client_cpu_percent,omitempty"`
+	GCPauses             *GCPauseStats             `json:"server_gc,omitempty"`
 	Timeseries           []loadgen.TimeseriesPoint `json:"timeseries,omitempty"`
 }
 
@@ -216,14 +216,14 @@ func formatBytes(b float64) string {
 
 func formatFloat(f float64) string {
 	if f >= 100 {
-		return java_like_format(f, 0)
+		return javaLikeFormat(f, 0)
 	} else if f >= 10 {
-		return java_like_format(f, 1)
+		return javaLikeFormat(f, 1)
 	}
-	return java_like_format(f, 2)
+	return javaLikeFormat(f, 2)
 }
 
-func java_like_format(f float64, precision int) string {
+func javaLikeFormat(f float64, precision int) string {
 	format := "%." + string('0'+byte(precision)) + "f"
 	return sprintf(format, f)
 }

@@ -93,15 +93,15 @@ func main() {
 	}
 
 	cfg := loadgen.Config{
-		URL:                *url,
-		Method:             *method,
-		Body:               body,
-		Duration:           *duration,
-		Warmup:             *warmup,
-		Connections:        *connections,
-		Workers:            w,
-		DisableKeepAlive:   *connClose,
-		HTTP2:              *h2,
+		URL:              *url,
+		Method:           *method,
+		Body:             body,
+		Duration:         *duration,
+		Warmup:           *warmup,
+		Connections:      *connections,
+		Workers:          w,
+		DisableKeepAlive: *connClose,
+		HTTP2:            *h2,
 		HTTP2Options: loadgen.HTTP2Options{
 			Connections: *h2Conns,
 			MaxStreams:  *h2Streams,

@@ -15,9 +15,9 @@ import (
 )
 
 func TestBenchmarkerSuccess(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -55,9 +55,9 @@ func TestBenchmarkerSuccess(t *testing.T) {
 }
 
 func TestBenchmarkerWarmup(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -96,9 +96,9 @@ func TestBenchmarkerWarmup(t *testing.T) {
 }
 
 func TestBenchmarkerContextCancellation(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -141,9 +141,9 @@ func TestBenchmarkerContextCancellation(t *testing.T) {
 }
 
 func TestBenchmarkerErrors(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(500)
-		w.Write([]byte("Internal Server Error"))
+		_, _ = w.Write([]byte("Internal Server Error"))
 	}))
 	defer srv.Close()
 
@@ -172,9 +172,9 @@ func TestBenchmarkerErrors(t *testing.T) {
 }
 
 func TestBenchmarkerTimeseries(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -207,9 +207,9 @@ func TestBenchmarkerTimeseries(t *testing.T) {
 }
 
 func TestBenchmarkerOnProgress(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -222,7 +222,7 @@ func TestBenchmarkerOnProgress(t *testing.T) {
 		Connections: 4,
 		Workers:     4,
 		Warmup:      0,
-		OnProgress: func(elapsed time.Duration, snapshot Result) {
+		OnProgress: func(_ time.Duration, _ Result) {
 			progressCalls.Add(1)
 		},
 	}
@@ -244,9 +244,9 @@ func TestBenchmarkerOnProgress(t *testing.T) {
 }
 
 func TestBenchmarkerMaxRPS(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	}))
 	defer srv.Close()
 
@@ -284,7 +284,7 @@ type mockClient struct {
 	calls atomic.Int64
 }
 
-func (m *mockClient) DoRequest(ctx context.Context, workerID int) (int, error) {
+func (m *mockClient) DoRequest(_ context.Context, _ int) (int, error) {
 	m.calls.Add(1)
 	// Simulate a tiny bit of work
 	time.Sleep(100 * time.Microsecond)
@@ -346,10 +346,10 @@ func TestBenchmarkerValidation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.name, func(st *testing.T) {
 			_, err := New(tt.cfg)
 			if err == nil {
-				t.Errorf("expected error for %s config", tt.name)
+				st.Errorf("expected error for %s config", tt.name)
 			}
 		})
 	}
@@ -358,9 +358,9 @@ func TestBenchmarkerValidation(t *testing.T) {
 func TestBenchmarkerH2(t *testing.T) {
 	// Start an h2c server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	})
 
 	h2s := &http2.Server{}
@@ -429,7 +429,7 @@ func TestBenchmarkerH2Validation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.name, func(_ *testing.T) {
 			// New() applies defaults for zero values, so these should succeed.
 			// We test that the defaults are applied correctly.
 			b, err := New(tt.cfg)

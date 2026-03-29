@@ -18,10 +18,10 @@ import (
 // testH2Cfg builds a Config suitable for newH2Client in tests.
 func testH2Cfg(method string, headers map[string]string, body []byte, numConns, maxStreams int) Config {
 	return Config{
-		Method: method,
+		Method:  method,
 		Headers: headers,
-		Body:   body,
-		HTTP2:  true,
+		Body:    body,
+		HTTP2:   true,
 		HTTP2Options: HTTP2Options{
 			Connections: numConns,
 			MaxStreams:  maxStreams,
@@ -42,19 +42,19 @@ func startH2CServer(t *testing.T, maxStreams uint32) (host, port string, cleanup
 	body2MB := make([]byte, 2<<20)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/simple", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/simple", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("OK"))
 	})
-	mux.HandleFunc("/medium", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/medium", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write(make([]byte, 64*1024))
 	})
-	mux.HandleFunc("/large", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/large", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write(body1MB)
 	})
-	mux.HandleFunc("/xlarge", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/xlarge", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 		_, _ = w.Write(body2MB)
 	})

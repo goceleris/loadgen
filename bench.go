@@ -1,4 +1,4 @@
-// Package bench provides a high-performance HTTP benchmarking tool.
+// Package loadgen provides a high-performance HTTP benchmarking tool.
 package loadgen
 
 import (
