@@ -429,7 +429,7 @@ func TestBenchmarkerH2Validation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.name, func(_ *testing.T) {
 			// New() applies defaults for zero values, so these should succeed.
 			// We test that the defaults are applied correctly.
 			b, err := New(tt.cfg)
