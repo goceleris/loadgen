@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to Go Package Registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Verify module
+        run: |
+          go mod verify
+          go build ./...
+          go vet ./...
+      - name: Request pkg.go.dev indexing
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          curl -s "https://proxy.golang.org/github.com/goceleris/loadgen/@v/${TAG}.info" || true
+          curl -s "https://sum.golang.org/lookup/github.com/goceleris/loadgen@${TAG}" || true
+          echo "Published github.com/goceleris/loadgen@${TAG}"
