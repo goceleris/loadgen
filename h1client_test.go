@@ -34,7 +34,7 @@ func startH1Server(t *testing.T, handler func(conn net.Conn)) (host, port string
 		}
 	}()
 	h, p, _ := net.SplitHostPort(ln.Addr().String())
-	return h, p, func() { ln.Close(); <-done }
+	return h, p, func() { _ = ln.Close(); <-done }
 }
 
 // readH1Request reads a full HTTP/1.1 request (request line + headers + optional body).
@@ -54,15 +54,15 @@ func readH1Request(r *bufio.Reader) bool {
 // testH1Cfg builds a Config suitable for newH1Client in tests.
 func testH1Cfg(keepAlive bool, workers int) Config {
 	cfg := Config{
-		Method:          "GET",
+		Method:           "GET",
 		DisableKeepAlive: !keepAlive,
-		Workers:         workers,
-		Connections:     workers,
-		DialTimeout:     5 * time.Second,
-		ReadBufferSize:  256 * 1024,
-		WriteBufferSize: 256 * 1024,
-		MaxResponseSize: 10 << 20, // 10MB
-		PoolSize:        16,
+		Workers:          workers,
+		Connections:      workers,
+		DialTimeout:      5 * time.Second,
+		ReadBufferSize:   256 * 1024,
+		WriteBufferSize:  256 * 1024,
+		MaxResponseSize:  10 << 20, // 10MB
+		PoolSize:         16,
 	}
 	return cfg
 }
@@ -73,7 +73,7 @@ func TestH1KeepAlive(t *testing.T) {
 	var mu sync.Mutex
 
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		mu.Lock()
 		connCount++
 		mu.Unlock()
@@ -117,13 +117,13 @@ func TestH1KeepAlive(t *testing.T) {
 
 func TestH1ConnectionClose(t *testing.T) {
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		if !readH1Request(reader) {
 			return
 		}
 		resp := "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK"
-		conn.Write([]byte(resp))
+		_, _ = conn.Write([]byte(resp))
 		// Server closes after one response (Connection: close)
 	})
 	defer cleanup()
@@ -151,7 +151,7 @@ func TestH1ConnectionClose(t *testing.T) {
 func TestH1ContentLength(t *testing.T) {
 	body := "Hello, World! This is a test response body."
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
@@ -183,7 +183,7 @@ func TestH1ContentLength(t *testing.T) {
 func TestH1Chunked(t *testing.T) {
 	// The chunks: "Hello" (5 bytes) + " World" (6 bytes) = 11 bytes total
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
@@ -223,7 +223,7 @@ func TestH1Reconnect(t *testing.T) {
 	var requestCount atomic.Int64
 
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 
 		if !readH1Request(reader) {
@@ -232,7 +232,7 @@ func TestH1Reconnect(t *testing.T) {
 		requestCount.Add(1)
 
 		resp := "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK"
-		conn.Write([]byte(resp))
+		_, _ = conn.Write([]byte(resp))
 	})
 	defer cleanup()
 
@@ -265,14 +265,14 @@ func TestH1LargeResponse(t *testing.T) {
 	largeBody := bytes.Repeat([]byte("X"), bodySize)
 
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
 				return
 			}
 			header := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", bodySize)
-			conn.Write([]byte(header))
+			_, _ = conn.Write([]byte(header))
 			// Write body in chunks to avoid buffering the entire thing
 			written := 0
 			for written < bodySize {
@@ -307,7 +307,7 @@ func TestH1LargeResponse(t *testing.T) {
 
 func TestH1ConcurrentWorkers(t *testing.T) {
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
@@ -353,7 +353,7 @@ func TestH1ConcurrentWorkers(t *testing.T) {
 
 func TestH1ErrorRecovery(t *testing.T) {
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
@@ -385,14 +385,14 @@ func TestH1ErrorRecovery(t *testing.T) {
 func TestH1MaxResponseSize(t *testing.T) {
 	const bodySize = 1024
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		if !readH1Request(reader) {
 			return
 		}
 		body := bytes.Repeat([]byte("X"), bodySize)
 		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", bodySize, body)
-		conn.Write([]byte(resp))
+		_, _ = conn.Write([]byte(resp))
 		// Close connection after sending so drainH1Response gets EOF.
 	})
 	defer cleanup()
@@ -416,7 +416,7 @@ func TestH1MaxResponseSize(t *testing.T) {
 
 func TestH1MaxResponseSizeChunked(t *testing.T) {
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		if !readH1Request(reader) {
 			return
@@ -430,7 +430,7 @@ func TestH1MaxResponseSizeChunked(t *testing.T) {
 		chunk2 := strings.Repeat("Y", 500)
 		sb.WriteString(fmt.Sprintf("%x\r\n%s\r\n", len(chunk2), chunk2))
 		sb.WriteString("0\r\n\r\n")
-		io.WriteString(conn, sb.String())
+		_, _ = io.WriteString(conn, sb.String())
 		// Close after sending so any drain gets EOF.
 	})
 	defer cleanup()
@@ -454,7 +454,7 @@ func TestH1MaxResponseSizeChunked(t *testing.T) {
 
 func TestH1ZeroContentLength(t *testing.T) {
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {
@@ -487,7 +487,7 @@ func TestH1MultipleWorkersConnectionIsolation(t *testing.T) {
 	// Each keep-alive worker should have its own connection.
 	// We verify by checking that no panics or data races occur.
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		reader := bufio.NewReader(conn)
 		for {
 			if !readH1Request(reader) {

@@ -18,7 +18,7 @@ import (
 // matches wrk's behavior of having many in-flight reconnects per thread.
 type h1Client struct {
 	conns           []*h1Conn
-	connCounters    []int  // per-worker round-robin counter (no sync needed)
+	connCounters    []int // per-worker round-robin counter (no sync needed)
 	addr            string
 	reqBuf          []byte // pre-formatted request bytes (immutable)
 	keepAlive       bool
