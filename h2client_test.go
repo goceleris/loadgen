@@ -15,6 +15,24 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
+// testH2Cfg builds a Config suitable for newH2Client in tests.
+func testH2Cfg(method string, headers map[string]string, body []byte, numConns, maxStreams int) Config {
+	return Config{
+		Method: method,
+		Headers: headers,
+		Body:   body,
+		HTTP2:  true,
+		HTTP2Options: HTTP2Options{
+			Connections: numConns,
+			MaxStreams:  maxStreams,
+		},
+		DialTimeout:     10 * time.Second,
+		ReadBufferSize:  2 * 1024 * 1024,
+		WriteBufferSize: 2 * 1024 * 1024,
+		MaxResponseSize: -1,
+	}
+}
+
 // startH2CServer creates a local h2c server with endpoints of varying response sizes
 // to exercise H2 flow control at different pressures.
 func startH2CServer(t *testing.T, maxStreams uint32) (host, port string, cleanup func()) {
@@ -77,7 +95,7 @@ func stressH2(t *testing.T, client *h2Client, workers int, duration time.Duratio
 		go func(id int) {
 			defer wg.Done()
 			for benchCtx.Err() == nil {
-				_, err := client.doRequest(benchCtx, id)
+				_, err := client.DoRequest(benchCtx, id)
 				if err != nil {
 					if benchCtx.Err() != nil {
 						return
@@ -111,16 +129,16 @@ func TestH2ClientBasic(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 100)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/simple", "GET", nil, nil, 1, 100)
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", nil, nil, 1, 100))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err = client.doRequest(ctx, 0)
+	_, err = client.DoRequest(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,11 +150,11 @@ func TestH2StressSimple(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 250)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/simple", "GET", nil, nil, 4, 200)
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", nil, nil, 4, 200))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ok, errs := stressH2(t, client, 200, 5*time.Second)
 	t.Logf("simple: %d OK, %d errors (%.1f%% error rate)", ok, errs, float64(errs)/float64(ok+errs)*100)
@@ -147,11 +165,11 @@ func TestH2StressMedium(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 200)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/medium", "GET", nil, nil, 4, 150)
+	client, err := newH2Client(host, port, "/medium", testH2Cfg("GET", nil, nil, 4, 150))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ok, errs := stressH2(t, client, 150, 5*time.Second)
 	t.Logf("medium (64KB): %d OK, %d errors", ok, errs)
@@ -164,11 +182,11 @@ func TestH2StressLargeResponse(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 100)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/large", "GET", nil, nil, 4, 100)
+	client, err := newH2Client(host, port, "/large", testH2Cfg("GET", nil, nil, 4, 100))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ok, errs := stressH2(t, client, 100, 10*time.Second)
 	t.Logf("large (1MB): %d OK, %d errors", ok, errs)
@@ -181,11 +199,11 @@ func TestH2StressXLargeResponse(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 50)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/xlarge", "GET", nil, nil, 4, 50)
+	client, err := newH2Client(host, port, "/xlarge", testH2Cfg("GET", nil, nil, 4, 50))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ok, errs := stressH2(t, client, 50, 15*time.Second)
 	t.Logf("xlarge (2MB): %d OK, %d errors", ok, errs)
@@ -197,11 +215,11 @@ func TestH2StressMultiConn(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 250)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/medium", "GET", nil, nil, 8, 200)
+	client, err := newH2Client(host, port, "/medium", testH2Cfg("GET", nil, nil, 8, 200))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ok, errs := stressH2(t, client, 256, 10*time.Second)
 	t.Logf("multi-conn (8 conns, 256 workers): %d OK, %d errors", ok, errs)
@@ -216,7 +234,7 @@ func TestH2StressMixedEndpoints(t *testing.T) {
 	paths := []string{"/simple", "/medium", "/large"}
 	clients := make([]*h2Client, len(paths))
 	for i, path := range paths {
-		c, err := newH2Client(host, port, path, "GET", nil, nil, 2, 100)
+		c, err := newH2Client(host, port, path, testH2Cfg("GET", nil, nil, 2, 100))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +242,7 @@ func TestH2StressMixedEndpoints(t *testing.T) {
 	}
 	defer func() {
 		for _, c := range clients {
-			c.close()
+			c.Close()
 		}
 	}()
 
@@ -240,7 +258,7 @@ func TestH2StressMixedEndpoints(t *testing.T) {
 			go func(c *h2Client, id int) {
 				defer wg.Done()
 				for benchCtx.Err() == nil {
-					_, err := c.doRequest(benchCtx, id)
+					_, err := c.DoRequest(benchCtx, id)
 					if err != nil {
 						if benchCtx.Err() != nil {
 							return
@@ -271,18 +289,18 @@ func TestH2StressMixedEndpoints(t *testing.T) {
 	}
 }
 
-// TestH2ContextCancellation verifies that doRequest exits promptly when the
+// TestH2ContextCancellation verifies that DoRequest exits promptly when the
 // context is cancelled, even if writeLoop is slow. This is the exact scenario
 // that caused the warmup hang: workers waiting for errCh with no ctx.Done().
 func TestH2ContextCancellation(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 100)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/simple", "GET", nil, nil, 1, 100)
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", nil, nil, 1, 100))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	// Start requests, then cancel context quickly
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -294,7 +312,7 @@ func TestH2ContextCancellation(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for ctx.Err() == nil {
-				_, _ = client.doRequest(ctx, id)
+				_, _ = client.DoRequest(ctx, id)
 			}
 		}(i)
 	}
@@ -310,26 +328,31 @@ func TestH2ContextCancellation(t *testing.T) {
 	}
 }
 
-// TestH2WarmupDoesNotHang simulates the warmup→benchmark flow using the
+// TestH2WarmupDoesNotHang simulates the warmup->benchmark flow using the
 // Benchmarker. Warmup must complete even if writeLoop is slow, because
-// warmup never calls close() on connections.
+// warmup never calls Close() on connections.
 func TestH2WarmupDoesNotHang(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 200)
 	defer cleanup()
 
 	cfg := Config{
-		URL:           fmt.Sprintf("http://%s:%s/simple", host, port),
-		Method:        "GET",
-		Duration:      2 * time.Second,
-		Workers:       100,
-		WarmupTime:    1 * time.Second,
-		KeepAlive:     true,
-		H2C:           true,
-		H2Connections: 4,
-		H2MaxStreams:  100,
+		URL:              fmt.Sprintf("http://%s:%s/simple", host, port),
+		Method:           "GET",
+		Duration:         2 * time.Second,
+		Workers:          100,
+		Warmup:           1 * time.Second,
+		DisableKeepAlive: false,
+		HTTP2:            true,
+		HTTP2Options: HTTP2Options{
+			Connections: 4,
+			MaxStreams:  100,
+		},
 	}
 
-	benchmarker := New(cfg)
+	benchmarker, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -350,11 +373,11 @@ func TestH2StreamIDExhaustion(t *testing.T) {
 	host, port, cleanup := startH2CServer(t, 100)
 	defer cleanup()
 
-	client, err := newH2Client(host, port, "/simple", "GET", nil, nil, 1, 100)
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", nil, nil, 1, 100))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	// Fast-forward stream ID close to max
 	client.conns[0].nextStreamID.Store(0x7FFFFFF0)
@@ -364,7 +387,7 @@ func TestH2StreamIDExhaustion(t *testing.T) {
 
 	// Should eventually get "stream ID exhausted" error, not hang
 	for range 20 {
-		_, err := client.doRequest(ctx, 0)
+		_, err := client.DoRequest(ctx, 0)
 		if err != nil {
 			return // expected
 		}
@@ -433,18 +456,18 @@ func TestH2WithRealisticHeaders(t *testing.T) {
 		"X-Forwarded-For":  "203.0.113.195, 70.41.3.18",
 	}
 
-	client, err := newH2Client(host, port, "/simple", "GET", headers, nil, 2, 100)
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", headers, nil, 2, 100))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.close()
+	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	var ok, errs int
 	for range 1000 {
-		_, err := client.doRequest(ctx, 0)
+		_, err := client.DoRequest(ctx, 0)
 		if err != nil {
 			errs++
 		} else {
