@@ -3,6 +3,7 @@ package loadgen
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -181,27 +182,47 @@ func extractStatus(headerBlock []byte) int {
 }
 
 // newH2Client creates a new zero-alloc HTTP/2 client.
-func newH2Client(host, port, path, method string, headers map[string]string, body []byte, numConns, maxStreams int) (*h2Client, error) {
+func newH2Client(host, port, path string, cfg Config) (*h2Client, error) {
 	addr := net.JoinHostPort(host, port)
-	headerBlock := buildHPACKHeaders(method, host, port, path, headers, len(body))
-	hasBody := len(body) > 0
+	scheme := cfg.scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	headerBlock := buildHPACKHeaders(cfg.Method, host, port, path, cfg.Headers, len(cfg.Body), scheme)
+	hasBody := len(cfg.Body) > 0
+	numConns := cfg.HTTP2Options.Connections
+	maxStreams := cfg.HTTP2Options.MaxStreams
+
+	// Build TLS config for HTTPS connections
+	var tlsCfg *tls.Config
+	if scheme == "https" {
+		if cfg.TLSConfig != nil {
+			tlsCfg = cfg.TLSConfig.Clone()
+		} else {
+			tlsCfg = &tls.Config{}
+		}
+		tlsCfg.NextProtos = []string{"h2"}
+		if cfg.InsecureSkipVerify {
+			tlsCfg.InsecureSkipVerify = true
+		}
+	}
 
 	conns := make([]*h2Conn, numConns)
 	for i := range numConns {
-		hc, err := dialH2(addr, maxStreams)
+		hc, err := dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
 		if err != nil {
 			for j := range i {
 				conns[j].closeConn()
 			}
-			return nil, fmt.Errorf("h2client: dial connection %d: %w", i, err)
+			return nil, fmt.Errorf("h2client: dial conn[%d]: %w", i, err)
 		}
 		conns[i] = hc
 	}
 
 	var payload []byte
 	if hasBody {
-		payload = make([]byte, len(body))
-		copy(payload, body)
+		payload = make([]byte, len(cfg.Body))
+		copy(payload, cfg.Body)
 	}
 
 	return &h2Client{
@@ -226,13 +247,18 @@ var h2HopByHopHeaders = map[string]struct{}{
 // buildHPACKHeaders pre-encodes the HPACK header block for reuse.
 // Hop-by-hop headers (Connection, Keep-Alive, etc.) are automatically
 // stripped per RFC 9113 Section 8.2.2.
-func buildHPACKHeaders(method, host, port, path string, headers map[string]string, bodyLen int) []byte {
+// The optional schemes parameter overrides the :scheme pseudo-header (default "http").
+func buildHPACKHeaders(method, host, port, path string, headers map[string]string, bodyLen int, schemes ...string) []byte {
+	s := "http"
+	if len(schemes) > 0 && schemes[0] != "" {
+		s = schemes[0]
+	}
 	var w hpackWriter
 	enc := hpack.NewEncoder(&w)
 	enc.SetMaxDynamicTableSizeLimit(0)
 
 	_ = enc.WriteField(hpack.HeaderField{Name: ":method", Value: method})
-	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "http"})
+	_ = enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: s})
 	_ = enc.WriteField(hpack.HeaderField{Name: ":authority", Value: net.JoinHostPort(host, port)})
 	_ = enc.WriteField(hpack.HeaderField{Name: ":path", Value: path})
 
@@ -264,15 +290,29 @@ func (w *hpackWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func dialH2(addr string, maxStreams int) (*h2Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024)
-		_ = tcpConn.SetWriteBuffer(2 * 1024 * 1024)
+func dialH2(addr, scheme string, maxStreams int, dialTimeout time.Duration, readBufSize, writeBufSize int, tlsCfg *tls.Config) (*h2Conn, error) {
+	var conn net.Conn
+	var err error
+	if scheme == "https" {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(readBufSize)
+			_ = tcpConn.SetWriteBuffer(writeBufSize)
+		}
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, dialTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(readBufSize)
+			_ = tcpConn.SetWriteBuffer(writeBufSize)
+		}
 	}
 
 	if _, err := conn.Write([]byte(h2ClientPreface)); err != nil {
@@ -573,15 +613,15 @@ func (hc *h2Conn) readLoop() {
 	}
 }
 
-// doRequest sends an HTTP/2 request and waits for the response.
+// DoRequest sends an HTTP/2 request and waits for the response.
 // Fire-and-forget to writeLoop: no resultCh round-trip. Workers wait only on respCh,
 // which receives from either writeLoop (on error) or readLoop (on response).
-func (c *h2Client) doRequest(ctx context.Context, workerID int) (int, error) {
+func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	idx := workerID % len(c.conns)
 	hc := c.conns[idx]
 
 	if hc.closed.Load() {
-		return 0, fmt.Errorf("h2client: connection closed")
+		return 0, fmt.Errorf("h2client: conn[%d] connection closed", idx)
 	}
 
 	// Acquire stream semaphore
@@ -614,7 +654,7 @@ func (c *h2Client) doRequest(ctx context.Context, workerID int) (int, error) {
 	case <-hc.done:
 		hc.chanPool.Put(chPtr)
 		hc.streamSem <- struct{}{}
-		return 0, fmt.Errorf("h2client: connection closing")
+		return 0, fmt.Errorf("h2client: conn[%d] connection closing", idx)
 	case <-ctx.Done():
 		hc.chanPool.Put(chPtr)
 		hc.streamSem <- struct{}{}
@@ -630,7 +670,7 @@ func (c *h2Client) doRequest(ctx context.Context, workerID int) (int, error) {
 			return 0, resp.err
 		}
 		if resp.status >= 400 {
-			return resp.bytesRead, fmt.Errorf("status %d", resp.status)
+			return resp.bytesRead, fmt.Errorf("h2client: conn[%d] status %d", idx, resp.status)
 		}
 		return resp.bytesRead, nil
 	case <-ctx.Done():
@@ -642,7 +682,7 @@ func (c *h2Client) doRequest(ctx context.Context, workerID int) (int, error) {
 		return 0, ctx.Err()
 	case <-hc.done:
 		hc.streamSem <- struct{}{}
-		return 0, fmt.Errorf("h2client: connection closing")
+		return 0, fmt.Errorf("h2client: conn[%d] connection closing", idx)
 	}
 }
 
@@ -663,8 +703,8 @@ func writeDataFrames(framer *h2Framer, streamID uint32, data []byte, maxFrameSiz
 	return nil
 }
 
-// close closes all connections.
-func (c *h2Client) close() {
+// Close closes all connections.
+func (c *h2Client) Close() {
 	for _, hc := range c.conns {
 		hc.closeConn()
 	}

@@ -3,6 +3,7 @@ package loadgen
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -16,62 +17,96 @@ import (
 // the worker can use the next. This amortizes reconnect latency and
 // matches wrk's behavior of having many in-flight reconnects per thread.
 type h1Client struct {
-	conns          []*h1Conn
-	connCounters   []int  // per-worker round-robin counter (no sync needed)
-	addr           string
-	reqBuf         []byte // pre-formatted request bytes (immutable)
-	keepAlive      bool
-	connsPerWorker int
+	conns           []*h1Conn
+	connCounters    []int  // per-worker round-robin counter (no sync needed)
+	addr            string
+	reqBuf          []byte // pre-formatted request bytes (immutable)
+	keepAlive       bool
+	connsPerWorker  int
+	dialTimeout     time.Duration
+	readBufferSize  int
+	writeBufferSize int
+	maxResponseSize int64
+	scheme          string
+	tlsConfig       *tls.Config
 }
 
 // h1Conn is a single persistent TCP connection with a buffered reader.
 // Owned by exactly one worker — no synchronization needed.
 type h1Conn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	addr   string
+	conn            net.Conn
+	reader          *bufio.Reader
+	addr            string
+	dialTimeout     time.Duration
+	readBufferSize  int
+	writeBufferSize int
+	scheme          string
+	tlsConfig       *tls.Config
 }
 
-// connsPerWorkerClose is the number of connections each worker owns in
-// Connection: close mode. While one connection is reconnecting (~2-4ms
-// round-trip), the worker processes requests on the others. Must be high
-// enough that reconnect latency is fully hidden.
-const connsPerWorkerClose = 16
-
 // newH1Client creates a new zero-alloc HTTP/1.1 client.
-func newH1Client(host, port, path, method string, headers map[string]string, body []byte, numWorkers int, keepAlive bool) (*h1Client, error) {
+func newH1Client(host, port, path string, cfg Config) (*h1Client, error) {
 	addr := net.JoinHostPort(host, port)
-	reqBuf := buildH1Request(method, path, host, port, headers, body, keepAlive)
+	keepAlive := !cfg.DisableKeepAlive
+	reqBuf := buildH1Request(cfg.Method, path, host, port, cfg.Headers, cfg.Body, keepAlive)
+	scheme := cfg.scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	// Build TLS config for HTTPS connections
+	var tlsCfg *tls.Config
+	if scheme == "https" {
+		if cfg.TLSConfig != nil {
+			tlsCfg = cfg.TLSConfig.Clone()
+		} else {
+			tlsCfg = &tls.Config{}
+		}
+		if cfg.InsecureSkipVerify {
+			tlsCfg.InsecureSkipVerify = true
+		}
+	}
 
 	connsPerWorker := 1
 	if !keepAlive {
-		connsPerWorker = connsPerWorkerClose
+		connsPerWorker = cfg.PoolSize
 	}
-	numConns := numWorkers * connsPerWorker
+	numConns := cfg.Workers * connsPerWorker
 
 	conns := make([]*h1Conn, numConns)
 	for i := range numConns {
-		conn, err := dialH1(addr)
+		conn, err := dialH1(addr, scheme, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
 		if err != nil {
 			for j := range i {
 				_ = conns[j].conn.Close()
 			}
-			return nil, fmt.Errorf("h1client: dial connection %d: %w", i, err)
+			return nil, fmt.Errorf("h1client: dial conn[%d]: %w", i, err)
 		}
 		conns[i] = &h1Conn{
-			conn:   conn,
-			reader: bufio.NewReaderSize(conn, 4096),
-			addr:   addr,
+			conn:            conn,
+			reader:          bufio.NewReaderSize(conn, 4096),
+			addr:            addr,
+			dialTimeout:     cfg.DialTimeout,
+			readBufferSize:  cfg.ReadBufferSize,
+			writeBufferSize: cfg.WriteBufferSize,
+			scheme:          scheme,
+			tlsConfig:       tlsCfg,
 		}
 	}
 
 	return &h1Client{
-		conns:          conns,
-		connCounters:   make([]int, numWorkers),
-		addr:           addr,
-		reqBuf:         reqBuf,
-		keepAlive:      keepAlive,
-		connsPerWorker: connsPerWorker,
+		conns:           conns,
+		connCounters:    make([]int, cfg.Workers),
+		addr:            addr,
+		reqBuf:          reqBuf,
+		keepAlive:       keepAlive,
+		connsPerWorker:  connsPerWorker,
+		dialTimeout:     cfg.DialTimeout,
+		readBufferSize:  cfg.ReadBufferSize,
+		writeBufferSize: cfg.WriteBufferSize,
+		maxResponseSize: cfg.MaxResponseSize,
+		scheme:          scheme,
+		tlsConfig:       tlsCfg,
 	}, nil
 }
 
@@ -126,25 +161,37 @@ func buildH1Request(method, path, host, port string, headers map[string]string, 
 	return buf
 }
 
-func dialH1(addr string) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBufSize int, tlsCfg *tls.Config) (net.Conn, error) {
+	if scheme == "https" {
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(readBufSize)
+			_ = tcpConn.SetWriteBuffer(writeBufSize)
+		}
+		return conn, nil
+	}
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetReadBuffer(256 * 1024)
-		_ = tcpConn.SetWriteBuffer(256 * 1024)
+		_ = tcpConn.SetReadBuffer(readBufSize)
+		_ = tcpConn.SetWriteBuffer(writeBufSize)
 	}
 	return conn, nil
 }
 
-// doRequest sends a pre-formatted HTTP/1.1 request and reads the response.
+// DoRequest sends a pre-formatted HTTP/1.1 request and reads the response.
 // Zero contention: each workerID maps to dedicated connection(s).
 // For keep-alive: 1 connection per worker.
 // For Connection: close: connsPerWorker connections, round-robin selection
 // so reconnects are amortized across the pool.
-func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
+func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	var hc *h1Conn
 	if c.connsPerWorker == 1 {
 		hc = c.conns[workerID%len(c.conns)]
@@ -159,6 +206,8 @@ func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
 		hc = c.conns[base+(c.connCounters[workerID]%c.connsPerWorker)]
 	}
 
+	connIdx := workerID % len(c.conns)
+
 	// Write request — single syscall for pre-formatted bytes
 	_, err := hc.conn.Write(c.reqBuf)
 	if err != nil {
@@ -167,10 +216,10 @@ func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
 		}
 		// Reconnect and retry once
 		if reconnErr := hc.reconnect(); reconnErr != nil {
-			return 0, fmt.Errorf("h1client: reconnect failed: %w", reconnErr)
+			return 0, fmt.Errorf("h1client: conn[%d] reconnect failed: %w", connIdx, reconnErr)
 		}
 		if _, err = hc.conn.Write(c.reqBuf); err != nil {
-			return 0, fmt.Errorf("h1client: write after reconnect: %w", err)
+			return 0, fmt.Errorf("h1client: conn[%d] write after reconnect: %w", connIdx, err)
 		}
 	}
 
@@ -180,16 +229,16 @@ func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
-		return 0, fmt.Errorf("h1client: read status: %w", err)
+		return 0, fmt.Errorf("h1client: conn[%d] read status: %w", connIdx, err)
 	}
 
 	if len(statusLine) < 12 {
-		return 0, fmt.Errorf("h1client: short status line")
+		return 0, fmt.Errorf("h1client: conn[%d] short status line", connIdx)
 	}
 	statusCode := parseStatusCode(statusLine[9:12])
 	if statusCode >= 400 {
 		n := drainH1Response(hc.reader)
-		return n, fmt.Errorf("status %d", statusCode)
+		return n, fmt.Errorf("h1client: conn[%d] status %d", connIdx, statusCode)
 	}
 
 	// Read headers, find Content-Length
@@ -199,7 +248,7 @@ func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
 	for {
 		line, err := hc.reader.ReadSlice('\n')
 		if err != nil {
-			return 0, fmt.Errorf("h1client: read header: %w", err)
+			return 0, fmt.Errorf("h1client: conn[%d] read header: %w", connIdx, err)
 		}
 		if len(line) <= 2 {
 			break
@@ -219,17 +268,22 @@ func (c *h1Client) doRequest(ctx context.Context, workerID int) (int, error) {
 	// Read body
 	totalRead := 0
 	if contentLength >= 0 {
+		// MaxResponseSize enforcement for content-length responses
+		if c.maxResponseSize > 0 && int64(contentLength) > c.maxResponseSize {
+			drainH1Response(hc.reader)
+			return 0, fmt.Errorf("h1client: conn[%d] response body %d bytes exceeds MaxResponseSize %d", connIdx, contentLength, c.maxResponseSize)
+		}
 		totalRead = contentLength
 		if contentLength > 0 {
 			discarded, err := hc.reader.Discard(contentLength)
 			if err != nil {
-				return discarded, fmt.Errorf("h1client: discard body: %w", err)
+				return discarded, fmt.Errorf("h1client: conn[%d] discard body: %w", connIdx, err)
 			}
 		}
 	} else if chunked {
-		totalRead, err = readChunked(hc.reader)
+		totalRead, err = readChunkedWithLimit(hc.reader, c.maxResponseSize)
 		if err != nil {
-			return totalRead, fmt.Errorf("h1client: read chunked: %w", err)
+			return totalRead, fmt.Errorf("h1client: conn[%d] read chunked: %w", connIdx, err)
 		}
 	}
 
@@ -306,8 +360,9 @@ func isChunkedHeader(line []byte) bool {
 	return asciiEqualFold(rem[:7], []byte("chunked"))
 }
 
-// readChunked reads a chunked transfer-encoded body, discarding all data.
-func readChunked(r *bufio.Reader) (int, error) {
+// readChunkedWithLimit reads a chunked transfer-encoded body, discarding all data.
+// If maxSize > 0 and the total exceeds maxSize, returns an error.
+func readChunkedWithLimit(r *bufio.Reader, maxSize int64) (int, error) {
 	total := 0
 	for {
 		line, err := r.ReadSlice('\n')
@@ -331,6 +386,9 @@ func readChunked(r *bufio.Reader) (int, error) {
 			return total, nil
 		}
 		total += size
+		if maxSize > 0 && int64(total) > maxSize {
+			return total, fmt.Errorf("chunked body exceeds MaxResponseSize %d", maxSize)
+		}
 		if _, err := r.Discard(size + 2); err != nil {
 			return total, err
 		}
@@ -362,7 +420,7 @@ func drainH1Response(r *bufio.Reader) int {
 		return contentLength
 	}
 	if chunked {
-		n, _ := readChunked(r)
+		n, _ := readChunkedWithLimit(r, -1)
 		return n
 	}
 	return 0
@@ -371,7 +429,7 @@ func drainH1Response(r *bufio.Reader) int {
 // reconnect closes and re-establishes the TCP connection.
 func (hc *h1Conn) reconnect() error {
 	_ = hc.conn.Close()
-	conn, err := dialH1(hc.addr)
+	conn, err := dialH1(hc.addr, hc.scheme, hc.dialTimeout, hc.readBufferSize, hc.writeBufferSize, hc.tlsConfig)
 	if err != nil {
 		return err
 	}
@@ -380,8 +438,8 @@ func (hc *h1Conn) reconnect() error {
 	return nil
 }
 
-// close closes all connections.
-func (c *h1Client) close() {
+// Close closes all connections.
+func (c *h1Client) Close() {
 	for _, hc := range c.conns {
 		_ = hc.conn.Close()
 	}

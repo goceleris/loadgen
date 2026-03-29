@@ -18,11 +18,20 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/goceleris/loadgen"
 )
+
+type headerFlag []string
+
+func (h *headerFlag) String() string { return "" }
+func (h *headerFlag) Set(value string) error {
+	*h = append(*h, value)
+	return nil
+}
 
 func main() {
 	var (
@@ -36,7 +45,12 @@ func main() {
 		h2Streams   = flag.Int("h2-streams", 100, "max concurrent H2 streams per connection")
 		method      = flag.String("method", "GET", "HTTP method")
 		connClose   = flag.Bool("close", false, "send Connection: close header (H1 only)")
+		insecure    = flag.Bool("insecure", false, "skip TLS certificate verification")
+		bodyFile    = flag.String("body-file", "", "path to file whose contents are sent as request body")
+		maxRPS      = flag.Int("max-rps", 0, "max requests per second (0 = unlimited)")
+		customHdrs  headerFlag
 	)
+	flag.Var(&customHdrs, "H", "custom header in 'Key: Value' format (repeatable)")
 	flag.Parse()
 
 	if *url == "" {
@@ -54,23 +68,52 @@ func main() {
 		}
 	}
 
-	// For Connection: close, don't pass it as a custom header — the H1
-	// client sets it based on KeepAlive. Remove from headers to avoid
-	// confusion (buildH1Request skips Connection in custom headers anyway).
+	// Parse custom headers from -H flags
 	var headers map[string]string
+	if len(customHdrs) > 0 {
+		headers = make(map[string]string, len(customHdrs))
+		for _, h := range customHdrs {
+			key, value, ok := strings.Cut(h, ": ")
+			if !ok {
+				fmt.Fprintf(os.Stderr, "error: invalid header format %q (expected \"Key: Value\")\n", h)
+				os.Exit(1)
+			}
+			headers[key] = value
+		}
+	}
+
+	var body []byte
+	if *bodyFile != "" {
+		var err error
+		body, err = os.ReadFile(*bodyFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: reading body file: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	cfg := loadgen.Config{
-		URL:           *url,
-		Method:        *method,
-		Duration:      *duration,
-		WarmupTime:    *warmup,
-		Connections:   *connections,
-		Workers:       w,
-		KeepAlive:     !*connClose,
-		H2C:           *h2,
-		H2Connections: *h2Conns,
-		H2MaxStreams:  *h2Streams,
-		Headers:       headers,
+		URL:                *url,
+		Method:             *method,
+		Body:               body,
+		Duration:           *duration,
+		Warmup:             *warmup,
+		Connections:        *connections,
+		Workers:            w,
+		DisableKeepAlive:   *connClose,
+		HTTP2:              *h2,
+		HTTP2Options: loadgen.HTTP2Options{
+			Connections: *h2Conns,
+			MaxStreams:  *h2Streams,
+		},
+		Headers:            headers,
+		InsecureSkipVerify: *insecure,
+		MaxRPS:             *maxRPS,
+	}
+
+	cfg.OnProgress = func(elapsed time.Duration, snapshot loadgen.Result) {
+		fmt.Fprintf(os.Stderr, "\r  %s  %d req  %.0f req/s",
+			elapsed.Round(time.Second), snapshot.Requests, snapshot.RequestsPerSec)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,8 +126,12 @@ func main() {
 		cancel()
 	}()
 
-	b := loadgen.New(cfg)
+	b, err := loadgen.New(cfg)
+	if err != nil {
+		log.Fatalf("loadgen: %v", err)
+	}
 	result, err := b.Run(ctx)
+	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		log.Fatalf("benchmark failed: %v", err)
 	}

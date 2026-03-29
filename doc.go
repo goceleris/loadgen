@@ -30,10 +30,12 @@
 // For HTTP/2:
 //
 //	cfg := loadgen.Config{
-//	    URL:           "http://localhost:8080/",
-//	    Duration:      15 * time.Second,
-//	    H2C:           true,
-//	    H2Connections: 16,
-//	    H2MaxStreams:  100,
+//	    URL:      "http://localhost:8080/",
+//	    Duration: 15 * time.Second,
+//	    HTTP2:    true,
+//	    HTTP2Options: loadgen.HTTP2Options{
+//	        Connections: 16,
+//	        MaxStreams:  100,
+//	    },
 //	}
 package loadgen
