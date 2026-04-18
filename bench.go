@@ -234,6 +234,11 @@ type Benchmarker struct {
 	config Config
 	raw    Client
 
+	// reopenRaw rebuilds the Client from the same config used in New().
+	// Called after warmup closes the client to unblock hung workers —
+	// the main phase needs a fresh connection pool.
+	reopenFn func() (Client, error)
+
 	// Metrics — errors use atomic (rare, no contention).
 	// Requests and bytesRead are tracked per-shard in latencies.
 	errors atomic.Int64
@@ -244,6 +249,20 @@ type Benchmarker struct {
 	// Control
 	running atomic.Bool
 	wg      sync.WaitGroup
+}
+
+// reopenRaw rebuilds b.raw using the same factory the constructor used.
+// Called after warmup closes connections to unblock stuck workers.
+func (b *Benchmarker) reopenRaw() error {
+	if b.reopenFn == nil {
+		return nil
+	}
+	c, err := b.reopenFn()
+	if err != nil {
+		return err
+	}
+	b.raw = c
+	return nil
 }
 
 // parseURL extracts host, port, path, and scheme from a raw URL.
@@ -332,6 +351,7 @@ func New(cfg Config) (*Benchmarker, error) {
 	cfg.scheme = scheme
 
 	var raw Client
+	var reopenFn func() (Client, error)
 
 	if cfg.HTTP2 {
 		// H2 workers are I/O-bound (blocked on channel round-trips), not CPU-bound.
@@ -339,8 +359,10 @@ func New(cfg Config) (*Benchmarker, error) {
 		// saturated. Little's Law: throughput = workers / RTT.
 		cfg.Workers *= 4
 		raw, err = newH2Client(host, port, path, cfg)
+		reopenFn = func() (Client, error) { return newH2Client(host, port, path, cfg) }
 	} else {
 		raw, err = newH1Client(host, port, path, cfg)
+		reopenFn = func() (Client, error) { return newH1Client(host, port, path, cfg) }
 	}
 
 	if err != nil {
@@ -350,6 +372,7 @@ func New(cfg Config) (*Benchmarker, error) {
 	return &Benchmarker{
 		config:    cfg,
 		raw:       raw,
+		reopenFn:  reopenFn,
 		latencies: NewShardedLatencyRecorder(cfg.Workers, flushInterval),
 	}, nil
 }
@@ -474,7 +497,23 @@ func (b *Benchmarker) warmup(ctx context.Context) {
 
 	<-warmupCtx.Done()
 	b.running.Store(false)
+	// Close connections so any worker stuck in a blocking Write/Read
+	// unblocks immediately. Without this, a server that stops
+	// responding during warmup hangs wg.Wait() indefinitely — the
+	// warmup context's deadline ALSO plumbs through to each socket via
+	// h1Client.DoRequest's SetDeadline, but connection close is a
+	// belt-and-suspenders guarantee that the warmup phase always
+	// terminates.
+	b.raw.Close()
 	b.wg.Wait()
+	// Re-open connections for the main run. The old raw client's conn
+	// slice is gone; the main phase expects a usable client.
+	if err := b.reopenRaw(); err != nil {
+		// Warmup already ran, so returning from here still gives the
+		// caller a benchmark — but errors here are fatal for the main
+		// phase and should surface via panic so they don't disappear.
+		panic(fmt.Sprintf("loadgen: warmup reopen failed: %v", err))
+	}
 }
 
 func (b *Benchmarker) worker(ctx context.Context, workerID int) {

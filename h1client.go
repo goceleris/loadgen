@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -32,8 +33,13 @@ type h1Client struct {
 }
 
 // h1Conn is a single persistent TCP connection with a buffered reader.
-// Owned by exactly one worker — no synchronization needed.
+// Normally owned by exactly one worker, but the benchmark orchestrator
+// may call Close() on the owning client from a different goroutine to
+// unblock hung workers. connMu serialises concurrent access to conn
+// between worker reconnects and the outer Close path — contention is
+// rare (only at shutdown / error recovery) so the mutex is fine.
 type h1Conn struct {
+	connMu          sync.Mutex
 	conn            net.Conn
 	reader          *bufio.Reader
 	addr            string
@@ -207,6 +213,19 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	}
 
 	connIdx := workerID % len(c.conns)
+
+	// Propagate the caller's context deadline onto the socket so a blocked
+	// Write/Read unblocks when the benchmark or warmup context expires.
+	// Without this, a server that stops responding (or is merely slow)
+	// leaves workers stuck in ReadSlice forever, and the outer wg.Wait
+	// never returns. If the caller's ctx has no deadline, apply a safety
+	// cap of 30s per request — well above any realistic handler budget
+	// but low enough to guarantee shutdown progress.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = hc.conn.SetDeadline(deadline)
+	} else {
+		_ = hc.conn.SetDeadline(time.Now().Add(30 * time.Second))
+	}
 
 	// Write request — single syscall for pre-formatted bytes
 	_, err := hc.conn.Write(c.reqBuf)
@@ -428,19 +447,31 @@ func drainH1Response(r *bufio.Reader) int {
 
 // reconnect closes and re-establishes the TCP connection.
 func (hc *h1Conn) reconnect() error {
-	_ = hc.conn.Close()
+	hc.connMu.Lock()
+	old := hc.conn
+	hc.connMu.Unlock()
+	_ = old.Close()
 	conn, err := dialH1(hc.addr, hc.scheme, hc.dialTimeout, hc.readBufferSize, hc.writeBufferSize, hc.tlsConfig)
 	if err != nil {
 		return err
 	}
+	hc.connMu.Lock()
 	hc.conn = conn
 	hc.reader.Reset(conn)
+	hc.connMu.Unlock()
 	return nil
 }
 
-// Close closes all connections.
+// Close closes all connections. Safe to call concurrently with worker
+// reconnects — connMu serialises the read-and-close against reconnect's
+// write of hc.conn.
 func (c *h1Client) Close() {
 	for _, hc := range c.conns {
-		_ = hc.conn.Close()
+		hc.connMu.Lock()
+		conn := hc.conn
+		hc.connMu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
 	}
 }
