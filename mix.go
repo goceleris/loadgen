@@ -211,7 +211,11 @@ func newMixClient(host, port, path string, cfg Config) (*mixClient, error) {
 			return nil, fmt.Errorf("mix: h2 sub-client: %w", err)
 		}
 		mc.h2 = h2c
-		mc.h2Conns = cfg.HTTP2Options.Connections
+		// Count the conns actually dialled, not the configured ceiling —
+		// short dial loops (dial failure on conn N) leave h2c.conns shorter
+		// than cfg.HTTP2Options.Connections; the report should reflect
+		// reality.
+		mc.h2Conns = len(h2c.conns)
 	}
 
 	// h2c-upgrade sub-client.
@@ -232,14 +236,17 @@ func newMixClient(host, port, path string, cfg Config) (*mixClient, error) {
 			return nil, fmt.Errorf("mix: upgrade sub-client: %w", err)
 		}
 		mc.upgrade = uc
-		mc.upgradeConns = cfg.HTTP2Options.Connections
+		mc.upgradeConns = len(uc.conns)
 	}
 
 	return mc, nil
 }
 
 // DoRequest dispatches the request to this worker's assigned sub-client,
-// updating the per-protocol request / error counters.
+// incrementing the per-protocol success counter on the happy path. Error
+// accounting is left to the benchmarker's worker loop (see recordError) so
+// shutdown-cancellation errors can be filtered out of the per-protocol
+// counts the same way Result.Errors filters them.
 func (c *mixClient) DoRequest(ctx context.Context, workerID int) (int, error) {
 	p := c.workerMap[workerID%len(c.workerMap)]
 	sub := c.subWorkerID[workerID%len(c.subWorkerID)]
@@ -251,27 +258,35 @@ func (c *mixClient) DoRequest(ctx context.Context, workerID int) (int, error) {
 	switch p {
 	case mixProtoH1:
 		n, err = c.h1.DoRequest(ctx, sub)
-		if err != nil {
-			c.h1Errors.Add(1)
-		} else {
+		if err == nil {
 			c.h1Requests.Add(1)
 		}
 	case mixProtoH2:
 		n, err = c.h2.DoRequest(ctx, sub)
-		if err != nil {
-			c.h2Errors.Add(1)
-		} else {
+		if err == nil {
 			c.h2Requests.Add(1)
 		}
 	case mixProtoUpgrade:
 		n, err = c.upgrade.DoRequest(ctx, sub)
-		if err != nil {
-			c.upgradeErrors.Add(1)
-		} else {
+		if err == nil {
 			c.upgradeRequests.Add(1)
 		}
 	}
 	return n, err
+}
+
+// recordError bumps the per-protocol error counter for the protocol assigned
+// to workerID. Called by the benchmarker worker loop AFTER it has decided
+// the error is not a shutdown-cancellation artefact.
+func (c *mixClient) recordError(workerID int) {
+	switch c.workerMap[workerID%len(c.workerMap)] {
+	case mixProtoH1:
+		c.h1Errors.Add(1)
+	case mixProtoH2:
+		c.h2Errors.Add(1)
+	case mixProtoUpgrade:
+		c.upgradeErrors.Add(1)
+	}
 }
 
 // Close shuts down every sub-client.

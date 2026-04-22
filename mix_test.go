@@ -267,7 +267,19 @@ func TestMixBenchmarkerEndToEnd(t *testing.T) {
 	if sum == 0 {
 		t.Fatalf("mix per-protocol requests sum to 0: %+v", result.Mix)
 	}
-	t.Logf("end-to-end mix: %+v (total=%d)", result.Mix, result.Requests)
+	// Issue #29 exit criterion #3: protocol-specific error rate is zero in
+	// every slot that has non-zero weight. Top-level Result.Errors filters
+	// shutdown-cancellation errors; the per-protocol counters must apply
+	// the same filter so the two stay consistent.
+	if result.Mix.H1Errors != 0 || result.Mix.H2Errors != 0 || result.Mix.UpgradeErrors != 0 {
+		t.Errorf("expected zero per-protocol errors, got: h1=%d h2=%d upgrade=%d (Result.Errors=%d)",
+			result.Mix.H1Errors, result.Mix.H2Errors, result.Mix.UpgradeErrors, result.Errors)
+	}
+	if result.Errors != result.Mix.H1Errors+result.Mix.H2Errors+result.Mix.UpgradeErrors {
+		t.Errorf("top-level Errors=%d should equal sum of per-protocol errors (h1=%d h2=%d upgrade=%d)",
+			result.Errors, result.Mix.H1Errors, result.Mix.H2Errors, result.Mix.UpgradeErrors)
+	}
+	t.Logf("end-to-end mix: %+v (total=%d, errors=%d)", result.Mix, result.Requests, result.Errors)
 }
 
 // TestMixValidationRejections verifies Validate() rejects the configurations

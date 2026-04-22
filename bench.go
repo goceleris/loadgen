@@ -269,6 +269,11 @@ type Benchmarker struct {
 	config Config
 	raw    Client
 
+	// mix is a cached pointer to raw when raw is a *mixClient. nil otherwise.
+	// The worker hot path reads this once on shutdown-filter and avoids a
+	// type assertion per request. Set at New() time, never mutated.
+	mix *mixClient
+
 	// Metrics — errors use atomic (rare, no contention).
 	// Requests and bytesRead are tracked per-shard in latencies.
 	errors atomic.Int64
@@ -392,11 +397,15 @@ func New(cfg Config) (*Benchmarker, error) {
 		return nil, fmt.Errorf("loadgen: dial: %w", err)
 	}
 
-	return &Benchmarker{
+	b := &Benchmarker{
 		config:    cfg,
 		raw:       raw,
 		latencies: NewShardedLatencyRecorder(cfg.Workers, flushInterval),
-	}, nil
+	}
+	if mc, ok := raw.(*mixClient); ok {
+		b.mix = mc
+	}
+	return b, nil
 }
 
 // Run executes the benchmark and returns results.
@@ -409,14 +418,14 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Reset metrics for actual benchmark
 	b.errors.Store(0)
 	b.latencies.Reset()
-	if mc, ok := b.raw.(*mixClient); ok {
+	if b.mix != nil {
 		// Clear per-protocol counters accumulated during warmup.
-		mc.h1Requests.Store(0)
-		mc.h2Requests.Store(0)
-		mc.upgradeRequests.Store(0)
-		mc.h1Errors.Store(0)
-		mc.h2Errors.Store(0)
-		mc.upgradeErrors.Store(0)
+		b.mix.h1Requests.Store(0)
+		b.mix.h2Requests.Store(0)
+		b.mix.upgradeRequests.Store(0)
+		b.mix.h1Errors.Store(0)
+		b.mix.h2Errors.Store(0)
+		b.mix.upgradeErrors.Store(0)
 	}
 
 	// Start client CPU monitor
@@ -569,6 +578,9 @@ func (b *Benchmarker) worker(ctx context.Context, workerID int) {
 				return
 			}
 			b.errors.Add(1)
+			if b.mix != nil {
+				b.mix.recordError(workerID)
+			}
 		} else {
 			b.latencies.RecordSuccess(workerID, latency, bytesRead)
 		}
@@ -602,6 +614,16 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	case *mixClient:
 		stats := c.stats()
 		res.Mix = &stats
+		// A mix run that included an upgrade slot wraps its own *h2Client with
+		// dialedViaUpgrade=true. Unwrap and surface the same UpgradeStats the
+		// dedicated -h2c-upgrade run would have reported, so CLI output and
+		// JSON shape stay parity between the two paths.
+		if uc, ok := c.upgrade.(*h2Client); ok && uc.dialedViaUpgrade {
+			res.Upgrade = &UpgradeStats{
+				UpgradeAttempted: uc.upgradeAttempted,
+				UpgradeSucceeded: len(uc.conns),
+			}
+		}
 	}
 
 	return res
