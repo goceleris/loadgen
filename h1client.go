@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -32,8 +33,14 @@ type h1Client struct {
 }
 
 // h1Conn is a single persistent TCP connection with a buffered reader.
-// Owned by exactly one worker — no synchronization needed.
+// Owned by exactly one worker for the request/response I/O path; the mu
+// guards conn/reader against concurrent access from (*h1Client).Close(),
+// which is invoked from Benchmarker.Run BEFORE the worker WaitGroup drains
+// in order to interrupt any in-flight I/O. Close and reconnect are the
+// only cold paths that acquire mu — DoRequest's hot path does not, because
+// reconnect is called from the same worker goroutine.
 type h1Conn struct {
+	mu              sync.Mutex
 	conn            net.Conn
 	reader          *bufio.Reader
 	addr            string
@@ -426,8 +433,12 @@ func drainH1Response(r *bufio.Reader) int {
 	return 0
 }
 
-// reconnect closes and re-establishes the TCP connection.
+// reconnect closes and re-establishes the TCP connection. Acquires hc.mu
+// so the write to hc.conn cannot race with (*h1Client).Close reading it
+// from the Benchmarker shutdown goroutine.
 func (hc *h1Conn) reconnect() error {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
 	_ = hc.conn.Close()
 	conn, err := dialH1(hc.addr, hc.scheme, hc.dialTimeout, hc.readBufferSize, hc.writeBufferSize, hc.tlsConfig)
 	if err != nil {
@@ -438,9 +449,13 @@ func (hc *h1Conn) reconnect() error {
 	return nil
 }
 
-// Close closes all connections.
+// Close closes all connections. Benchmarker.Run calls Close before draining
+// the worker WaitGroup (to interrupt in-flight I/O), so we must take hc.mu
+// to synchronise with concurrent reconnect() writes on the conn field.
 func (c *h1Client) Close() {
 	for _, hc := range c.conns {
+		hc.mu.Lock()
 		_ = hc.conn.Close()
+		hc.mu.Unlock()
 	}
 }
