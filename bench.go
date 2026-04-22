@@ -85,6 +85,23 @@ type Config struct {
 	// HTTP/1.1 is used with one request per connection at a time.
 	HTTP2 bool
 
+	// H2CUpgrade enables the RFC 7540 §3.2 h2c upgrade handshake: each new
+	// connection starts as H1 carrying Connection: Upgrade, HTTP2-Settings
+	// + Upgrade: h2c headers, reads a 101 Switching Protocols response, then
+	// switches to H2 on the same TCP conn. Mutually exclusive with HTTP2:
+	// Validate() returns an error if both are set. Over TLS this is undefined
+	// and also rejected (servers negotiate H2 via ALPN, not h2c). Only meaningful
+	// when the URL scheme is "http".
+	H2CUpgrade bool
+
+	// Mix, if non-nil, assigns each new connection to a protocol via a weighted
+	// random draw across H1, H2 prior-knowledge, and h2c-upgrade. Mutually
+	// exclusive with HTTP2 and H2CUpgrade. See ParseMixRatio for the string
+	// format. HTTP2Options.Connections controls how many H2 connections are
+	// dialled; the H1 pool scales with Connections as usual. A conn stays on
+	// its chosen protocol for its entire lifetime.
+	Mix *MixRatio
+
 	// HTTP2Options holds HTTP/2-specific tuning parameters.
 	// Only used when HTTP2 is true. HTTP/2 multiplexes streams over
 	// a single connection, but multiple connections can improve
@@ -179,19 +196,37 @@ func (c Config) Validate() error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("loadgen: unsupported URL scheme %q (must be http or https)", u.Scheme)
 	}
+	if c.HTTP2 && c.H2CUpgrade {
+		return errors.New("loadgen: HTTP2 and H2CUpgrade are mutually exclusive")
+	}
+	if c.H2CUpgrade && u.Scheme == "https" {
+		return errors.New("loadgen: H2CUpgrade requires http scheme (TLS uses ALPN, not h2c)")
+	}
+	if c.Mix != nil {
+		if c.HTTP2 || c.H2CUpgrade {
+			return errors.New("loadgen: Mix is mutually exclusive with HTTP2 and H2CUpgrade")
+		}
+		if u.Scheme == "https" && c.Mix.Upgrade > 0 {
+			return errors.New("loadgen: Mix with non-zero h2c-upgrade weight requires http scheme")
+		}
+		if c.Mix.H1+c.Mix.H2+c.Mix.Upgrade == 0 {
+			return errors.New("loadgen: Mix must have at least one non-zero weight")
+		}
+	}
 	if c.Duration <= 0 {
 		return errors.New("loadgen: Duration must be positive")
 	}
-	if !c.HTTP2 && c.Connections < 1 {
+	usesH2Pool := c.HTTP2 || c.H2CUpgrade || (c.Mix != nil && (c.Mix.H2 > 0 || c.Mix.Upgrade > 0))
+	if !usesH2Pool && c.Connections < 1 {
 		return errors.New("loadgen: Connections must be >= 1")
 	}
 	if c.Workers < 1 {
 		return errors.New("loadgen: Workers must be >= 1")
 	}
-	if c.HTTP2 && c.HTTP2Options.Connections < 1 {
+	if usesH2Pool && c.HTTP2Options.Connections < 1 {
 		return errors.New("loadgen: HTTP2Options.Connections must be >= 1")
 	}
-	if c.HTTP2 && c.HTTP2Options.MaxStreams < 1 {
+	if usesH2Pool && c.HTTP2Options.MaxStreams < 1 {
 		return errors.New("loadgen: HTTP2Options.MaxStreams must be >= 1")
 	}
 	switch c.Method {
@@ -233,6 +268,11 @@ type Client interface {
 type Benchmarker struct {
 	config Config
 	raw    Client
+
+	// mix is a cached pointer to raw when raw is a *mixClient. nil otherwise.
+	// The worker hot path reads this once on shutdown-filter and avoids a
+	// type assertion per request. Set at New() time, never mutated.
+	mix *mixClient
 
 	// Metrics — errors use atomic (rare, no contention).
 	// Requests and bytesRead are tracked per-shard in latencies.
@@ -289,15 +329,16 @@ func New(cfg Config) (*Benchmarker, error) {
 	if cfg.MaxResponseSize == 0 {
 		cfg.MaxResponseSize = 10 << 20 // 10MB
 	}
+	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade || (cfg.Mix != nil && (cfg.Mix.H2 > 0 || cfg.Mix.Upgrade > 0))
 	if cfg.ReadBufferSize == 0 {
-		if cfg.HTTP2 {
+		if useH2Defaults {
 			cfg.ReadBufferSize = 2 * 1024 * 1024 // 2MB for H2
 		} else {
 			cfg.ReadBufferSize = 256 * 1024 // 256KB for H1
 		}
 	}
 	if cfg.WriteBufferSize == 0 {
-		if cfg.HTTP2 {
+		if useH2Defaults {
 			cfg.WriteBufferSize = 2 * 1024 * 1024 // 2MB for H2
 		} else {
 			cfg.WriteBufferSize = 256 * 1024 // 256KB for H1
@@ -312,7 +353,7 @@ func New(cfg Config) (*Benchmarker, error) {
 	}
 
 	flushInterval := defaultFlushInterval // 256 for H1
-	if cfg.HTTP2 {
+	if useH2Defaults {
 		flushInterval = 16 // ~4 flushes/sec/worker at ~69 rps/worker
 	}
 
@@ -333,13 +374,22 @@ func New(cfg Config) (*Benchmarker, error) {
 
 	var raw Client
 
-	if cfg.HTTP2 {
+	switch {
+	case cfg.Mix != nil:
+		// H2/upgrade conns are multiplexed like normal H2 — bump workers for
+		// the same reason as the H2 case below.
+		cfg.Workers *= 4
+		raw, err = newMixClient(host, port, path, cfg)
+	case cfg.HTTP2:
 		// H2 workers are I/O-bound (blocked on channel round-trips), not CPU-bound.
 		// With multiplexed streams, workers need 4x headroom to keep the pipeline
 		// saturated. Little's Law: throughput = workers / RTT.
 		cfg.Workers *= 4
 		raw, err = newH2Client(host, port, path, cfg)
-	} else {
+	case cfg.H2CUpgrade:
+		cfg.Workers *= 4
+		raw, err = newH2CUpgradeClient(host, port, path, cfg)
+	default:
 		raw, err = newH1Client(host, port, path, cfg)
 	}
 
@@ -347,11 +397,15 @@ func New(cfg Config) (*Benchmarker, error) {
 		return nil, fmt.Errorf("loadgen: dial: %w", err)
 	}
 
-	return &Benchmarker{
+	b := &Benchmarker{
 		config:    cfg,
 		raw:       raw,
 		latencies: NewShardedLatencyRecorder(cfg.Workers, flushInterval),
-	}, nil
+	}
+	if mc, ok := raw.(*mixClient); ok {
+		b.mix = mc
+	}
+	return b, nil
 }
 
 // Run executes the benchmark and returns results.
@@ -364,6 +418,15 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Reset metrics for actual benchmark
 	b.errors.Store(0)
 	b.latencies.Reset()
+	if b.mix != nil {
+		// Clear per-protocol counters accumulated during warmup.
+		b.mix.h1Requests.Store(0)
+		b.mix.h2Requests.Store(0)
+		b.mix.upgradeRequests.Store(0)
+		b.mix.h1Errors.Store(0)
+		b.mix.h2Errors.Store(0)
+		b.mix.upgradeErrors.Store(0)
+	}
 
 	// Start client CPU monitor
 	cpuMon := &CPUMonitor{}
@@ -515,6 +578,9 @@ func (b *Benchmarker) worker(ctx context.Context, workerID int) {
 				return
 			}
 			b.errors.Add(1)
+			if b.mix != nil {
+				b.mix.recordError(workerID)
+			}
 		} else {
 			b.latencies.RecordSuccess(workerID, latency, bytesRead)
 		}
@@ -528,7 +594,7 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	rps := float64(reqs) / elapsed.Seconds()
 	throughput := float64(bytesRead) / elapsed.Seconds()
 
-	return &Result{
+	res := &Result{
 		Requests:       reqs,
 		Errors:         errs,
 		Duration:       elapsed,
@@ -536,4 +602,29 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		ThroughputBPS:  throughput,
 		Latency:        b.latencies.Percentiles(),
 	}
+
+	switch c := b.raw.(type) {
+	case *h2Client:
+		if c.dialedViaUpgrade {
+			res.Upgrade = &UpgradeStats{
+				UpgradeAttempted: c.upgradeAttempted,
+				UpgradeSucceeded: len(c.conns),
+			}
+		}
+	case *mixClient:
+		stats := c.stats()
+		res.Mix = &stats
+		// A mix run that included an upgrade slot wraps its own *h2Client with
+		// dialedViaUpgrade=true. Unwrap and surface the same UpgradeStats the
+		// dedicated -h2c-upgrade run would have reported, so CLI output and
+		// JSON shape stay parity between the two paths.
+		if uc, ok := c.upgrade.(*h2Client); ok && uc.dialedViaUpgrade {
+			res.Upgrade = &UpgradeStats{
+				UpgradeAttempted: uc.upgradeAttempted,
+				UpgradeSucceeded: len(uc.conns),
+			}
+		}
+	}
+
+	return res
 }
