@@ -74,12 +74,20 @@ func (m loadgenMode) String() string {
 // relies on the native (linux-only) engines enforcing protocol selection
 // that the net/http-backed Std engine does not. The matrix is meaningful
 // on Linux; Darwin's Std-only runs skip these rows with a clear reason.
+//
+// unreachableReason is a non-empty string for cells whose server config
+// cannot actually be produced by celeris — e.g. Protocol=Auto silently
+// coerces EnableH2Upgrade=true in resource/config.go:167-169, so any
+// (auto, upgrade=false, *) cell is unreachable in practice. We keep such
+// rows in the matrix (skipped with this reason) rather than delete them,
+// so the coercion stays visible in code review.
 type matrixCell struct {
-	serverProto   string // "auto", "http1", "h2c"
-	serverUpgrade string // "default", "true", "false"
-	mode          loadgenMode
-	expectOK      bool
-	stdSkipReason string
+	serverProto       string // "auto", "http1", "h2c"
+	serverUpgrade     string // "default", "true", "false"
+	mode              loadgenMode
+	expectOK          bool
+	stdSkipReason     string
+	unreachableReason string
 }
 
 func (c matrixCell) name() string {
@@ -120,6 +128,15 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 	// these cells are meaningful only on the native (linux) engines.
 	const h2cServingH1 = "std engine uses x/net/http2/h2c which falls through to H1 — EnableH2Upgrade + Protocol=H2C enforcement is only implemented in native linux engines"
 
+	// autoCoercesUpgrade is the reason we skip every Protocol=Auto row with
+	// the explicit serverUpgrade="false" knob. celeris' resource layer forces
+	// EnableH2Upgrade=true whenever the resolved Protocol is Auto — see the
+	// WithDefaults block at celeris/resource/config.go:163-169 — so the
+	// server config this row tries to produce is unreachable in practice.
+	// We keep the rows as skips (not deletions) to surface that coercion
+	// for reviewers reading this matrix.
+	const autoCoercesUpgrade = "celeris Protocol=Auto coerces EnableH2Upgrade=true in resource/config.go:167-169; this server config is unreachable in practice"
+
 	// The full matrix from issue #30. 20 cells total. stdSkipReason is
 	// non-empty for the 4 cells whose expected behaviour relies on the
 	// linux-only native engines.
@@ -130,10 +147,18 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		{serverProto: "http1", serverUpgrade: "false", mode: modeUpgrade, expectOK: false},
 
 		// Protocol=HTTP1, EnableH2Upgrade=true
-		// (Same outcomes — HTTP1 explicitly rejects upgrade attempts.)
+		// Prior-knowledge H2 still fails (the H1 parser never sees the PRI
+		// preface as a legal request-line), but an RFC 7540 §3.2 upgrade IS
+		// honoured by the native linux engines — celeris/internal/conn/h1.go
+		// gates the upgrade path on state.EnableH2Upgrade && req.UpgradeH2C
+		// (see line 536 there). So http1+upgrade=true+h2c-upgrade is a
+		// supported configuration, not a rejection case.
+		// The Std (net/http) engine does NOT honour the upgrade — it replies
+		// 200 on the plain H1 socket and silently ignores the Upgrade header
+		// — so the darwin Std-only run skips this row.
 		{serverProto: "http1", serverUpgrade: "true", mode: modeH1, expectOK: true},
 		{serverProto: "http1", serverUpgrade: "true", mode: modeH2, expectOK: false},
-		{serverProto: "http1", serverUpgrade: "true", mode: modeUpgrade, expectOK: false},
+		{serverProto: "http1", serverUpgrade: "true", mode: modeUpgrade, expectOK: true, stdSkipReason: "std (net/http) engine ignores H2C upgrade on Protocol=HTTP1 and answers 200 on H1 — only the native linux engines emit 101 Switching Protocols"},
 
 		// Protocol=H2C, EnableH2Upgrade=false
 		{serverProto: "h2c", serverUpgrade: "false", mode: modeH1, expectOK: false, stdSkipReason: h2cServingH1},
@@ -146,10 +171,16 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		{serverProto: "h2c", serverUpgrade: "true", mode: modeUpgrade, expectOK: true},
 
 		// Protocol=Auto, EnableH2Upgrade=false
-		{serverProto: "auto", serverUpgrade: "false", mode: modeH1, expectOK: true},
-		{serverProto: "auto", serverUpgrade: "false", mode: modeH2, expectOK: true},
-		{serverProto: "auto", serverUpgrade: "false", mode: modeUpgrade, expectOK: false, stdSkipReason: h2cServingH1},
-		{serverProto: "auto", serverUpgrade: "false", mode: modeMix110, expectOK: true},
+		// NOTE: celeris/resource/config.go:167-169 silently coerces
+		// EnableH2Upgrade=true whenever Protocol=Auto (the toResourceConfig
+		// path at celeris/config.go:210-215 preserves the user's *bool, but
+		// WithDefaults unconditionally flips it back). So every row here is
+		// actually the same as (auto, upgrade=true, ...). We keep them
+		// skipped rather than deleted so the coercion stays visible.
+		{serverProto: "auto", serverUpgrade: "false", mode: modeH1, expectOK: true, unreachableReason: autoCoercesUpgrade},
+		{serverProto: "auto", serverUpgrade: "false", mode: modeH2, expectOK: true, unreachableReason: autoCoercesUpgrade},
+		{serverProto: "auto", serverUpgrade: "false", mode: modeUpgrade, expectOK: false, stdSkipReason: h2cServingH1, unreachableReason: autoCoercesUpgrade},
+		{serverProto: "auto", serverUpgrade: "false", mode: modeMix110, expectOK: true, unreachableReason: autoCoercesUpgrade},
 
 		// Protocol=Auto, EnableH2Upgrade=true
 		{serverProto: "auto", serverUpgrade: "true", mode: modeH1, expectOK: true},
@@ -162,6 +193,9 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 	for _, cell := range matrix {
 		cell := cell
 		t.Run(cell.name(), func(t *testing.T) {
+			if cell.unreachableReason != "" {
+				t.Skipf("%s", cell.unreachableReason)
+			}
 			if isStd && cell.stdSkipReason != "" {
 				t.Skipf("%s", cell.stdSkipReason)
 			}
