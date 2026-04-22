@@ -28,6 +28,10 @@ type Result struct {
 	// the 101 Switching Protocols handshake; UpgradeAttempted counts dialled
 	// connections. For non-upgrade runs this field is omitted.
 	Upgrade *UpgradeStats `json:"upgrade,omitempty"`
+
+	// Mix, when non-nil, reports per-protocol request / error / conn counts
+	// for a run using -mix. Omitted for single-protocol runs.
+	Mix *MixStats `json:"mix,omitempty"`
 }
 
 // UpgradeStats summarises the outcome of h2c-upgrade handshakes across all
@@ -38,6 +42,22 @@ type Result struct {
 type UpgradeStats struct {
 	UpgradeAttempted int `json:"attempted"`
 	UpgradeSucceeded int `json:"succeeded"`
+}
+
+// MixStats breaks down request and error counts by protocol when a run uses
+// the -mix flag. Conns counts report how many TCP connections were created
+// per protocol slot; requests / errors are per-protocol tallies from the
+// benchmark proper (post-warmup).
+type MixStats struct {
+	H1Conns         int   `json:"h1_conns"`
+	H2Conns         int   `json:"h2_conns"`
+	UpgradeConns    int   `json:"upgrade_conns"`
+	H1Requests      int64 `json:"h1_requests"`
+	H2Requests      int64 `json:"h2_requests"`
+	UpgradeRequests int64 `json:"upgrade_requests"`
+	H1Errors        int64 `json:"h1_errors"`
+	H2Errors        int64 `json:"h2_errors"`
+	UpgradeErrors   int64 `json:"upgrade_errors"`
 }
 
 // Percentiles holds latency percentile values.

@@ -42,6 +42,7 @@ func main() {
 		workers     = flag.Int("workers", 0, "number of workers (default: connections for H1, connections*4 for H2)")
 		h2          = flag.Bool("h2", false, "use HTTP/2 prior-knowledge (h2c)")
 		h2cUpgrade  = flag.Bool("h2c-upgrade", false, "use HTTP/2 via RFC 7540 §3.2 h2c upgrade handshake")
+		mix         = flag.String("mix", "", "per-connection protocol mix ratio, e.g. h1:h2:upgrade=4:4:1")
 		h2Conns     = flag.Int("h2-conns", 16, "H2 connections")
 		h2Streams   = flag.Int("h2-streams", 100, "max concurrent H2 streams per connection")
 		method      = flag.String("method", "GET", "HTTP method")
@@ -61,12 +62,32 @@ func main() {
 	}
 
 	// Mutually-exclusive protocol-selection flags.
-	if *h2 && *h2cUpgrade {
-		fmt.Fprintln(os.Stderr, "error: -h2 and -h2c-upgrade are mutually exclusive")
+	modeCount := 0
+	if *h2 {
+		modeCount++
+	}
+	if *h2cUpgrade {
+		modeCount++
+	}
+	if *mix != "" {
+		modeCount++
+	}
+	if modeCount > 1 {
+		fmt.Fprintln(os.Stderr, "error: -h2, -h2c-upgrade, and -mix are mutually exclusive")
 		os.Exit(2)
 	}
 
-	multiplexed := *h2 || *h2cUpgrade
+	var mixRatio *loadgen.MixRatio
+	if *mix != "" {
+		r, err := loadgen.ParseMixRatio(*mix)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		mixRatio = &r
+	}
+
+	multiplexed := *h2 || *h2cUpgrade || (mixRatio != nil && (mixRatio.H2 > 0 || mixRatio.Upgrade > 0))
 	w := *workers
 	if w == 0 {
 		if multiplexed {
@@ -111,6 +132,7 @@ func main() {
 		DisableKeepAlive: *connClose,
 		HTTP2:            *h2,
 		H2CUpgrade:       *h2cUpgrade,
+		Mix:              mixRatio,
 		HTTP2Options: loadgen.HTTP2Options{
 			Connections: *h2Conns,
 			MaxStreams:  *h2Streams,
@@ -152,6 +174,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "warning: %d conns failed to upgrade\n",
 				result.Upgrade.UpgradeAttempted-result.Upgrade.UpgradeSucceeded)
 		}
+	}
+	if result.Mix != nil {
+		total := result.Mix.H1Requests + result.Mix.H2Requests + result.Mix.UpgradeRequests
+		fmt.Fprintf(os.Stderr,
+			"mix breakdown (conns=%d/%d/%d):\n  h1:      %d req, %d err\n  h2:      %d req, %d err\n  upgrade: %d req, %d err\n  total:   %d req\n",
+			result.Mix.H1Conns, result.Mix.H2Conns, result.Mix.UpgradeConns,
+			result.Mix.H1Requests, result.Mix.H1Errors,
+			result.Mix.H2Requests, result.Mix.H2Errors,
+			result.Mix.UpgradeRequests, result.Mix.UpgradeErrors,
+			total,
+		)
 	}
 
 	// Output JSON result.

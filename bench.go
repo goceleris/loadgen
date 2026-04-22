@@ -94,6 +94,14 @@ type Config struct {
 	// when the URL scheme is "http".
 	H2CUpgrade bool
 
+	// Mix, if non-nil, assigns each new connection to a protocol via a weighted
+	// random draw across H1, H2 prior-knowledge, and h2c-upgrade. Mutually
+	// exclusive with HTTP2 and H2CUpgrade. See ParseMixRatio for the string
+	// format. HTTP2Options.Connections controls how many H2 connections are
+	// dialled; the H1 pool scales with Connections as usual. A conn stays on
+	// its chosen protocol for its entire lifetime.
+	Mix *MixRatio
+
 	// HTTP2Options holds HTTP/2-specific tuning parameters.
 	// Only used when HTTP2 is true. HTTP/2 multiplexes streams over
 	// a single connection, but multiple connections can improve
@@ -194,10 +202,21 @@ func (c Config) Validate() error {
 	if c.H2CUpgrade && u.Scheme == "https" {
 		return errors.New("loadgen: H2CUpgrade requires http scheme (TLS uses ALPN, not h2c)")
 	}
+	if c.Mix != nil {
+		if c.HTTP2 || c.H2CUpgrade {
+			return errors.New("loadgen: Mix is mutually exclusive with HTTP2 and H2CUpgrade")
+		}
+		if u.Scheme == "https" && c.Mix.Upgrade > 0 {
+			return errors.New("loadgen: Mix with non-zero h2c-upgrade weight requires http scheme")
+		}
+		if c.Mix.H1+c.Mix.H2+c.Mix.Upgrade == 0 {
+			return errors.New("loadgen: Mix must have at least one non-zero weight")
+		}
+	}
 	if c.Duration <= 0 {
 		return errors.New("loadgen: Duration must be positive")
 	}
-	usesH2Pool := c.HTTP2 || c.H2CUpgrade
+	usesH2Pool := c.HTTP2 || c.H2CUpgrade || (c.Mix != nil && (c.Mix.H2 > 0 || c.Mix.Upgrade > 0))
 	if !usesH2Pool && c.Connections < 1 {
 		return errors.New("loadgen: Connections must be >= 1")
 	}
@@ -305,7 +324,7 @@ func New(cfg Config) (*Benchmarker, error) {
 	if cfg.MaxResponseSize == 0 {
 		cfg.MaxResponseSize = 10 << 20 // 10MB
 	}
-	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade
+	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade || (cfg.Mix != nil && (cfg.Mix.H2 > 0 || cfg.Mix.Upgrade > 0))
 	if cfg.ReadBufferSize == 0 {
 		if useH2Defaults {
 			cfg.ReadBufferSize = 2 * 1024 * 1024 // 2MB for H2
@@ -351,6 +370,11 @@ func New(cfg Config) (*Benchmarker, error) {
 	var raw Client
 
 	switch {
+	case cfg.Mix != nil:
+		// H2/upgrade conns are multiplexed like normal H2 — bump workers for
+		// the same reason as the H2 case below.
+		cfg.Workers *= 4
+		raw, err = newMixClient(host, port, path, cfg)
 	case cfg.HTTP2:
 		// H2 workers are I/O-bound (blocked on channel round-trips), not CPU-bound.
 		// With multiplexed streams, workers need 4x headroom to keep the pipeline
@@ -385,6 +409,15 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Reset metrics for actual benchmark
 	b.errors.Store(0)
 	b.latencies.Reset()
+	if mc, ok := b.raw.(*mixClient); ok {
+		// Clear per-protocol counters accumulated during warmup.
+		mc.h1Requests.Store(0)
+		mc.h2Requests.Store(0)
+		mc.upgradeRequests.Store(0)
+		mc.h1Errors.Store(0)
+		mc.h2Errors.Store(0)
+		mc.upgradeErrors.Store(0)
+	}
 
 	// Start client CPU monitor
 	cpuMon := &CPUMonitor{}
@@ -558,11 +591,17 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		Latency:        b.latencies.Percentiles(),
 	}
 
-	if h2c, ok := b.raw.(*h2Client); ok && h2c.dialedViaUpgrade {
-		res.Upgrade = &UpgradeStats{
-			UpgradeAttempted: h2c.upgradeAttempted,
-			UpgradeSucceeded: len(h2c.conns),
+	switch c := b.raw.(type) {
+	case *h2Client:
+		if c.dialedViaUpgrade {
+			res.Upgrade = &UpgradeStats{
+				UpgradeAttempted: c.upgradeAttempted,
+				UpgradeSucceeded: len(c.conns),
+			}
 		}
+	case *mixClient:
+		stats := c.stats()
+		res.Mix = &stats
 	}
 
 	return res
