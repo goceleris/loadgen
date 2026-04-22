@@ -20,6 +20,23 @@ import (
 // path take precedence.
 const h2cUpgradeDefaultPath = "/"
 
+// h2cUpgradeSettingsPayload is the wire-format SETTINGS frame payload
+// loadgen advertises during an h2c upgrade. Computed once at package init
+// from h2HandshakeSettings so every dial reuses the same slice — no
+// per-dial encodeH2SettingsPayload call, no per-dial base64 re-encode.
+//
+// h2cUpgradeSettingsB64 is the base64url (no-pad) encoding of the payload,
+// ready to splice into the HTTP2-Settings header without a second allocation.
+var (
+	h2cUpgradeSettingsPayload []byte
+	h2cUpgradeSettingsB64     string
+)
+
+func init() {
+	h2cUpgradeSettingsPayload = encodeH2SettingsPayload(h2HandshakeSettings)
+	h2cUpgradeSettingsB64 = base64.RawURLEncoding.EncodeToString(h2cUpgradeSettingsPayload)
+}
+
 // buildH2CUpgradeRequest formats the H1 GET request that triggers the h2c
 // upgrade per RFC 7540 §3.2. It carries Connection: Upgrade, HTTP2-Settings
 // + Upgrade: h2c + a base64url-encoded (no padding) SETTINGS payload.
@@ -36,9 +53,26 @@ const h2cUpgradeDefaultPath = "/"
 // the port-80 case matters in practice, but the logic is kept
 // scheme-aware for future-proofing.
 func buildH2CUpgradeRequest(path, host, port, scheme string, settingsPayload []byte) []byte {
-	b64 := base64.RawURLEncoding.EncodeToString(settingsPayload)
-
-	buf := make([]byte, 0, 256)
+	// Size the single-allocation output buffer tightly: 64 bytes of
+	// request-line + header-name scaffolding (GET, HTTP/1.1, Host, etc.),
+	// plus the variable path/host/port, plus the base64 settings. Fits
+	// in one alloc on the happy path.
+	b64 := h2cUpgradeSettingsB64
+	if settingsPayload != nil && !bytes.Equal(settingsPayload, h2cUpgradeSettingsPayload) {
+		// Test-path escape hatch: caller supplied a non-default payload.
+		// Pay the per-call base64 cost only here.
+		b64 = base64.RawURLEncoding.EncodeToString(settingsPayload)
+	}
+	portLen := 0
+	if !isDefaultPort(scheme, port) {
+		portLen = 1 + len(port) // ':' + port
+	}
+	sz := 4 /* "GET " */ + len(path) + 11 /* " HTTP/1.1\r\n" */ +
+		6 /* "Host: " */ + len(host) + portLen + 2 /* "\r\n" */ +
+		38 /* "Connection: Upgrade, HTTP2-Settings\r\n" */ +
+		15 /* "Upgrade: h2c\r\n" */ +
+		16 /* "HTTP2-Settings: " */ + len(b64) + 4 /* "\r\n\r\n" */
+	buf := make([]byte, 0, sz)
 	buf = append(buf, "GET "...)
 	buf = append(buf, path...)
 	buf = append(buf, " HTTP/1.1\r\n"...)
@@ -48,10 +82,7 @@ func buildH2CUpgradeRequest(path, host, port, scheme string, settingsPayload []b
 		buf = append(buf, ':')
 		buf = append(buf, port...)
 	}
-	buf = append(buf, "\r\n"...)
-	buf = append(buf, "Connection: Upgrade, HTTP2-Settings\r\n"...)
-	buf = append(buf, "Upgrade: h2c\r\n"...)
-	buf = append(buf, "HTTP2-Settings: "...)
+	buf = append(buf, "\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: "...)
 	buf = append(buf, b64...)
 	buf = append(buf, "\r\n\r\n"...)
 	return buf
@@ -126,8 +157,7 @@ func dialH2CUpgrade(addr, scheme, path, host, port string, maxStreams int, dialT
 		path = h2cUpgradeDefaultPath
 	}
 
-	settingsPayload := encodeH2SettingsPayload(h2HandshakeSettings)
-	req := buildH2CUpgradeRequest(path, host, port, scheme, settingsPayload)
+	req := buildH2CUpgradeRequest(path, host, port, scheme, h2cUpgradeSettingsPayload)
 
 	// Allow up to 10s for the upgrade round-trip. Cleared before returning
 	// to the caller so completeH2Handshake can set its own handshake deadline.

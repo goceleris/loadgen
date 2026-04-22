@@ -24,9 +24,9 @@ import (
 // startH2CUpgradeServer runs the golang.org/x/net/http2/h2c handler on a
 // loopback listener. The handler accepts the RFC 7540 §3.2 upgrade handshake
 // out of the box, so we get a known-good counterpart for the happy-path
-// integration-style test.
-func startH2CUpgradeServer(t *testing.T) (host, port string, cleanup func()) {
-	t.Helper()
+// integration-style test. Takes testing.TB so benchmarks can reuse it.
+func startH2CUpgradeServer(tb testing.TB) (host, port string, cleanup func()) {
+	tb.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -37,7 +37,7 @@ func startH2CUpgradeServer(t *testing.T) (host, port string, cleanup func()) {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
