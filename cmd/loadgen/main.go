@@ -168,12 +168,13 @@ func main() {
 	}
 
 	if result.Upgrade != nil {
+		// UpgradeAttempted == UpgradeSucceeded by construction today:
+		// newH2ClientWithDialer fails the whole run on the first dial error,
+		// so partial-success state is unreachable. The two fields are kept
+		// in the JSON shape as a forward-compatible slot for future
+		// best-effort dial semantics.
 		fmt.Fprintf(os.Stderr, "h2c upgrade: %d/%d conns upgraded successfully\n",
 			result.Upgrade.UpgradeSucceeded, result.Upgrade.UpgradeAttempted)
-		if result.Upgrade.UpgradeSucceeded < result.Upgrade.UpgradeAttempted {
-			fmt.Fprintf(os.Stderr, "warning: %d conns failed to upgrade\n",
-				result.Upgrade.UpgradeAttempted-result.Upgrade.UpgradeSucceeded)
-		}
 	}
 	if result.Mix != nil {
 		total := result.Mix.H1Requests + result.Mix.H2Requests + result.Mix.UpgradeRequests

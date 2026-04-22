@@ -37,8 +37,13 @@ type Result struct {
 // UpgradeStats summarises the outcome of h2c-upgrade handshakes across all
 // dialled connections. UpgradeAttempted is the number of conns loadgen tried
 // to dial; UpgradeSucceeded is the number that completed the 101 Switching
-// Protocols handshake. They are equal in the happy path; divergence means
-// some conns failed the upgrade (server misconfigured, refused upgrade, etc).
+// Protocols handshake.
+//
+// In the current implementation these two fields are ALWAYS equal: the
+// dialer fails the benchmark on the first conn that cannot upgrade, so a
+// partial-success state never reaches a Result. The two fields are retained
+// in the JSON shape as a forward-compatible slot for future best-effort
+// dial semantics (one flaky conn shouldn't tank the run).
 type UpgradeStats struct {
 	UpgradeAttempted int `json:"attempted"`
 	UpgradeSucceeded int `json:"succeeded"`
