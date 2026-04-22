@@ -41,15 +41,29 @@ func ParseMixRatio(s string) (MixRatio, error) {
 		}
 		s = s[eq+1:]
 	}
-	parts := strings.Split(s, ":")
-	if len(parts) != 3 {
-		return MixRatio{}, fmt.Errorf("loadgen: mix ratio must have 3 colon-separated weights, got %d in %q", len(parts), s)
-	}
-	weights := make([]int, 3)
-	for i, p := range parts {
-		v, err := strconv.Atoi(strings.TrimSpace(p))
+	// Parse exactly three colon-separated integers without allocating a
+	// []string or a []int. Cold path, but zero-alloc here means the
+	// benchmem floor is the same shape as the hot paths.
+	var weights [3]int
+	remaining := s
+	for i := range 3 {
+		var piece string
+		if i < 2 {
+			j := strings.IndexByte(remaining, ':')
+			if j < 0 {
+				return MixRatio{}, fmt.Errorf("loadgen: mix ratio must have 3 colon-separated weights, got %d in %q", i+1, s)
+			}
+			piece = remaining[:j]
+			remaining = remaining[j+1:]
+		} else {
+			if strings.IndexByte(remaining, ':') >= 0 {
+				return MixRatio{}, fmt.Errorf("loadgen: mix ratio must have 3 colon-separated weights, got %d in %q", 4, s)
+			}
+			piece = remaining
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(piece))
 		if err != nil {
-			return MixRatio{}, fmt.Errorf("loadgen: mix ratio weight %d is not a number: %q", i, p)
+			return MixRatio{}, fmt.Errorf("loadgen: mix ratio weight %d is not a number: %q", i, piece)
 		}
 		if v < 0 {
 			return MixRatio{}, fmt.Errorf("loadgen: mix ratio weight %d is negative: %d", i, v)
