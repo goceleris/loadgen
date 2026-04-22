@@ -85,6 +85,15 @@ type Config struct {
 	// HTTP/1.1 is used with one request per connection at a time.
 	HTTP2 bool
 
+	// H2CUpgrade enables the RFC 7540 §3.2 h2c upgrade handshake: each new
+	// connection starts as H1 carrying Connection: Upgrade, HTTP2-Settings
+	// + Upgrade: h2c headers, reads a 101 Switching Protocols response, then
+	// switches to H2 on the same TCP conn. Mutually exclusive with HTTP2:
+	// Validate() returns an error if both are set. Over TLS this is undefined
+	// and also rejected (servers negotiate H2 via ALPN, not h2c). Only meaningful
+	// when the URL scheme is "http".
+	H2CUpgrade bool
+
 	// HTTP2Options holds HTTP/2-specific tuning parameters.
 	// Only used when HTTP2 is true. HTTP/2 multiplexes streams over
 	// a single connection, but multiple connections can improve
@@ -179,19 +188,26 @@ func (c Config) Validate() error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("loadgen: unsupported URL scheme %q (must be http or https)", u.Scheme)
 	}
+	if c.HTTP2 && c.H2CUpgrade {
+		return errors.New("loadgen: HTTP2 and H2CUpgrade are mutually exclusive")
+	}
+	if c.H2CUpgrade && u.Scheme == "https" {
+		return errors.New("loadgen: H2CUpgrade requires http scheme (TLS uses ALPN, not h2c)")
+	}
 	if c.Duration <= 0 {
 		return errors.New("loadgen: Duration must be positive")
 	}
-	if !c.HTTP2 && c.Connections < 1 {
+	usesH2Pool := c.HTTP2 || c.H2CUpgrade
+	if !usesH2Pool && c.Connections < 1 {
 		return errors.New("loadgen: Connections must be >= 1")
 	}
 	if c.Workers < 1 {
 		return errors.New("loadgen: Workers must be >= 1")
 	}
-	if c.HTTP2 && c.HTTP2Options.Connections < 1 {
+	if usesH2Pool && c.HTTP2Options.Connections < 1 {
 		return errors.New("loadgen: HTTP2Options.Connections must be >= 1")
 	}
-	if c.HTTP2 && c.HTTP2Options.MaxStreams < 1 {
+	if usesH2Pool && c.HTTP2Options.MaxStreams < 1 {
 		return errors.New("loadgen: HTTP2Options.MaxStreams must be >= 1")
 	}
 	switch c.Method {
@@ -289,15 +305,16 @@ func New(cfg Config) (*Benchmarker, error) {
 	if cfg.MaxResponseSize == 0 {
 		cfg.MaxResponseSize = 10 << 20 // 10MB
 	}
+	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade
 	if cfg.ReadBufferSize == 0 {
-		if cfg.HTTP2 {
+		if useH2Defaults {
 			cfg.ReadBufferSize = 2 * 1024 * 1024 // 2MB for H2
 		} else {
 			cfg.ReadBufferSize = 256 * 1024 // 256KB for H1
 		}
 	}
 	if cfg.WriteBufferSize == 0 {
-		if cfg.HTTP2 {
+		if useH2Defaults {
 			cfg.WriteBufferSize = 2 * 1024 * 1024 // 2MB for H2
 		} else {
 			cfg.WriteBufferSize = 256 * 1024 // 256KB for H1
@@ -312,7 +329,7 @@ func New(cfg Config) (*Benchmarker, error) {
 	}
 
 	flushInterval := defaultFlushInterval // 256 for H1
-	if cfg.HTTP2 {
+	if useH2Defaults {
 		flushInterval = 16 // ~4 flushes/sec/worker at ~69 rps/worker
 	}
 
@@ -333,13 +350,17 @@ func New(cfg Config) (*Benchmarker, error) {
 
 	var raw Client
 
-	if cfg.HTTP2 {
+	switch {
+	case cfg.HTTP2:
 		// H2 workers are I/O-bound (blocked on channel round-trips), not CPU-bound.
 		// With multiplexed streams, workers need 4x headroom to keep the pipeline
 		// saturated. Little's Law: throughput = workers / RTT.
 		cfg.Workers *= 4
 		raw, err = newH2Client(host, port, path, cfg)
-	} else {
+	case cfg.H2CUpgrade:
+		cfg.Workers *= 4
+		raw, err = newH2CUpgradeClient(host, port, path, cfg)
+	default:
 		raw, err = newH1Client(host, port, path, cfg)
 	}
 
@@ -528,7 +549,7 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	rps := float64(reqs) / elapsed.Seconds()
 	throughput := float64(bytesRead) / elapsed.Seconds()
 
-	return &Result{
+	res := &Result{
 		Requests:       reqs,
 		Errors:         errs,
 		Duration:       elapsed,
@@ -536,4 +557,13 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		ThroughputBPS:  throughput,
 		Latency:        b.latencies.Percentiles(),
 	}
+
+	if h2c, ok := b.raw.(*h2Client); ok && h2c.dialedViaUpgrade {
+		res.Upgrade = &UpgradeStats{
+			UpgradeAttempted: h2c.upgradeAttempted,
+			UpgradeSucceeded: len(h2c.conns),
+		}
+	}
+
+	return res
 }

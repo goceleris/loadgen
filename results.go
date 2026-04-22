@@ -22,6 +22,22 @@ type Result struct {
 
 	ClientCPUPercent float64           `json:"client_cpu_percent,omitempty"`
 	Timeseries       []TimeseriesPoint `json:"timeseries,omitempty"`
+
+	// Upgrade, when non-nil, reports h2c-upgrade handshake outcomes for a
+	// run using -h2c-upgrade. UpgradeSucceeded counts conns that completed
+	// the 101 Switching Protocols handshake; UpgradeAttempted counts dialled
+	// connections. For non-upgrade runs this field is omitted.
+	Upgrade *UpgradeStats `json:"upgrade,omitempty"`
+}
+
+// UpgradeStats summarises the outcome of h2c-upgrade handshakes across all
+// dialled connections. UpgradeAttempted is the number of conns loadgen tried
+// to dial; UpgradeSucceeded is the number that completed the 101 Switching
+// Protocols handshake. They are equal in the happy path; divergence means
+// some conns failed the upgrade (server misconfigured, refused upgrade, etc).
+type UpgradeStats struct {
+	UpgradeAttempted int `json:"attempted"`
+	UpgradeSucceeded int `json:"succeeded"`
 }
 
 // Percentiles holds latency percentile values.

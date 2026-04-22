@@ -22,6 +22,17 @@ type h2Client struct {
 	headerBlock []byte // pre-encoded HPACK header block (immutable)
 	dataPayload []byte // body bytes for POST (nil for GET)
 	hasBody     bool
+
+	// dialedViaUpgrade reports whether this client's connections were
+	// established via the h2c upgrade handshake vs prior-knowledge H2.
+	// Populated by newH2CUpgradeClient so the benchmark report can show
+	// "upgraded X/Y conns successfully".
+	dialedViaUpgrade bool
+	// upgradeAttempted is the configured connection count (i.e. the number
+	// of upgrade handshakes attempted). Equal to len(conns) on success;
+	// New() currently fails the whole benchmark on any dial error so these
+	// are equal in the happy path.
+	upgradeAttempted int
 }
 
 // h2WriteReq is a frame write request submitted to the writer goroutine.
@@ -183,10 +194,24 @@ func extractStatus(headerBlock []byte) int {
 
 // newH2Client creates a new zero-alloc HTTP/2 client.
 func newH2Client(host, port, path string, cfg Config) (*h2Client, error) {
+	return newH2ClientWithDialer(host, port, path, cfg, false)
+}
+
+// newH2CUpgradeClient creates a new zero-alloc HTTP/2 client that establishes
+// each connection via the RFC 7540 §3.2 h2c upgrade handshake (starts H1,
+// negotiates the upgrade, then switches to H2 on the same TCP conn).
+func newH2CUpgradeClient(host, port, path string, cfg Config) (*h2Client, error) {
+	return newH2ClientWithDialer(host, port, path, cfg, true)
+}
+
+func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*h2Client, error) {
 	addr := net.JoinHostPort(host, port)
 	scheme := cfg.scheme
 	if scheme == "" {
 		scheme = "http"
+	}
+	if upgrade && scheme == "https" {
+		return nil, fmt.Errorf("h2client: h2c upgrade is only defined over cleartext (got scheme %q)", scheme)
 	}
 	headerBlock := buildHPACKHeaders(cfg.Method, host, port, path, cfg.Headers, len(cfg.Body), scheme)
 	hasBody := len(cfg.Body) > 0
@@ -209,7 +234,13 @@ func newH2Client(host, port, path string, cfg Config) (*h2Client, error) {
 
 	conns := make([]*h2Conn, numConns)
 	for i := range numConns {
-		hc, err := dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+		var hc *h2Conn
+		var err error
+		if upgrade {
+			hc, err = dialH2CUpgrade(addr, scheme, path, host, port, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+		} else {
+			hc, err = dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+		}
 		if err != nil {
 			for j := range i {
 				conns[j].closeConn()
@@ -226,10 +257,12 @@ func newH2Client(host, port, path string, cfg Config) (*h2Client, error) {
 	}
 
 	return &h2Client{
-		conns:       conns,
-		headerBlock: headerBlock,
-		dataPayload: payload,
-		hasBody:     hasBody,
+		conns:            conns,
+		headerBlock:      headerBlock,
+		dataPayload:      payload,
+		hasBody:          hasBody,
+		dialedViaUpgrade: upgrade,
+		upgradeAttempted: numConns,
 	}, nil
 }
 
@@ -315,21 +348,42 @@ func dialH2(addr, scheme string, maxStreams int, dialTimeout time.Duration, read
 		}
 	}
 
+	br := bufio.NewReaderSize(conn, 65536)
+	return completeH2Handshake(conn, br, addr, maxStreams, 1)
+}
+
+// h2HandshakeSettings is the SETTINGS payload loadgen sends on every H2
+// handshake. It is exposed as a package-level value so the h2c-upgrade path
+// can base64url-encode it for the HTTP2-Settings request header.
+var h2HandshakeSettings = [][2]uint32{
+	{settingEnablePush, 0},
+	{settingInitialWindowSize, h2InitialWindowSize},
+	{settingMaxFrameSize, h2MaxFrameSize},
+	{settingHeaderTableSize, 0},
+}
+
+// completeH2Handshake runs the client-side H2 handshake over an already-open
+// TCP (or TLS) connection: writes the client preface + SETTINGS + WINDOW_UPDATE,
+// reads the server SETTINGS, acks it, and waits for the server SETTINGS ack.
+//
+// initialStreamID selects the first client-initiated stream ID. For a normal
+// H2 prior-knowledge connection this is 1. For an h2c-upgrade connection,
+// stream 1 is already consumed by the upgrade GET, so callers pass 3.
+//
+// br is the caller-provided buffered reader. For prior-knowledge H2 the caller
+// constructs a fresh one; for h2c-upgrade the caller passes the reader already
+// positioned past the `101 Switching Protocols` CRLF CRLF so any buffered bytes
+// (typically the server's SETTINGS frame) are not lost.
+func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStreams int, initialStreamID uint32) (*h2Conn, error) {
 	if _, err := conn.Write([]byte(h2ClientPreface)); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write preface: %w", err)
 	}
 
 	bw := bufio.NewWriterSize(conn, 65536)
-	br := bufio.NewReaderSize(conn, 65536)
 	framer := newH2Framer(bw, br)
 
-	if err := framer.WriteSettings([][2]uint32{
-		{settingEnablePush, 0},
-		{settingInitialWindowSize, h2InitialWindowSize},
-		{settingMaxFrameSize, h2MaxFrameSize},
-		{settingHeaderTableSize, 0},
-	}); err != nil {
+	if err := framer.WriteSettings(h2HandshakeSettings); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write settings: %w", err)
 	}
@@ -413,7 +467,7 @@ func dialH2(addr, scheme string, maxStreams int, dialTimeout time.Duration, read
 			},
 		},
 	}
-	hc.nextStreamID.Store(1)
+	hc.nextStreamID.Store(initialStreamID)
 
 	for range effectiveStreams {
 		hc.streamSem <- struct{}{}

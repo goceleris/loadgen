@@ -40,7 +40,8 @@ func main() {
 		warmup      = flag.Duration("warmup", 2*time.Second, "warmup duration")
 		connections = flag.Int("connections", 256, "number of H1 connections (= workers)")
 		workers     = flag.Int("workers", 0, "number of workers (default: connections for H1, connections*4 for H2)")
-		h2          = flag.Bool("h2", false, "use HTTP/2 (h2c)")
+		h2          = flag.Bool("h2", false, "use HTTP/2 prior-knowledge (h2c)")
+		h2cUpgrade  = flag.Bool("h2c-upgrade", false, "use HTTP/2 via RFC 7540 §3.2 h2c upgrade handshake")
 		h2Conns     = flag.Int("h2-conns", 16, "H2 connections")
 		h2Streams   = flag.Int("h2-streams", 100, "max concurrent H2 streams per connection")
 		method      = flag.String("method", "GET", "HTTP method")
@@ -59,9 +60,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Mutually-exclusive protocol-selection flags.
+	if *h2 && *h2cUpgrade {
+		fmt.Fprintln(os.Stderr, "error: -h2 and -h2c-upgrade are mutually exclusive")
+		os.Exit(2)
+	}
+
+	multiplexed := *h2 || *h2cUpgrade
 	w := *workers
 	if w == 0 {
-		if *h2 {
+		if multiplexed {
 			w = runtime.NumCPU() * 4
 		} else {
 			w = *connections
@@ -102,6 +110,7 @@ func main() {
 		Workers:          w,
 		DisableKeepAlive: *connClose,
 		HTTP2:            *h2,
+		H2CUpgrade:       *h2cUpgrade,
 		HTTP2Options: loadgen.HTTP2Options{
 			Connections: *h2Conns,
 			MaxStreams:  *h2Streams,
@@ -134,6 +143,15 @@ func main() {
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		log.Fatalf("benchmark failed: %v", err)
+	}
+
+	if result.Upgrade != nil {
+		fmt.Fprintf(os.Stderr, "h2c upgrade: %d/%d conns upgraded successfully\n",
+			result.Upgrade.UpgradeSucceeded, result.Upgrade.UpgradeAttempted)
+		if result.Upgrade.UpgradeSucceeded < result.Upgrade.UpgradeAttempted {
+			fmt.Fprintf(os.Stderr, "warning: %d conns failed to upgrade\n",
+				result.Upgrade.UpgradeAttempted-result.Upgrade.UpgradeSucceeded)
+		}
 	}
 
 	// Output JSON result.
