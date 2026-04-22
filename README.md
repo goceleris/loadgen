@@ -146,7 +146,9 @@ Flags:
   -H string            Custom header "Key: Value" (repeatable)
   -body-file string    Read request body from file
   -close               Send Connection: close (H1 only)
-  -h2                  Use HTTP/2 (h2c/h2)
+  -h2                  Use HTTP/2 prior-knowledge (h2c/h2)
+  -h2c-upgrade         Use HTTP/2 via RFC 7540 §3.2 h2c upgrade handshake
+  -mix string          Per-connection protocol mix ratio, e.g. h1:h2:upgrade=4:4:1
   -h2-conns int        H2 connections (default 16)
   -h2-streams int      Max concurrent H2 streams per connection (default 100)
   -insecure            Skip TLS certificate verification
@@ -166,6 +168,43 @@ loadgen -url http://localhost:8080/ -h2 -h2-conns 16 -h2-streams 200 -duration 3
 # HTTPS with rate limiting
 loadgen -url https://api.example.com/health -insecure -max-rps 5000 -duration 60s
 ```
+
+### `-h2c-upgrade` (RFC 7540 §3.2)
+
+Starts each connection as HTTP/1.1 carrying `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c` headers, reads a `101 Switching Protocols` response, then switches to HTTP/2 on the same TCP socket. Exercises the cleartext upgrade path that is absent from `-h2` (which sends the H2 preface directly, skipping HTTP/1.1 entirely). Mutually exclusive with `-h2` and `-mix`. Only defined over cleartext HTTP — TLS servers negotiate H2 via ALPN.
+
+```bash
+# Basic h2c upgrade run.
+loadgen -url http://localhost:8080/ -h2c-upgrade -duration 30s
+
+# h2c upgrade with many connections + streams (matches browser-style fanout).
+loadgen -url http://localhost:8080/ -h2c-upgrade -h2-conns 16 -h2-streams 200 -duration 30s
+
+# Target an endpoint used by the celeris Protocol: Auto + EnableH2Upgrade test.
+loadgen -url http://127.0.0.1:9000/api/health -h2c-upgrade -duration 60s -warmup 5s
+```
+
+The final output includes an `upgrade` block in the JSON result plus a stderr line summarising how many connections completed the handshake: `h2c upgrade: X/Y conns upgraded successfully`.
+
+### `-mix` — realistic traffic mixtures
+
+Assigns each connection to a protocol by weighted random draw across H1, H2 prior-knowledge, and h2c-upgrade. Connections commit to their chosen protocol for life. Mutually exclusive with `-h2` and `-h2c-upgrade`. Format: `h1:h2:upgrade=N:N:N` (the `h1:h2:upgrade=` prefix is optional; a bare `N:N:N` also parses). Weights must be non-negative integers; `0:0:0` is rejected.
+
+```bash
+# Third of each protocol — equal fan-out across the dispatcher.
+loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=1:1:1 -duration 30s
+
+# Browser-heavy H2 with a trickle of legacy H1 upgrades (44/44/11).
+loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=4:4:1 -duration 60s
+
+# Mostly H1 with an occasional H2 client (90/10 split).
+loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=9:1:0 -duration 30s
+
+# Fully equivalent to -h2c-upgrade but routed through the mix dispatcher.
+loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=0:0:1 -duration 30s
+```
+
+The `mix` block in the JSON result reports per-protocol connection counts, requests, and errors. The stderr summary prints a matching per-protocol breakdown so you can confirm the server handled each slot correctly.
 
 Output is JSON with RPS, latency percentiles (p50-p99.99), errors, throughput, and timeseries data.
 
