@@ -426,9 +426,9 @@ func TestH1MaxResponseSizeChunked(t *testing.T) {
 		var sb strings.Builder
 		sb.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
 		chunk := strings.Repeat("X", 600)
-		sb.WriteString(fmt.Sprintf("%x\r\n%s\r\n", len(chunk), chunk))
+		fmt.Fprintf(&sb, "%x\r\n%s\r\n", len(chunk), chunk)
 		chunk2 := strings.Repeat("Y", 500)
-		sb.WriteString(fmt.Sprintf("%x\r\n%s\r\n", len(chunk2), chunk2))
+		fmt.Fprintf(&sb, "%x\r\n%s\r\n", len(chunk2), chunk2)
 		sb.WriteString("0\r\n\r\n")
 		_, _ = io.WriteString(conn, sb.String())
 		// Close after sending so any drain gets EOF.
