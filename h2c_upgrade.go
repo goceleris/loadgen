@@ -29,7 +29,13 @@ const h2cUpgradeDefaultPath = "/"
 // upgrade requests with bodies. Loadgen issues the first request as a
 // no-body GET and then multiplexes the real workload on subsequent H2
 // streams.
-func buildH2CUpgradeRequest(path, host, port string, settingsPayload []byte) []byte {
+//
+// The Host header follows RFC 9110 §7.2: the port is omitted when it is
+// the scheme default (80 for http), matching Go's net/http.Request.Write
+// canonicalisation. h2c upgrade is http-only (see dialH2CUpgrade), so only
+// the port-80 case matters in practice, but the logic is kept
+// scheme-aware for future-proofing.
+func buildH2CUpgradeRequest(path, host, port, scheme string, settingsPayload []byte) []byte {
 	b64 := base64.RawURLEncoding.EncodeToString(settingsPayload)
 
 	buf := make([]byte, 0, 256)
@@ -38,8 +44,10 @@ func buildH2CUpgradeRequest(path, host, port string, settingsPayload []byte) []b
 	buf = append(buf, " HTTP/1.1\r\n"...)
 	buf = append(buf, "Host: "...)
 	buf = append(buf, host...)
-	buf = append(buf, ':')
-	buf = append(buf, port...)
+	if !isDefaultPort(scheme, port) {
+		buf = append(buf, ':')
+		buf = append(buf, port...)
+	}
 	buf = append(buf, "\r\n"...)
 	buf = append(buf, "Connection: Upgrade, HTTP2-Settings\r\n"...)
 	buf = append(buf, "Upgrade: h2c\r\n"...)
@@ -47,6 +55,22 @@ func buildH2CUpgradeRequest(path, host, port string, settingsPayload []byte) []b
 	buf = append(buf, b64...)
 	buf = append(buf, "\r\n\r\n"...)
 	return buf
+}
+
+// isDefaultPort reports whether port is the default for scheme. Empty port
+// is treated as default. Used to canonicalise Host headers so we don't emit
+// ":80" / ":443" — some strict servers reject non-canonical Host.
+func isDefaultPort(scheme, port string) bool {
+	if port == "" {
+		return true
+	}
+	switch scheme {
+	case "http":
+		return port == "80"
+	case "https":
+		return port == "443"
+	}
+	return false
 }
 
 // encodeH2SettingsPayload serialises the client's SETTINGS frame payload
@@ -103,7 +127,7 @@ func dialH2CUpgrade(addr, scheme, path, host, port string, maxStreams int, dialT
 	}
 
 	settingsPayload := encodeH2SettingsPayload(h2HandshakeSettings)
-	req := buildH2CUpgradeRequest(path, host, port, settingsPayload)
+	req := buildH2CUpgradeRequest(path, host, port, scheme, settingsPayload)
 
 	// Allow up to 10s for the upgrade round-trip. Cleared before returning
 	// to the caller so completeH2Handshake can set its own handshake deadline.

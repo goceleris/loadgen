@@ -511,6 +511,42 @@ func TestH2CUpgradeStressAfterHandshake(t *testing.T) {
 	t.Logf("upgrade stress: %d OK, %d errors", okCount.Load(), errCount.Load())
 }
 
+// TestBuildH2CUpgradeRequestHostCanonical verifies the Host header follows
+// RFC 9110 §7.2: the port is omitted when it matches the scheme default.
+// Previously loadgen always included the port — some strict servers treat
+// "example.com:80" as non-canonical and may reject it.
+func TestBuildH2CUpgradeRequestHostCanonical(t *testing.T) {
+	cases := []struct {
+		name   string
+		host   string
+		port   string
+		scheme string
+		want   string
+	}{
+		{"http default port stripped", "example.com", "80", "http", "Host: example.com\r\n"},
+		{"http non-default port kept", "example.com", "8080", "http", "Host: example.com:8080\r\n"},
+		{"https default port stripped", "example.com", "443", "https", "Host: example.com\r\n"},
+		{"https non-default port kept", "example.com", "8443", "https", "Host: example.com:8443\r\n"},
+		{"loopback non-default port kept", "127.0.0.1", "12345", "http", "Host: 127.0.0.1:12345\r\n"},
+		{"empty port omitted", "example.com", "", "http", "Host: example.com\r\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := buildH2CUpgradeRequest("/", tc.host, tc.port, tc.scheme, []byte{0, 0, 0, 0, 0, 0})
+			if !bytes.Contains(req, []byte(tc.want)) {
+				t.Errorf("request missing %q\n---\n%s\n---", tc.want, req)
+			}
+			// Regression guard: never emit ":<default-port>" in the Host line.
+			if tc.scheme == "http" && tc.port == "80" && bytes.Contains(req, []byte("Host: example.com:80")) {
+				t.Error("http default port 80 must be stripped")
+			}
+			if tc.scheme == "https" && tc.port == "443" && bytes.Contains(req, []byte("Host: example.com:443")) {
+				t.Error("https default port 443 must be stripped")
+			}
+		})
+	}
+}
+
 // hasToken reports whether a comma-separated header list contains token
 // (case-insensitive, leading/trailing whitespace tolerant).
 func hasToken(list, token string) bool {
