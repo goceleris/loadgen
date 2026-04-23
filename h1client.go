@@ -170,7 +170,7 @@ func buildH1Request(method, path, host, port string, headers map[string]string, 
 
 func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBufSize int, tlsCfg *tls.Config) (net.Conn, error) {
 	if scheme == "https" {
-		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsCfg)
+		conn, err := dialTLSRetry(addr, dialTimeout, tlsCfg)
 		if err != nil {
 			return nil, err
 		}
@@ -181,7 +181,7 @@ func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBu
 		}
 		return conn, nil
 	}
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	conn, err := dialTCPRetry(addr, dialTimeout)
 	if err != nil {
 		return nil, err
 	}

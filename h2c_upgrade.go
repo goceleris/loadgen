@@ -143,7 +143,7 @@ func dialH2CUpgrade(addr, scheme, path, host, port string, maxStreams int, dialT
 		return nil, fmt.Errorf("h2c upgrade: not supported over TLS (use -h2 with ALPN instead)")
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	conn, err := dialTCPRetry(addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("h2c upgrade: dial: %w", err)
 	}

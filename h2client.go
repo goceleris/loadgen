@@ -327,17 +327,18 @@ func dialH2(addr, scheme string, maxStreams int, dialTimeout time.Duration, read
 	var conn net.Conn
 	var err error
 	if scheme == "https" {
-		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", addr, tlsCfg)
-		if err != nil {
-			return nil, err
+		tlsConn, tlsErr := dialTLSRetry(addr, dialTimeout, tlsCfg)
+		if tlsErr != nil {
+			return nil, tlsErr
 		}
-		if tcpConn, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn); ok {
+		conn = tlsConn
+		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
 			_ = tcpConn.SetReadBuffer(readBufSize)
 			_ = tcpConn.SetWriteBuffer(writeBufSize)
 		}
 	} else {
-		conn, err = net.DialTimeout("tcp", addr, dialTimeout)
+		conn, err = dialTCPRetry(addr, dialTimeout)
 		if err != nil {
 			return nil, err
 		}
