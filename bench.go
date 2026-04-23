@@ -601,6 +601,7 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		RequestsPerSec: rps,
 		ThroughputBPS:  throughput,
 		Latency:        b.latencies.Percentiles(),
+		DialRetries:    snapshotDialRetries(),
 	}
 
 	switch c := b.raw.(type) {

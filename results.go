@@ -32,6 +32,15 @@ type Result struct {
 	// Mix, when non-nil, reports per-protocol request / error / conn counts
 	// for a run using -mix. Omitted for single-protocol runs.
 	Mix *MixStats `json:"mix,omitempty"`
+
+	// DialRetries counts how many TCP SYN retries happened during the
+	// run because the first SYN got an RST back (SO_REUSEPORT listener
+	// replacement, adaptive engine active-engine switch, conntrack
+	// collision, …). Zero in the normal case; a nonzero value is a
+	// release-gate signal that the peer has a brief "no listener on
+	// port" window and the run survived it only because loadgen
+	// retried — the peer may still want to investigate.
+	DialRetries uint64 `json:"dial_retries,omitempty"`
 }
 
 // UpgradeStats summarises the outcome of h2c-upgrade handshakes across all
