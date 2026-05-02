@@ -208,6 +208,60 @@ The `mix` block in the JSON result reports per-protocol connection counts, reque
 
 Output is JSON with RPS, latency percentiles (p50-p99.99), errors, throughput, and timeseries data.
 
+## Cluster-bench integration contract
+
+`cmd/loadgen` is designed to be invoked remotely (over SSH or by an
+orchestrator like Ansible) on a dedicated load-generation host. The
+contract is:
+
+| Aspect            | Behavior                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------ |
+| **stdout**        | A single pretty-printed JSON `Result` object — no progress noise, no log lines.                  |
+| **stderr**        | Human-readable progress (`<elapsed>  <reqs>  <rps>`), final mix/upgrade summaries, error traces. |
+| **exit 0**        | Benchmark ran to completion (errors during the run are reported in JSON, not via exit code).     |
+| **exit non-zero** | Configuration error (`-url` missing, mutually-exclusive flags, body-file unreadable, etc.).      |
+| **SIGINT / SIGTERM** | Cancels the run *gracefully* — partial Result still printed to stdout, exit 0.                |
+
+### JSON output schema
+
+The shape comes from `loadgen.Result` in `results.go`. Stable fields used by orchestrators:
+
+| Field                         | Type     | Meaning                                                                |
+| ----------------------------- | -------- | ---------------------------------------------------------------------- |
+| `Requests`                    | int64    | Total successful requests during the measurement window.               |
+| `Errors`                      | int64    | Total errors during the measurement window.                            |
+| `Bytes`                       | int64    | Total response body bytes received.                                    |
+| `RequestsPerSec`              | float64  | `Requests / Duration.Seconds()`.                                       |
+| `BytesPerSec`                 | float64  | `Bytes / Duration.Seconds()`.                                          |
+| `Duration`                    | duration | Wall-clock measurement duration (post-warmup).                         |
+| `Latency.{P50,P75,P90,P99,P99_9,P99_99}` | duration | Latency percentiles in nanoseconds.                       |
+| `Mix` (optional)              | object   | Present when `-mix` was used. See "Mix-mode benchmarks" above.         |
+| `Upgrade` (optional)          | object   | Present when `-h2c-upgrade` was used. Records connection upgrade tally.|
+
+### Pre-built binary releases
+
+GitHub Releases ship platform tarballs that orchestrators can fetch directly:
+
+```bash
+TAG=v1.1.0
+OS=linux
+ARCH=amd64
+curl -fsSL "https://github.com/goceleris/loadgen/releases/download/${TAG}/loadgen_${OS}_${ARCH}.tar.gz" \
+  | tar xz -C /tmp/
+chmod +x /tmp/loadgen-${OS}-${ARCH}
+/tmp/loadgen-${OS}-${ARCH} -url http://target:8080/ -duration 10s
+```
+
+A matching `.sha256` file accompanies each archive.
+
+### Reference orchestrator
+
+The celeris cluster bench (see `goceleris/celeris` → `mage clusterBench` +
+`ansible/cluster-bench.yml`) uses this contract. Cross-compiles loadgen
+on the dev machine (or fetches a release tarball), pushes to the
+loadgen host, executes, parses stdout JSON, fetches stderr+stdout to
+the dev box.
+
 ## Architecture
 
 ```
