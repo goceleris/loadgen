@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,75 @@ import (
 
 	"golang.org/x/net/http2/hpack"
 )
+
+// Hot-path errors are pre-allocated and shared across goroutines so the
+// 4xx/5xx response storm + RST_STREAM flood (e.g. when the server hits
+// SETTINGS_MAX_CONCURRENT_STREAMS) doesn't cap loadgen throughput on
+// allocator/string-building. These types implement error and expose
+// the structured fields for callers that want to inspect them.
+
+// HTTP2StatusError is the error returned by [h2Client.DoRequest] for
+// non-2xx responses. The receiver is a pointer to a pre-allocated
+// instance per status code in the 100-599 range — never construct one
+// yourself, and don't compare error strings (use errors.As instead).
+type HTTP2StatusError struct{ Status int }
+
+// Error renders the canonical loadgen string. Stable across loadgen
+// versions for log scraping; the structured Status field is the
+// programmatic accessor.
+func (e *HTTP2StatusError) Error() string {
+	return "h2client: status " + strconv.Itoa(e.Status)
+}
+
+// HTTP2ResetError is returned by DoRequest when the server reset the
+// stream with RST_STREAM. Pre-allocated for known H2 error codes to
+// avoid the per-call fmt.Errorf alloc that capped throughput when
+// MaxConcurrentStreams was exceeded.
+type HTTP2ResetError struct{ Code uint32 }
+
+func (e *HTTP2ResetError) Error() string {
+	return "h2client: stream reset code=" + strconv.FormatUint(uint64(e.Code), 10)
+}
+
+var (
+	// 100..599 covers every legal HTTP status; 600 entries is a 4.8 KB
+	// table on 64-bit. Indexed directly by status int.
+	statusErrors    [600]*HTTP2StatusError
+	resetErrorsHot  [16]*HTTP2ResetError // H2 error codes 0..14 are defined; 15 reserved
+	resetErrorOther = &HTTP2ResetError{Code: ^uint32(0)}
+)
+
+func init() {
+	for i := 100; i < 600; i++ {
+		statusErrors[i] = &HTTP2StatusError{Status: i}
+	}
+	for i := uint32(0); i < uint32(len(resetErrorsHot)); i++ {
+		resetErrorsHot[i] = &HTTP2ResetError{Code: i}
+	}
+}
+
+// statusError returns a shared *HTTP2StatusError for any int status
+// in [100, 600). Returns a freshly-allocated one for out-of-range
+// status (which shouldn't happen on a valid HTTP response).
+func statusError(status int) error {
+	if status < 0 || status >= len(statusErrors) {
+		return &HTTP2StatusError{Status: status}
+	}
+	if e := statusErrors[status]; e != nil {
+		return e
+	}
+	return &HTTP2StatusError{Status: status}
+}
+
+// resetError returns a shared *HTTP2ResetError for known codes,
+// falling back to resetErrorOther for unknown codes (rare; the
+// caller can still detect "this was a reset" via errors.As).
+func resetError(code uint32) error {
+	if code < uint32(len(resetErrorsHot)) {
+		return resetErrorsHot[code]
+	}
+	return resetErrorOther
+}
 
 // h2Client is a zero-allocation HTTP/2 benchmark client.
 // Uses pre-encoded HPACK headers, dedicated writer goroutine per connection,
@@ -631,7 +701,7 @@ func (hc *h2Conn) readLoop() {
 			idx := (frame.StreamID >> 1) % numSlots
 			chPtr := hc.streamSlots[idx].ch.Swap(nil)
 			if chPtr != nil {
-				*chPtr <- h2Response{err: fmt.Errorf("stream reset: code=%d", frame.ErrCode())}
+				*chPtr <- h2Response{err: resetError(uint32(frame.ErrCode()))}
 			}
 
 		case frameSettings:
@@ -725,7 +795,7 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 			return 0, resp.err
 		}
 		if resp.status >= 400 {
-			return resp.bytesRead, fmt.Errorf("h2client: conn[%d] status %d", idx, resp.status)
+			return resp.bytesRead, statusError(resp.status)
 		}
 		return resp.bytesRead, nil
 	case <-ctx.Done():
