@@ -701,7 +701,7 @@ func (hc *h2Conn) readLoop() {
 			idx := (frame.StreamID >> 1) % numSlots
 			chPtr := hc.streamSlots[idx].ch.Swap(nil)
 			if chPtr != nil {
-				*chPtr <- h2Response{err: resetError(uint32(frame.ErrCode()))}
+				*chPtr <- h2Response{err: resetError(frame.ErrCode())}
 			}
 
 		case frameSettings:
