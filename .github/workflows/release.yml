@@ -67,10 +67,7 @@ jobs:
         run: |
           cd dist
           tar czf "loadgen_${GOOS}_${GOARCH}.tar.gz" "loadgen-${GOOS}-${GOARCH}"
-          sha256sum "loadgen_${GOOS}_${GOARCH}.tar.gz" > "loadgen_${GOOS}_${GOARCH}.tar.gz.sha256"
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
-            dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz.sha256
+          files: dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
