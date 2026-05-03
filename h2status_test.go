@@ -1,6 +1,71 @@
 package loadgen
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+// TestStatusErrorReuseAndAs verifies that statusError() returns the
+// same pre-allocated *HTTP2StatusError instance across calls (zero
+// alloc on the hot 4xx path) and that the public errors.As contract
+// still works for callers that want to inspect the status field.
+func TestStatusErrorReuseAndAs(t *testing.T) {
+	for _, code := range []int{200, 400, 404, 429, 500, 503} {
+		a := statusError(code)
+		b := statusError(code)
+		if a != b {
+			t.Errorf("statusError(%d) returned different instances", code)
+		}
+		var se *HTTP2StatusError
+		if !errors.As(a, &se) {
+			t.Errorf("errors.As(statusError(%d)) failed", code)
+			continue
+		}
+		if se.Status != code {
+			t.Errorf("HTTP2StatusError.Status = %d, want %d", se.Status, code)
+		}
+	}
+	// Out-of-range still returns a valid error (just freshly allocated).
+	got := statusError(999)
+	var se *HTTP2StatusError
+	if !errors.As(got, &se) || se.Status != 999 {
+		t.Errorf("out-of-range statusError(999) lost status info")
+	}
+}
+
+// TestResetErrorReuseAndAs same contract for stream-reset codes.
+func TestResetErrorReuseAndAs(t *testing.T) {
+	for _, code := range []uint32{0, 7, 8, 11, 14} {
+		a := resetError(code)
+		b := resetError(code)
+		if a != b {
+			t.Errorf("resetError(%d) returned different instances", code)
+		}
+		var re *HTTP2ResetError
+		if !errors.As(a, &re) {
+			t.Errorf("errors.As(resetError(%d)) failed", code)
+			continue
+		}
+		if re.Code != code {
+			t.Errorf("HTTP2ResetError.Code = %d, want %d", re.Code, code)
+		}
+	}
+}
+
+// BenchmarkStatusError documents the per-call cost: should be 0 B/op,
+// 0 allocs/op, since pre-allocated table entries are returned by
+// pointer.
+func BenchmarkStatusError(b *testing.B) {
+	for b.Loop() {
+		_ = statusError(404)
+	}
+}
+
+func BenchmarkResetError(b *testing.B) {
+	for b.Loop() {
+		_ = resetError(7)
+	}
+}
 
 func TestExtractStatus(t *testing.T) {
 	tests := []struct {
