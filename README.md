@@ -252,7 +252,9 @@ chmod +x /tmp/loadgen-${OS}-${ARCH}
 /tmp/loadgen-${OS}-${ARCH} -url http://target:8080/ -duration 10s
 ```
 
-A matching `.sha256` file accompanies each archive.
+GitHub displays the SHA-256 of each release asset on the release page —
+`gh release download <tag>` and the GitHub UI verify checksums automatically,
+so the workflow doesn't ship a separate `.sha256` sidecar.
 
 ### Reference orchestrator
 
