@@ -68,6 +68,6 @@ jobs:
           cd dist
           tar czf "loadgen_${GOOS}_${GOARCH}.tar.gz" "loadgen-${GOOS}-${GOARCH}"
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
