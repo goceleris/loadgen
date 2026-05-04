@@ -166,15 +166,18 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		{serverProto: "h2c", serverUpgrade: "false", mode: modeUpgrade, expectOK: false, stdSkipReason: h2cServingH1},
 
 		// Protocol=H2C, EnableH2Upgrade=true
-		// Even with upgrade=true, the H2C listener never runs the H1 parser
-		// — celeris/engine/epoll/loop.go:459-463 calls initProtocol(H2C)
-		// directly when Protocol!=Auto, so the H2 framer sees the H1 upgrade
-		// request bytes as a malformed preface and closes the connection.
-		// EnableH2Upgrade is only meaningful for H1 listeners; on an H2C
-		// listener the flag is effectively a no-op.
-		{serverProto: "h2c", serverUpgrade: "true", mode: modeH1, expectOK: false, stdSkipReason: h2cServingH1},
+		// In celeris v1.4.1 the native engines defer the protocol commit
+		// to detectProtocol on first recv when Protocol=H2C and
+		// EnableH2Upgrade=true (mirroring Auto), so the listener accepts
+		// H1 plaintext, prior-knowledge H2, AND honours the H1→H2 upgrade.
+		// See celeris/engine/iouring/worker.go:782-794 and the matching
+		// deferred-commit branch in engine/epoll/loop.go acceptAll.
+		// The Std (net/http) engine answers 200 on the H1 socket and never
+		// emits 101 Switching Protocols, so the modeUpgrade row would be a
+		// silent-pass there and stays gated behind stdSkipReason.
+		{serverProto: "h2c", serverUpgrade: "true", mode: modeH1, expectOK: true},
 		{serverProto: "h2c", serverUpgrade: "true", mode: modeH2, expectOK: true},
-		{serverProto: "h2c", serverUpgrade: "true", mode: modeUpgrade, expectOK: false, stdSkipReason: h2cServingH1},
+		{serverProto: "h2c", serverUpgrade: "true", mode: modeUpgrade, expectOK: true, stdSkipReason: "std (net/http) engine ignores H2C upgrade and answers 200 on H1 — only the native linux engines emit 101 Switching Protocols"},
 
 		// Protocol=Auto, EnableH2Upgrade=false
 		// NOTE: celeris/resource/config.go:167-169 silently coerces
