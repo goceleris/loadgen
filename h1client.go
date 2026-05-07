@@ -459,3 +459,16 @@ func (c *h1Client) Close() {
 		hc.mu.Unlock()
 	}
 }
+
+// Unblock implements the bench Unblocker extension. Sets a deadline
+// on every pooled conn so workers stuck inside a blocking Read/Write
+// return with a timeout error, then can observe ctx cancellation and
+// exit. Pass the zero Time to clear deadlines (lets post-warmup
+// reuse the same pool).
+func (c *h1Client) Unblock(t time.Time) {
+	for _, hc := range c.conns {
+		hc.mu.Lock()
+		_ = hc.conn.SetDeadline(t)
+		hc.mu.Unlock()
+	}
+}

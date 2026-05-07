@@ -264,6 +264,24 @@ type Client interface {
 	Close()
 }
 
+// Unblocker is an optional extension implemented by clients whose
+// underlying connections support timeout-based cancellation
+// (net.Conn.SetDeadline). When workers are stuck inside a blocking
+// Read/Write that does NOT honor context cancellation — every
+// stdlib net.Conn — calling Unblock(time.Now()) forces every active
+// I/O on the client's pooled conns to return with a timeout error,
+// letting workers observe ctx.Done() and exit promptly. Cleared by
+// passing the zero Time. Used by warmup to flush stuck workers
+// without closing the conns (post-warmup re-uses the same pool).
+//
+// Implemented by h1Client, h2Client, mixClient, h2cUpgradeClient.
+// Custom Client implementations may opt in for the same benefit;
+// the bench will fall back to unconditional warmup-end if absent
+// (workers exit naturally on the next DoRequest completion).
+type Unblocker interface {
+	Unblock(t time.Time)
+}
+
 // Benchmarker runs HTTP benchmarks.
 type Benchmarker struct {
 	config Config
@@ -537,7 +555,25 @@ func (b *Benchmarker) warmup(ctx context.Context) {
 
 	<-warmupCtx.Done()
 	b.running.Store(false)
+	// Net.Conn doesn't honor context cancellation — workers stuck
+	// inside Read/Write would block until the syscall returns
+	// naturally, which on a slow / heavily-loaded server can be
+	// minutes. Calling Unblock(time.Now()) sets every pooled conn's
+	// deadline to "right now", so any active Read/Write returns with
+	// a timeout error; the worker's DoRequest fails fast, the worker
+	// re-checks running, and exits. Without this, b.wg.Wait below
+	// can stall well past the warmup window — observed on -race
+	// matrix runs where 1MB POSTs naturally took 30+ seconds and
+	// stretched warmup so far that post-warmup got 18ms of cellCtx
+	// before fail-fast tripped. Reset the deadline before workers
+	// spawn again in Run() so post-warmup uses the same warm pool.
+	if u, ok := b.raw.(Unblocker); ok {
+		u.Unblock(time.Now())
+	}
 	b.wg.Wait()
+	if u, ok := b.raw.(Unblocker); ok {
+		u.Unblock(time.Time{}) // clear deadlines for the post-warmup pool reuse
+	}
 }
 
 func (b *Benchmarker) worker(ctx context.Context, workerID int) {
