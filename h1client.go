@@ -460,15 +460,26 @@ func (c *h1Client) Close() {
 	}
 }
 
-// Unblock implements the bench Unblocker extension. Sets a deadline
-// on every pooled conn so workers stuck inside a blocking Read/Write
-// return with a timeout error, then can observe ctx cancellation and
-// exit. Pass the zero Time to clear deadlines (lets post-warmup
-// reuse the same pool).
+// Unblock implements the bench Unblocker extension. Closes every
+// pooled conn so workers stuck inside a blocking Read/Write return
+// with a closed-conn error, then observe ctx cancellation and
+// exit. Closing (rather than SetDeadline) is intentional: a Read
+// interrupted mid-response leaves partial bytes in the conn's
+// bufio buffer that the next request would mis-parse; closing
+// guarantees a clean conn for the post-warmup worker, which re-
+// establishes the conn lazily via the existing reconnect-on-write
+// path inside DoRequest. Pass the zero Time as a no-op.
 func (c *h1Client) Unblock(t time.Time) {
+	if t.IsZero() {
+		// Clear: post-warmup workers reconnect lazily — nothing to do
+		// here. Kept as a documented no-op so the Unblocker contract
+		// stays symmetric (workers may also call this from the
+		// time.After cleanup path; the second call is harmless).
+		return
+	}
 	for _, hc := range c.conns {
 		hc.mu.Lock()
-		_ = hc.conn.SetDeadline(t)
+		_ = hc.conn.Close()
 		hc.mu.Unlock()
 	}
 }
