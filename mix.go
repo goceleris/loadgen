@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // MixRatio captures the three-protocol traffic ratio parsed from the `-mix`
@@ -313,6 +314,22 @@ func (c *mixClient) Close() {
 	}
 	if c.upgrade != nil {
 		c.upgrade.Close()
+	}
+}
+
+// Unblock fans out to every sub-client that implements the
+// Unblocker extension. Used by warmup to flush stuck workers
+// across the entire mix pool in one call. Sub-clients that don't
+// implement Unblock (custom user clients) are silently skipped —
+// their workers exit naturally once their next DoRequest returns.
+func (c *mixClient) Unblock(t time.Time) {
+	for _, sub := range []Client{c.h1, c.h2, c.upgrade} {
+		if sub == nil {
+			continue
+		}
+		if u, ok := sub.(Unblocker); ok {
+			u.Unblock(t)
+		}
 	}
 }
 
