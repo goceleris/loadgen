@@ -835,18 +835,6 @@ func (c *h2Client) Close() {
 	}
 }
 
-// Unblock implements the bench Unblocker extension as a no-op for
-// h2. Setting a deadline on an h2 conn would cause its readLoop /
-// writeLoop to observe a timeout and tear the conn down (HTTP/2
-// frames require ordered delivery — partial frames are fatal). h2
-// workers already honor ctx cancellation via select on writeCh and
-// the per-stream response channel, so they exit without needing a
-// kick from outside. The Unblocker contract permits this — clients
-// for which deadline-based unblocking would corrupt the conn pool
-// are allowed to no-op, accepting the small risk that some workers
-// take an extra DoRequest round-trip to notice ctx.Done().
-func (c *h2Client) Unblock(_ time.Time) {}
-
 func (hc *h2Conn) closeConn() {
 	if !hc.closed.CompareAndSwap(false, true) {
 		return // already closed
