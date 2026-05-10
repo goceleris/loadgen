@@ -50,10 +50,22 @@ func main() {
 		insecure    = flag.Bool("insecure", false, "skip TLS certificate verification")
 		bodyFile    = flag.String("body-file", "", "path to file whose contents are sent as request body")
 		maxRPS      = flag.Int("max-rps", 0, "max requests per second (0 = unlimited)")
+		rate        = flag.Float64("rate", 0, "constant request rate (req/s); >0 enables rated mode with intended-time latency (Gil Tene's coordinated-omission correction)")
+		peer        = flag.String("peer", "", "federation: dial host:port of a sidecar loadgen and merge its histogram into the result")
+		sidecar     = flag.String("sidecar", "", "run as federation sidecar listening on host:port; ignores -duration etc. — settings come from the coordinator's start frame")
+		outFile     = flag.String("out", "", "write the JSON result to this file path (in addition to stdout)")
+		cpuMonitor  = flag.Bool("cpu-monitor", true, "enable the loadgen-process 1Hz CPU sampler (Result.cpu_pct_p95)")
+		recvqProbe  = flag.Bool("recvq-probe", true, "enable the per-socket recv-Q probe (Linux only; Result.recvq_high)")
 		customHdrs  headerFlag
 	)
 	flag.Var(&customHdrs, "H", "custom header in 'Key: Value' format (repeatable)")
 	flag.Parse()
+
+	// Sidecar mode: bind, accept one coordinator, run, ship result.
+	if *sidecar != "" {
+		runSidecar(*sidecar)
+		return
+	}
 
 	if *url == "" {
 		fmt.Fprintln(os.Stderr, "error: -url is required")
@@ -140,6 +152,10 @@ func main() {
 		Headers:            headers,
 		InsecureSkipVerify: *insecure,
 		MaxRPS:             *maxRPS,
+		Rate:               *rate,
+		Peer:               *peer,
+		CPUMonitor:         *cpuMonitor,
+		RecvQProbe:         *recvqProbe,
 	}
 
 	cfg.OnProgress = func(elapsed time.Duration, snapshot loadgen.Result) {
@@ -193,5 +209,65 @@ func main() {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(result); err != nil {
 		log.Fatalf("encode result: %v", err)
+	}
+
+	if *outFile != "" {
+		f, err := os.Create(*outFile)
+		if err != nil {
+			log.Fatalf("create out file: %v", err)
+		}
+		fenc := json.NewEncoder(f)
+		fenc.SetIndent("", "  ")
+		if err := fenc.Encode(result); err != nil {
+			_ = f.Close()
+			log.Fatalf("encode out file: %v", err)
+		}
+		if err := f.Close(); err != nil {
+			log.Fatalf("close out file: %v", err)
+		}
+	}
+}
+
+// runSidecar binds to addr and serves a single coordinator. The actual
+// benchmark Config comes from the coordinator's start frame; we pass an
+// empty base so URL/Duration/Rate/etc. are taken from the wire.
+func runSidecar(addr string) {
+	sc, err := loadgen.NewFederationSidecar(addr)
+	if err != nil {
+		log.Fatalf("sidecar: %v", err)
+	}
+	defer func() { _ = sc.Close() }()
+	fmt.Fprintf(os.Stderr, "sidecar: listening on %s\n", sc.Addr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		cancel()
+	}()
+
+	base := loadgen.Config{
+		Method:      "GET",
+		Connections: 256,
+		Workers:     64,
+		HTTP2Options: loadgen.HTTP2Options{
+			Connections: 16,
+			MaxStreams:  100,
+		},
+		CPUMonitor: true,
+		RecvQProbe: true,
+	}
+	err = sc.Serve(ctx, base, func(rctx context.Context, cfg loadgen.Config) (*loadgen.Result, error) {
+		b, berr := loadgen.New(cfg)
+		if berr != nil {
+			return nil, berr
+		}
+		return b.Run(rctx)
+	})
+	if err != nil {
+		log.Fatalf("sidecar: %v", err)
 	}
 }
