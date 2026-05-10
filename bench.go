@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 )
 
 // HTTP2Options holds HTTP/2-specific settings.
@@ -147,6 +149,31 @@ type Config struct {
 	// Rate is distributed evenly across workers using a token bucket.
 	MaxRPS int
 
+	// Rate, when > 0, switches the benchmark from saturation mode (dispatch
+	// as fast as possible) to constant-rate mode. The scheduler emits one
+	// request every (1/Rate) seconds. Latency is measured from the
+	// *intended* dispatch time, not the actual one — this is Gil Tene's
+	// coordinated-omission correction. When the server stalls, a backlog
+	// of unsent intended timestamps accumulates and surfaces as honest
+	// tail latency.
+	Rate float64
+
+	// Peer enables federation: the loadgen instance becomes the
+	// coordinator for a sidecar instance running at this host:port. Both
+	// instances run identical workloads against the target; at end-of-run
+	// the coordinator pulls the sidecar's V2-compressed histogram and
+	// merges it into its own. Empty disables federation.
+	Peer string
+
+	// CPUMonitor toggles the loadgen-process CPU sampler (1Hz, P95 emitted
+	// on Result.CPUPctP95). True by default in DefaultConfig.
+	CPUMonitor bool
+
+	// RecvQProbe toggles the per-socket receive-queue probe (5s cadence on
+	// Linux, no-op elsewhere). RecvQHigh on Result is true when median
+	// recv-Q exceeds 64KB sustained ≥10s.
+	RecvQProbe bool
+
 	// OnProgress is called approximately every second during the benchmark
 	// with a snapshot of current results. The snapshot is a copy safe for
 	// concurrent access. Must not block — long-running callbacks delay
@@ -180,6 +207,8 @@ func DefaultConfig() Config {
 			Connections: 16,  // Multiple H2 connections for better throughput
 			MaxStreams:  100, // Concurrent streams per connection
 		},
+		CPUMonitor: true,
+		RecvQProbe: true,
 	}
 }
 
@@ -215,6 +244,9 @@ func (c Config) Validate() error {
 	}
 	if c.Duration <= 0 {
 		return errors.New("loadgen: Duration must be positive")
+	}
+	if c.Rate < 0 {
+		return errors.New("loadgen: Rate must be non-negative")
 	}
 	usesH2Pool := c.HTTP2 || c.H2CUpgrade || (c.Mix != nil && (c.Mix.H2 > 0 || c.Mix.Upgrade > 0))
 	if !usesH2Pool && c.Connections < 1 {
@@ -409,6 +441,13 @@ func New(cfg Config) (*Benchmarker, error) {
 }
 
 // Run executes the benchmark and returns results.
+//
+// When the Config supplies a non-empty Peer, Run additionally dials the
+// peer sidecar over TCP, kicks it off in lockstep, and merges the
+// sidecar's HdrHistogram into the local one before returning. The merged
+// histogram lands on Result.Histogram; FederationStats reports the merge
+// outcome. Federation is best-effort: failure to reach the peer is
+// recorded on Result.Federation but does not fail the whole run.
 func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Warmup phase
 	if b.config.Warmup > 0 {
@@ -428,9 +467,47 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		b.mix.upgradeErrors.Store(0)
 	}
 
-	// Start client CPU monitor
+	// Federation: dial the peer before workers spin up so the start
+	// signal lands at a well-defined moment relative to local launch.
+	var fed *FederationCoordinator
+	var fedStats *FederationStats
+	if b.config.Peer != "" {
+		fed = NewFederationCoordinator(b.config.Peer, 30*time.Second)
+		fedStats = &FederationStats{Role: "primary", Peer: b.config.Peer}
+		if err := fed.Dial(ctx); err != nil {
+			fedStats.MergeError = err.Error()
+			fed = nil // disable downstream collection
+		} else {
+			startAt := time.Now().Add(500 * time.Millisecond)
+			if err := fed.Start(startAt, b.config); err != nil {
+				fedStats.MergeError = err.Error()
+				_ = fed.Close()
+				fed = nil
+			} else {
+				// Sleep until the agreed launch instant so both sides start
+				// near-simultaneously.
+				wait := time.Until(startAt)
+				if wait > 0 {
+					t := time.NewTimer(wait)
+					select {
+					case <-ctx.Done():
+						t.Stop()
+					case <-t.C:
+					}
+				}
+			}
+		}
+	}
+
+	// Start client CPU monitor (whole-system) and the loadgen-self sampler.
 	cpuMon := &CPUMonitor{}
 	cpuMon.Start()
+
+	var selfCPU *SelfCPUSampler
+	if b.config.CPUMonitor {
+		selfCPU = NewSelfCPUSampler(600)
+		selfCPU.Start()
+	}
 
 	// Create a scoped context for this benchmark run. Workers use this context
 	// so their in-flight HTTP requests are cancelled when the benchmark ends,
@@ -438,6 +515,15 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Allow Duration + 60s for in-flight requests to drain.
 	runCtx, runCancel := context.WithTimeout(ctx, b.config.Duration+60*time.Second)
 	defer runCancel()
+
+	// Per-socket recv-Q probe (Linux only). The probe is best-effort: when
+	// it cannot read /proc/net/tcp it stays silent and RecvQHigh remains
+	// false. Caller filters by loadgen's open socket inodes.
+	var recvqProbe *recvQProbe
+	if b.config.RecvQProbe {
+		recvqProbe = newRecvQProbe()
+		recvqProbe.Start(runCtx)
+	}
 
 	// Timeseries collection: 1-second snapshots
 	var timeseries []TimeseriesPoint
@@ -447,9 +533,33 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	b.running.Store(true)
 	start := time.Now()
 
+	// Rated mode: a single scheduler goroutine emits intended-dispatch
+	// timestamps into a buffered channel; workers pop slots and run requests.
+	// When the server stalls, slots queue up (capacity = 4× rate) — the
+	// queueing time itself becomes part of the recorded latency, which is
+	// the coordinated-omission correction.
+	var slots chan time.Time
+	var schedDone chan struct{}
+	if b.config.Rate > 0 {
+		bufLen := int(b.config.Rate * 4)
+		if bufLen < 1024 {
+			bufLen = 1024
+		}
+		if bufLen > 1<<20 {
+			bufLen = 1 << 20
+		}
+		slots = make(chan time.Time, bufLen)
+		schedDone = make(chan struct{})
+		go b.rateScheduler(runCtx, start, slots, schedDone)
+	}
+
 	for i := range b.config.Workers {
 		workerID := i
-		b.wg.Go(func() { b.worker(runCtx, workerID) })
+		if slots != nil {
+			b.wg.Go(func() { b.ratedWorker(runCtx, workerID, slots) })
+		} else {
+			b.wg.Go(func() { b.worker(runCtx, workerID) })
+		}
 	}
 
 	// Timeseries ticker: collect 1-second throughput snapshots
@@ -498,6 +608,12 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// cancellation ensures they don't hang past the HTTP client timeout.
 	runCancel()
 
+	if schedDone != nil {
+		// rateScheduler closes slots on its own way out. Wait for it so
+		// ratedWorker goroutines can observe the close and exit.
+		<-schedDone
+	}
+
 	// Close connections to interrupt any pending I/O, allowing workers to exit.
 	b.raw.Close()
 
@@ -512,6 +628,36 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	result := b.buildResult(elapsed)
 	result.ClientCPUPercent = cpuMon.Stop()
 	result.Timeseries = timeseries
+	if selfCPU != nil {
+		result.CPUPctP95 = selfCPU.Stop()
+	}
+	if recvqProbe != nil {
+		result.RecvQHigh = recvqProbe.Stop()
+	}
+
+	// Collect peer histogram if federation is active.
+	if fed != nil {
+		local := b.latencies.MergedHistogram()
+		peerReqs, peerErrs, merged, err := fed.CollectResult(local)
+		_ = fed.Close()
+		if err != nil {
+			fedStats.MergeError = err.Error()
+			fedStats.MergeSucceeded = false
+		} else {
+			fedStats.PeerRequests = peerReqs
+			fedStats.PeerErrors = peerErrs
+			fedStats.MergeSucceeded = true
+			if merged != nil && merged.TotalCount() > 0 {
+				if blob, encErr := merged.Encode(hdrhistogram.V2CompressedEncodingCookieBase); encErr == nil {
+					result.Histogram = blob
+					result.Latency = percentilesFromHistogram(merged)
+				}
+			}
+		}
+	}
+	if fedStats != nil {
+		result.Federation = fedStats
+	}
 
 	return result, nil
 }
@@ -538,6 +684,106 @@ func (b *Benchmarker) warmup(ctx context.Context) {
 	<-warmupCtx.Done()
 	b.running.Store(false)
 	b.wg.Wait()
+}
+
+// rateScheduler emits intended-dispatch timestamps at the configured Rate.
+// It closes slots when the run context is cancelled or when running flips
+// false, so ratedWorker goroutines can drop out cleanly.
+//
+// The scheduler does NOT skip past stalled wakeups — every slot is enqueued
+// even if it lands in the past. Workers see the original intended timestamp
+// and record latency relative to it. That's the coordinated-omission
+// correction: queueing time at the loadgen side becomes visible tail
+// latency, instead of being silently dropped because "the worker was busy."
+func (b *Benchmarker) rateScheduler(ctx context.Context, start time.Time, slots chan<- time.Time, done chan<- struct{}) {
+	defer close(done)
+	defer func() {
+		// Tell workers no more slots are coming. Channel is buffered, so
+		// any pending slots remain consumable until drained.
+		// Closing the channel here is racy with the ratedWorker send-side
+		// of nothing — only sender closes, by design.
+		// Use a recover to swallow a panic if a second close ever happens.
+		defer func() { _ = recover() }()
+		// We're the sole sender, so closing here is safe.
+		// (Caller does not also close.)
+		closeChanIfOpen(slots)
+	}()
+
+	period := time.Duration(float64(time.Second) / b.config.Rate)
+	if period <= 0 {
+		return
+	}
+
+	next := start.Add(period)
+	for b.running.Load() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		now := time.Now()
+		if now.Before(next) {
+			t := time.NewTimer(next.Sub(now))
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
+
+		// Enqueue the *intended* time, not the actual "now". If the buffer
+		// is full the server is far behind — block briefly so the
+		// schedule pressure shows up as latency at workers, then keep going.
+		select {
+		case <-ctx.Done():
+			return
+		case slots <- next:
+		}
+		next = next.Add(period)
+	}
+}
+
+// closeChanIfOpen closes a chan time.Time, swallowing the "already closed"
+// panic if the close races (rateScheduler is sole sender, so this is just
+// defence-in-depth).
+func closeChanIfOpen(ch chan<- time.Time) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
+// ratedWorker pulls intended-time slots from the scheduler and dispatches.
+// Latency is measured from the intended dispatch time, not from when the
+// worker actually fired — this is the coordinated-omission correction.
+func (b *Benchmarker) ratedWorker(ctx context.Context, workerID int, slots <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case intended, ok := <-slots:
+			if !ok {
+				return
+			}
+			if !b.running.Load() {
+				return
+			}
+			bytesRead, err := b.raw.DoRequest(ctx, workerID)
+			latency := time.Since(intended)
+
+			if err != nil {
+				if !b.running.Load() && ctx.Err() != nil {
+					return
+				}
+				b.errors.Add(1)
+				if b.mix != nil {
+					b.mix.recordError(workerID)
+				}
+				continue
+			}
+			b.latencies.RecordSuccess(workerID, latency, bytesRead)
+		}
+	}
 }
 
 func (b *Benchmarker) worker(ctx context.Context, workerID int) {
@@ -602,6 +848,18 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		ThroughputBPS:  throughput,
 		Latency:        b.latencies.Percentiles(),
 		DialRetries:    snapshotDialRetries(),
+	}
+
+	if hist, err := b.latencies.EncodeHistogram(); err == nil {
+		res.Histogram = hist
+	}
+
+	if b.config.Rate > 0 {
+		res.RatedMode = true
+		res.TargetRPS = b.config.Rate
+		res.Mode = "rated"
+	} else {
+		res.Mode = "saturation"
 	}
 
 	switch c := b.raw.(type) {
