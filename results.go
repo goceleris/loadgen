@@ -41,6 +41,57 @@ type Result struct {
 	// port" window and the run survived it only because loadgen
 	// retried — the peer may still want to investigate.
 	DialRetries uint64 `json:"dial_retries,omitempty"`
+
+	// Histogram is the V2-compressed HdrHistogram payload covering the
+	// full latency distribution recorded during the run. Range covers
+	// 1µs through 30s with 3 significant digits (~0.1% precision).
+	// Empty when no samples were recorded. Decode via
+	// hdrhistogram.Decode after base64-decoding (or use the loadgen
+	// helper DecodeHistogram).
+	Histogram []byte `json:"histogram,omitempty"`
+
+	// RatedMode is true when the run was driven by a constant-rate
+	// scheduler (-rate) using Gil-Tene-style intended-time latency.
+	// False for the default open-loop saturation mode.
+	RatedMode bool `json:"rated_mode,omitempty"`
+
+	// TargetRPS is the constant request rate requested via -rate.
+	// Only meaningful when RatedMode is true; zero otherwise.
+	TargetRPS float64 `json:"target_rps,omitempty"`
+
+	// CPUPctP95 is the 95th-percentile of 1Hz CPU samples taken on the
+	// loadgen process itself (user+sys ticks normalised by available
+	// cores). Surfaces "loadgen CPU was the bottleneck" without
+	// requiring the consumer to read /proc.
+	CPUPctP95 float64 `json:"cpu_pct_p95,omitempty"`
+
+	// RecvQHigh is true when the EPOLLIN backlog probe observed the
+	// median per-socket receive queue exceed 64KB sustained for ≥10s.
+	// Indicates the loadgen client could not drain responses fast
+	// enough — observed latency is loadgen-side, not server-side.
+	RecvQHigh bool `json:"recvq_high,omitempty"`
+
+	// Mode is "saturation" or "rated", mirroring RatedMode in a
+	// human-readable form. Set by Run() after the schedule resolves.
+	Mode string `json:"mode,omitempty"`
+
+	// Federation, when non-nil, reports the outcome of a -peer
+	// coordinator/sidecar run. The coordinator's Histogram field
+	// contains the merged distribution; Federation tracks how the
+	// merge resolved.
+	Federation *FederationStats `json:"federation,omitempty"`
+}
+
+// FederationStats captures the outcome of a -peer federated run.
+// The primary instance fills this in after merging the sidecar's
+// histogram into its own.
+type FederationStats struct {
+	Role           string `json:"role"`            // "primary" or "sidecar"
+	Peer           string `json:"peer"`            // host:port of the remote
+	PeerRequests   int64  `json:"peer_requests"`   // requests served by the sidecar
+	PeerErrors     int64  `json:"peer_errors"`     // errors observed by the sidecar
+	MergeSucceeded bool   `json:"merge_succeeded"` // true when the histograms merged cleanly
+	MergeError     string `json:"merge_error,omitempty"`
 }
 
 // UpgradeStats summarises the outcome of h2c-upgrade handshakes across all

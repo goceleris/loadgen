@@ -6,6 +6,20 @@ import (
 	"time"
 )
 
+// approxEqual returns true when have is within tolerance of want.
+// HdrHistogram with 3 significant digits introduces ~0.1% quantization;
+// 2% tolerance covers that comfortably for these coarse-grained tests.
+func approxEqual(have, want time.Duration, tol float64) bool {
+	if want == 0 {
+		return have == 0
+	}
+	delta := have - want
+	if delta < 0 {
+		delta = -delta
+	}
+	return float64(delta)/float64(want) <= tol
+}
+
 func TestShardedLatencyRecorder(t *testing.T) {
 	r := NewShardedLatencyRecorder(4, defaultFlushInterval)
 
@@ -16,14 +30,14 @@ func TestShardedLatencyRecorder(t *testing.T) {
 	r.RecordShard(3, 40*time.Millisecond)
 
 	p := r.Percentiles()
-	if p.Min != 10*time.Millisecond {
-		t.Errorf("min = %v, want 10ms", p.Min)
+	if !approxEqual(p.Min, 10*time.Millisecond, 0.02) {
+		t.Errorf("min = %v, want ~10ms", p.Min)
 	}
-	if p.Max != 40*time.Millisecond {
-		t.Errorf("max = %v, want 40ms", p.Max)
+	if !approxEqual(p.Max, 40*time.Millisecond, 0.02) {
+		t.Errorf("max = %v, want ~40ms", p.Max)
 	}
-	if p.Avg != 25*time.Millisecond {
-		t.Errorf("avg = %v, want 25ms", p.Avg)
+	if !approxEqual(p.Avg, 25*time.Millisecond, 0.02) {
+		t.Errorf("avg = %v, want ~25ms", p.Avg)
 	}
 }
 
@@ -46,11 +60,11 @@ func TestRecordSuccessAndTotals(t *testing.T) {
 
 	// Latency percentiles should still work
 	p := r.Percentiles()
-	if p.Min != 10*time.Millisecond {
-		t.Errorf("min = %v, want 10ms", p.Min)
+	if !approxEqual(p.Min, 10*time.Millisecond, 0.02) {
+		t.Errorf("min = %v, want ~10ms", p.Min)
 	}
-	if p.Max != 40*time.Millisecond {
-		t.Errorf("max = %v, want 40ms", p.Max)
+	if !approxEqual(p.Max, 40*time.Millisecond, 0.02) {
+		t.Errorf("max = %v, want ~40ms", p.Max)
 	}
 }
 
@@ -68,8 +82,8 @@ func TestShardedLatencyRecorderReset(t *testing.T) {
 	// Record after reset should work
 	r.RecordShard(0, 5*time.Millisecond)
 	p = r.Percentiles()
-	if p.Min != 5*time.Millisecond {
-		t.Errorf("after reset: min = %v, want 5ms", p.Min)
+	if !approxEqual(p.Min, 5*time.Millisecond, 0.02) {
+		t.Errorf("after reset: min = %v, want ~5ms", p.Min)
 	}
 }
 
@@ -100,7 +114,7 @@ func TestShardedLatencyRecorderModuloWrap(t *testing.T) {
 	r.RecordShard(12, 20*time.Millisecond) // 12 % 4 = shard 0
 
 	p := r.Percentiles()
-	if p.Min != 10*time.Millisecond || p.Max != 20*time.Millisecond {
+	if !approxEqual(p.Min, 10*time.Millisecond, 0.02) || !approxEqual(p.Max, 20*time.Millisecond, 0.02) {
 		t.Errorf("modulo wrap: min=%v max=%v", p.Min, p.Max)
 	}
 }
