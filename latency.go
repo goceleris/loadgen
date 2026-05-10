@@ -4,6 +4,8 @@ import (
 	"slices"
 	"sync/atomic"
 	"time"
+
+	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 )
 
 const defaultMaxSamples = 1000000 // 1M samples = ~8MB memory
@@ -14,13 +16,32 @@ const defaultMaxSamples = 1000000 // 1M samples = ~8MB memory
 // avoid timeseries oscillation caused by correlated flush bursts at low per-worker rps.
 const defaultFlushInterval int64 = 256
 
+// HdrHistogram precision parameters — covers 1µs through 30s with 0.1% precision.
+const (
+	hdrLowestTrackable    int64 = 1
+	hdrHighestTrackable   int64 = 30 * int64(time.Second) // 30s in ns
+	hdrSignificantDigits  int   = 3
+	hdrCorrectedThreshold int64 = 0 // 0 disables coordinated-omission correction at the histogram layer
+)
+
+// newHistogram returns a fresh hdrhistogram.Histogram tuned for HTTP latency.
+// 1ns..30s with 3 significant digits — base buffer is ~37KB.
+func newHistogram() *hdrhistogram.Histogram {
+	return hdrhistogram.New(hdrLowestTrackable, hdrHighestTrackable, hdrSignificantDigits)
+}
+
 // latencyShard is a per-worker latency accumulator. Single-writer, no lock needed
 // for samples/sum/count/min/max. The requests/bytesRead counters use atomics so
 // that Totals() can be safely called concurrently (e.g., for timeseries snapshots).
 //
 // To minimize atomic overhead on ARM64, workers accumulate into plain localReqs/
 // localBytes counters and flush to the atomic counters every flushInterval requests.
+//
+// Each shard owns its own HdrHistogram so RecordValue is contention-free in the
+// hot path. Shards are merged at finalization to compute global percentiles and
+// produce the V2-compressed histogram payload.
 type latencyShard struct {
+	hist          *hdrhistogram.Histogram
 	samples       []time.Duration
 	sum           time.Duration
 	count         int64
@@ -62,6 +83,7 @@ func NewShardedLatencyRecorder(numShards int, flushInterval int64) *ShardedLaten
 	shards := make([]latencyShard, numShards)
 	for i := range shards {
 		shards[i] = latencyShard{
+			hist:          newHistogram(),
 			samples:       make([]time.Duration, 0, perShard),
 			min:           time.Hour,
 			maxSamples:    perShard,
@@ -69,6 +91,19 @@ func NewShardedLatencyRecorder(numShards int, flushInterval int64) *ShardedLaten
 		}
 	}
 	return &ShardedLatencyRecorder{shards: shards}
+}
+
+// recordHist clamps to the histogram's tracked range and records. Out-of-range
+// samples (e.g. >30s) are clipped to the highest trackable value rather than
+// dropped, so the tail mass remains visible.
+func recordHist(h *hdrhistogram.Histogram, d time.Duration) {
+	v := int64(d)
+	if v < hdrLowestTrackable {
+		v = hdrLowestTrackable
+	} else if v > hdrHighestTrackable {
+		v = hdrHighestTrackable
+	}
+	_ = h.RecordValue(v)
 }
 
 // RecordShard adds a latency sample to the worker's shard. No lock, no atomic.
@@ -82,6 +117,7 @@ func (s *ShardedLatencyRecorder) RecordShard(shardID int, d time.Duration) {
 	if d > sh.max {
 		sh.max = d
 	}
+	recordHist(sh.hist, d)
 
 	if len(sh.samples) < sh.maxSamples {
 		sh.samples = append(sh.samples, d)
@@ -116,6 +152,7 @@ func (s *ShardedLatencyRecorder) RecordSuccess(shardID int, d time.Duration, byt
 	if d > sh.max {
 		sh.max = d
 	}
+	recordHist(sh.hist, d)
 
 	if len(sh.samples) < sh.maxSamples {
 		sh.samples = append(sh.samples, d)
@@ -166,13 +203,74 @@ func (s *ShardedLatencyRecorder) Reset() {
 		sh.localBytes = 0
 		sh.requests.Store(0)
 		sh.bytesRead.Store(0)
+		sh.hist.Reset()
+	}
+}
+
+// MergedHistogram returns a single Histogram containing the merged samples
+// from every shard. Caller owns the result.
+func (s *ShardedLatencyRecorder) MergedHistogram() *hdrhistogram.Histogram {
+	merged := newHistogram()
+	for i := range s.shards {
+		merged.Merge(s.shards[i].hist)
+	}
+	return merged
+}
+
+// EncodeHistogram returns the V2-compressed encoding of the merged histogram.
+// Empty payload when no samples were recorded.
+func (s *ShardedLatencyRecorder) EncodeHistogram() ([]byte, error) {
+	merged := s.MergedHistogram()
+	if merged.TotalCount() == 0 {
+		return nil, nil
+	}
+	return merged.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+}
+
+// DecodeHistogram is a thin convenience wrapper around hdrhistogram.Decode
+// for consumers that only depend on the loadgen module.
+func DecodeHistogram(b []byte) (*hdrhistogram.Histogram, error) {
+	return hdrhistogram.Decode(b)
+}
+
+// percentilesFromHistogram derives the legacy Percentiles struct from a
+// merged HdrHistogram. The histogram tracks values in nanoseconds; the
+// returned values are time.Duration. Returns the zero value when no samples
+// have been recorded.
+func percentilesFromHistogram(h *hdrhistogram.Histogram) Percentiles {
+	if h == nil || h.TotalCount() == 0 {
+		return Percentiles{}
+	}
+	mean := time.Duration(h.Mean())
+	return Percentiles{
+		Avg:   mean,
+		Min:   time.Duration(h.Min()),
+		Max:   time.Duration(h.Max()),
+		P50:   time.Duration(h.ValueAtQuantile(50)),
+		P75:   time.Duration(h.ValueAtQuantile(75)),
+		P90:   time.Duration(h.ValueAtQuantile(90)),
+		P99:   time.Duration(h.ValueAtQuantile(99)),
+		P999:  time.Duration(h.ValueAtQuantile(99.9)),
+		P9999: time.Duration(h.ValueAtQuantile(99.99)),
 	}
 }
 
 // Percentiles merges all shards and calculates latency percentiles.
 // Called once at the end of the benchmark — not on the hot path.
+//
+// Computation now flows through the merged HdrHistogram so percentiles are
+// consistent with the V2-compressed payload exported on Result.Histogram.
+// The legacy ring-buffer slice path is kept as a fallback for cases where
+// HdrHistogram has not yet observed any value (count==0).
 func (s *ShardedLatencyRecorder) Percentiles() Percentiles {
-	// Merge stats across shards
+	merged := s.MergedHistogram()
+	if merged.TotalCount() > 0 {
+		return percentilesFromHistogram(merged)
+	}
+
+	// Legacy fallback path — preserved because tests inspect samples even
+	// when zero values were recorded via RecordValue (the histogram does
+	// not allow values < hdrLowestTrackable, but ring buffer does).
 	var totalSum time.Duration
 	var totalCount int64
 	globalMin := time.Hour
@@ -196,7 +294,6 @@ func (s *ShardedLatencyRecorder) Percentiles() Percentiles {
 		return Percentiles{}
 	}
 
-	// Merge all sample slices
 	sorted := make([]time.Duration, 0, totalSamples)
 	for i := range s.shards {
 		sorted = append(sorted, s.shards[i].samples...)
