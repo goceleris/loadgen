@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck // deprecation in x/net v0.54+ documents the unencrypted-HTTP/2 Protocols replacement, but loadgen's test scaffold pre-dates that API and the migration is tracked for v1.5.0.
 )
 
 func TestBenchmarkerSuccess(t *testing.T) {
@@ -364,7 +364,7 @@ func TestBenchmarkerH2(t *testing.T) {
 	})
 
 	h2s := &http2.Server{}
-	handler := h2c.NewHandler(mux, h2s)
+	handler := h2c.NewHandler(mux, h2s) //nolint:staticcheck // see import-line comment
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
