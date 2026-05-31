@@ -157,6 +157,7 @@ func main() {
 		Peer:               *peer,
 		CPUMonitor:         *cpuMonitor,
 		RecvQProbe:         *recvqProbe,
+		Mode:               *mode,
 	}
 
 	cfg.OnProgress = func(elapsed time.Duration, snapshot loadgen.Result) {
