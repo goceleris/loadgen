@@ -206,6 +206,80 @@ func TestBenchmarkerTimeseries(t *testing.T) {
 	t.Logf("timeseries: %d points", len(result.Timeseries))
 }
 
+func TestBenchmarkerTimeseriesP99AndErrors(t *testing.T) {
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Roughly 10% of requests fail with 500; the client counts non-2xx as errors.
+		if n.Add(1)%10 == 0 {
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte("err"))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:         srv.URL,
+		Method:      "GET",
+		Duration:    3 * time.Second,
+		Connections: 4,
+		Workers:     4,
+		Warmup:      0,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Timeseries) == 0 {
+		t.Fatal("expected timeseries entries")
+	}
+
+	// (a) At least one bucket must carry a windowed P99.
+	sawP99 := false
+	var bucketErrSum int64
+	for _, p := range result.Timeseries {
+		if p.P99Ms > 0 {
+			sawP99 = true
+		}
+		bucketErrSum += p.Errors
+	}
+	if !sawP99 {
+		t.Error("expected at least one timeseries point with P99Ms > 0")
+	}
+
+	// (b) Sum of per-bucket errors should approximate the cumulative error
+	// count. Errors recorded after the final tick land in no bucket, so allow a
+	// tolerance for the trailing sub-tick window.
+	if result.Errors == 0 {
+		t.Fatal("expected errors > 0 from the failure-injecting server")
+	}
+	if bucketErrSum > result.Errors {
+		t.Errorf("bucket error sum %d exceeds cumulative errors %d", bucketErrSum, result.Errors)
+	}
+	tolerance := result.Errors / 3 // generous: covers a full trailing sub-tick window
+	if tolerance < 5 {
+		tolerance = 5
+	}
+	if result.Errors-bucketErrSum > tolerance {
+		t.Errorf("bucket error sum %d too far below cumulative errors %d (tolerance %d)", bucketErrSum, result.Errors, tolerance)
+	}
+
+	// The FINAL cumulative percentiles must remain populated/correct.
+	if result.Latency.P99 <= 0 {
+		t.Error("expected cumulative P99 > 0")
+	}
+	t.Logf("timeseries+errors: %d points, bucketErrSum=%d cumErrors=%d p99=%v",
+		len(result.Timeseries), bucketErrSum, result.Errors, result.Latency.P99)
+}
+
 func TestBenchmarkerOnProgress(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)

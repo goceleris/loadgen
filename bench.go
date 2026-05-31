@@ -187,6 +187,12 @@ type Config struct {
 	// client creation (though they remain available via the Config).
 	Client Client
 
+	// Mode selects a non-HTTP driver. "" = normal HTTP. WebSocket modes:
+	// "ws-echo", "ws-large-echo", "ws-hub" use the WS client; "sse-fanout"
+	// uses the SSE client (one GET /events stream per worker, one event per
+	// request). When set, Mode is mutually exclusive with HTTP2/Mix/H2CUpgrade.
+	Mode string
+
 	// scheme is set internally by New() from the parsed URL.
 	// Defaults to "http" when empty (e.g., in tests calling newH1Client/newH2Client directly).
 	scheme string
@@ -230,6 +236,16 @@ func (c Config) Validate() error {
 	}
 	if c.H2CUpgrade && u.Scheme == "https" {
 		return errors.New("loadgen: H2CUpgrade requires http scheme (TLS uses ALPN, not h2c)")
+	}
+	if c.Mode != "" {
+		switch c.Mode {
+		case wsModeEcho, wsModeLargeEcho, wsModeHub, sseMode:
+		default:
+			return fmt.Errorf("loadgen: unknown mode %q", c.Mode)
+		}
+		if c.HTTP2 || c.Mix != nil || c.H2CUpgrade {
+			return errors.New("loadgen: Mode is mutually exclusive with HTTP2, Mix, and H2CUpgrade")
+		}
 	}
 	if c.Mix != nil {
 		if c.HTTP2 || c.H2CUpgrade {
@@ -407,6 +423,10 @@ func New(cfg Config) (*Benchmarker, error) {
 	var raw Client
 
 	switch {
+	case cfg.Mode == sseMode:
+		raw, err = newSSEClient(host, port, path, cfg)
+	case cfg.Mode != "":
+		raw, err = newWSClient(host, port, path, cfg)
 	case cfg.Mix != nil:
 		// H2/upgrade conns are multiplexed like normal H2 — bump workers for
 		// the same reason as the H2 case below.
@@ -528,6 +548,7 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// Timeseries collection: 1-second snapshots
 	var timeseries []TimeseriesPoint
 	var prevReqs int64
+	var prevErrors int64
 
 	// Start workers — each gets a unique workerID for connection partitioning
 	b.running.Store(true)
@@ -575,10 +596,15 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 				elapsed := time.Since(start).Seconds()
 				deltaReqs := reqs - prevReqs
 				prevReqs = reqs
+				p99 := b.latencies.SnapshotWindowP99Ms()
+				curErr := b.errors.Load()
 				timeseries = append(timeseries, TimeseriesPoint{
 					TimestampSec:   elapsed,
 					RequestsPerSec: float64(deltaReqs), // 1-second window
+					P99Ms:          p99,
+					Errors:         curErr - prevErrors,
 				})
+				prevErrors = curErr
 				if b.config.OnProgress != nil {
 					snapshot := Result{
 						Requests:       reqs,
@@ -841,6 +867,7 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	throughput := float64(bytesRead) / elapsed.Seconds()
 
 	res := &Result{
+		LoadgenVersion: Version,
 		Requests:       reqs,
 		Errors:         errs,
 		Duration:       elapsed,

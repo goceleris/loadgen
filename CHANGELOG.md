@@ -4,6 +4,54 @@ All notable changes to `github.com/goceleris/loadgen` are documented in
 this file. Versioning follows semver (MAJOR.MINOR.PATCH) with the same
 release cadence as `github.com/goceleris/celeris`.
 
+## v1.4.5 — 2026-05-31
+
+This release extends loadgen beyond plain request/response benchmarking:
+the time-series stream now carries per-bucket tail latency, and two new
+non-HTTP drivers (WebSocket and SSE) let probatorium exercise long-lived
+streaming endpoints. A version stamp on every `Result` lets consumers
+attribute a run to the loadgen build that produced it.
+
+### Added
+
+- **Per-bucket tail latency in the time-series** — each
+  `TimeseriesPoint` now reports `p99_ms` alongside `rps`, so a report can
+  plot per-second tail latency over the run instead of only the run-wide
+  aggregate. Lets probatorium spot mid-run latency excursions that a
+  single end-of-run percentile hides.
+  Closes #153.
+
+- **WebSocket load client** (`Config.Mode = "ws-echo" | "ws-large-echo"
+  | "ws-hub"`) — a native RFC 6455 driver that opens the upgrade
+  handshake and then drives long-lived frames: `ws-echo` round-trips a
+  small text frame per request, `ws-large-echo` round-trips a 64 KiB
+  payload (exercising the extended 64-bit frame-length path), and
+  `ws-hub` measures fan-out latency against a broadcast hub. Each
+  completed round-trip is timed into the same HdrHistogram as the HTTP
+  path.
+
+- **SSE load client** (`Config.Mode = "sse-fanout"`) — a Server-Sent
+  Events driver that subscribes many connections to an event stream and
+  records inter-event latency, surfacing fan-out delivery cost under
+  sustained connection counts.
+
+### Changed
+
+- `Config` gains a `Mode` field selecting the non-HTTP driver, exposed on
+  the CLI as `-mode`. The empty string keeps the default HTTP behaviour;
+  `Mode` is mutually exclusive with `HTTP2`, `Mix`, and `H2CUpgrade`.
+
+- `Result` gains a `LoadgenVersion` field (`json:"loadgen_version"`),
+  stamped from the new exported `Version` constant (`"1.4.5"`) in
+  `buildResult`. Probatorium records this to track which loadgen build
+  produced each run.
+
+### Compatibility
+
+- Wire-compatible with celeris ≥ v1.4.3. The new `Result` fields are
+  additive (`loadgen_version`, time-series `p99_ms`); existing consumers
+  that ignore unknown JSON keys are unaffected.
+
 ## v1.4.4 — 2026-05-16
 
 This release lands the "wave 11" feature set that probatorium needs to
