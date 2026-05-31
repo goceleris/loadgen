@@ -107,6 +107,48 @@ func TestTotalsResetClearsCounters(t *testing.T) {
 	}
 }
 
+func TestSnapshotWindowP99Ms(t *testing.T) {
+	r := NewShardedLatencyRecorder(4, defaultFlushInterval)
+
+	// First window: a batch of ~20ms samples spread across shards.
+	for i := range 200 {
+		r.RecordSuccess(i%4, 20*time.Millisecond, 0)
+	}
+	first := r.SnapshotWindowP99Ms()
+	if first <= 0 {
+		t.Fatalf("first window P99 = %v, want > 0", first)
+	}
+	if first < 18 || first > 22 {
+		t.Errorf("first window P99 = %v ms, want ~20ms", first)
+	}
+
+	// Second window: fewer, smaller samples. Must reflect ONLY this window —
+	// proving the previous window's 20ms samples were reset, not carried over.
+	for i := range 10 {
+		r.RecordSuccess(i%4, 2*time.Millisecond, 0)
+	}
+	second := r.SnapshotWindowP99Ms()
+	if second <= 0 {
+		t.Fatalf("second window P99 = %v, want > 0", second)
+	}
+	if second >= first {
+		t.Errorf("second window P99 = %v ms, want < first window %v ms (window not reset)", second, first)
+	}
+
+	// Third window: no samples recorded -> 0.
+	third := r.SnapshotWindowP99Ms()
+	if third != 0 {
+		t.Errorf("empty window P99 = %v, want 0", third)
+	}
+
+	// The cumulative histogram must be unaffected by the windowing: it still
+	// holds all 210 samples, so its P99 is the 20ms tail.
+	p := r.Percentiles()
+	if !approxEqual(p.P99, 20*time.Millisecond, 0.05) {
+		t.Errorf("cumulative P99 = %v, want ~20ms (windowing must not disturb cumulative)", p.P99)
+	}
+}
+
 func TestShardedLatencyRecorderModuloWrap(t *testing.T) {
 	// Worker ID larger than shard count should wrap via modulo
 	r := NewShardedLatencyRecorder(4, defaultFlushInterval)

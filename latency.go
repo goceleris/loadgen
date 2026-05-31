@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,14 @@ type latencyShard struct {
 	// Per-shard request/bytes counters — atomic for safe concurrent reads by Totals().
 	requests  atomic.Int64
 	bytesRead atomic.Int64
+
+	// histWindow accumulates latencies for the current 1-second timeseries
+	// interval only. Unlike the cumulative hist (lock-free single-writer), it is
+	// read+reset by the ticker goroutine concurrently with the worker writer, so
+	// it needs windowMu. The cumulative hot path stays untouched: windowMu
+	// guards histWindow and nothing else.
+	windowMu   sync.Mutex
+	histWindow *hdrhistogram.Histogram
 }
 
 // ShardedLatencyRecorder eliminates lock contention by giving each worker its own shard.
@@ -84,6 +93,7 @@ func NewShardedLatencyRecorder(numShards int, flushInterval int64) *ShardedLaten
 	for i := range shards {
 		shards[i] = latencyShard{
 			hist:          newHistogram(),
+			histWindow:    newHistogram(),
 			samples:       make([]time.Duration, 0, perShard),
 			min:           time.Hour,
 			maxSamples:    perShard,
@@ -106,6 +116,15 @@ func recordHist(h *hdrhistogram.Histogram, d time.Duration) {
 	_ = h.RecordValue(v)
 }
 
+// recordWindow records d into the shard's windowed histogram under windowMu so
+// the ticker goroutine's SnapshotWindowP99Ms read+reset cannot race the worker
+// writer. The cumulative hist is recorded separately and remains lock-free.
+func (sh *latencyShard) recordWindow(d time.Duration) {
+	sh.windowMu.Lock()
+	recordHist(sh.histWindow, d)
+	sh.windowMu.Unlock()
+}
+
 // RecordShard adds a latency sample to the worker's shard. No lock, no atomic.
 func (s *ShardedLatencyRecorder) RecordShard(shardID int, d time.Duration) {
 	sh := &s.shards[shardID%len(s.shards)]
@@ -118,6 +137,7 @@ func (s *ShardedLatencyRecorder) RecordShard(shardID int, d time.Duration) {
 		sh.max = d
 	}
 	recordHist(sh.hist, d)
+	sh.recordWindow(d)
 
 	if len(sh.samples) < sh.maxSamples {
 		sh.samples = append(sh.samples, d)
@@ -153,6 +173,7 @@ func (s *ShardedLatencyRecorder) RecordSuccess(shardID int, d time.Duration, byt
 		sh.max = d
 	}
 	recordHist(sh.hist, d)
+	sh.recordWindow(d)
 
 	if len(sh.samples) < sh.maxSamples {
 		sh.samples = append(sh.samples, d)
@@ -190,6 +211,29 @@ func (s *ShardedLatencyRecorder) FlushLocal() {
 	}
 }
 
+// SnapshotWindowP99Ms merges every shard's windowed histogram, reads the P99
+// (in milliseconds), then resets each windowed histogram so the next 1-second
+// interval starts fresh. Returns 0 when no samples were recorded in the window.
+//
+// Called from the timeseries ticker goroutine concurrently with worker writers.
+// Each shard's windowed histogram is read and reset under that shard's windowMu,
+// the same lock the hot path takes for its windowed RecordValue. The cumulative
+// hist, Totals(), MergedHistogram(), and Percentiles() are not touched.
+func (s *ShardedLatencyRecorder) SnapshotWindowP99Ms() float64 {
+	merged := newHistogram()
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.windowMu.Lock()
+		merged.Merge(sh.histWindow)
+		sh.histWindow.Reset()
+		sh.windowMu.Unlock()
+	}
+	if merged.TotalCount() == 0 {
+		return 0
+	}
+	return float64(merged.ValueAtQuantile(99)) / 1e6
+}
+
 // Reset clears all shards (called between warmup and main benchmark).
 func (s *ShardedLatencyRecorder) Reset() {
 	for i := range s.shards {
@@ -204,6 +248,9 @@ func (s *ShardedLatencyRecorder) Reset() {
 		sh.requests.Store(0)
 		sh.bytesRead.Store(0)
 		sh.hist.Reset()
+		sh.windowMu.Lock()
+		sh.histWindow.Reset()
+		sh.windowMu.Unlock()
 	}
 }
 

@@ -9,6 +9,7 @@ type TimeseriesPoint struct {
 	TimestampSec   float64 `json:"t"`
 	RequestsPerSec float64 `json:"rps"`
 	P99Ms          float64 `json:"p99_ms,omitempty"`
+	Errors         int64   `json:"errors,omitempty"`
 }
 
 // Result holds the benchmark results.
@@ -19,6 +20,11 @@ type Result struct {
 	RequestsPerSec float64       `json:"requests_per_sec"`
 	ThroughputBPS  float64       `json:"throughput_bps"`
 	Latency        Percentiles   `json:"latency"`
+
+	// LoadgenVersion records which loadgen build produced this run, so
+	// downstream consumers (probatorium) can attribute a Result to a
+	// specific release. Stamped from the Version constant by buildResult.
+	LoadgenVersion string `json:"loadgen_version,omitempty"`
 
 	ClientCPUPercent float64           `json:"client_cpu_percent,omitempty"`
 	Timeseries       []TimeseriesPoint `json:"timeseries,omitempty"`
