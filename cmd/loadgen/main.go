@@ -56,6 +56,7 @@ func main() {
 		outFile     = flag.String("out", "", "write the JSON result to this file path (in addition to stdout)")
 		cpuMonitor  = flag.Bool("cpu-monitor", true, "enable the loadgen-process 1Hz CPU sampler (Result.cpu_pct_p95)")
 		recvqProbe  = flag.Bool("recvq-probe", true, "enable the per-socket recv-Q probe (Linux only; Result.recvq_high)")
+		mode        = flag.String("mode", "", "streaming driver: ws-echo | ws-large-echo | ws-hub | sse-fanout (default: plain HTTP). Mutually exclusive with -h2/-h2c-upgrade/-mix")
 		customHdrs  headerFlag
 	)
 	flag.Var(&customHdrs, "H", "custom header in 'Key: Value' format (repeatable)")
