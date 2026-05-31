@@ -37,7 +37,7 @@ func wsTestServer(t *testing.T) *httptest.Server {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		sum := sha1.Sum([]byte(key + wsGUID))
 		accept := base64.StdEncoding.EncodeToString(sum[:])
@@ -96,16 +96,16 @@ func wsServeHub(conn net.Conn) {
 func wsServerFrameTest(opcode byte, payload []byte) []byte {
 	n := len(payload)
 	b0 := byte(0x80) | (opcode & 0x0f)
-	var header []byte
+	header := make([]byte, 0, 10+n)
 	switch {
 	case n <= 125:
-		header = []byte{b0, byte(n)}
+		header = append(header, b0, byte(n))
 	case n <= 0xffff:
-		header = []byte{b0, 126, byte(n >> 8), byte(n)}
+		header = append(header, b0, 126, byte(n>>8), byte(n))
 	default:
-		header = []byte{b0, 127,
-			byte(n >> 56), byte(n >> 48), byte(n >> 40), byte(n >> 32),
-			byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+		header = append(header, b0, 127,
+			byte(n>>56), byte(n>>48), byte(n>>40), byte(n>>32),
+			byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 	}
 	return append(header, payload...)
 }
