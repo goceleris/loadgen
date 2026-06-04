@@ -2,8 +2,8 @@ github.com/HdrHistogram/hdrhistogram-go v1.2.0 h1:XMJkDWuz6bM9Fzy7zORuVFKH7ZJY41
 github.com/HdrHistogram/hdrhistogram-go v1.2.0/go.mod h1:CiIeGiHSd06zjX+FypuEJ5EQ07KKtxZ+8J6hszwVQig=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/goceleris/celeris v1.4.14 h1:hyNrQvAha5KQJdypZ/ZQNy/J6Yp6Oemk1y+y4OQ6N0I=
-github.com/goceleris/celeris v1.4.14/go.mod h1:vEvLb5xgX0Is0O/VMIWAPikcwZ5ZIfdf+qWMXwgVqME=
+github.com/goceleris/celeris v1.4.15 h1:et6pbB6R07BB2Ml/98zE8p8d+AamBDM/0CkAfQGnlcE=
+github.com/goceleris/celeris v1.4.15/go.mod h1:vEvLb5xgX0Is0O/VMIWAPikcwZ5ZIfdf+qWMXwgVqME=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
