@@ -1,10 +1,10 @@
 module github.com/goceleris/loadgen
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
-	github.com/goceleris/celeris v1.4.10
+	github.com/goceleris/celeris v1.4.14
 	golang.org/x/net v0.55.0
 )
 
