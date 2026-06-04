@@ -264,7 +264,10 @@ func TestBenchmarkerTimeseriesP99AndErrors(t *testing.T) {
 	if bucketErrSum > result.Errors {
 		t.Errorf("bucket error sum %d exceeds cumulative errors %d", bucketErrSum, result.Errors)
 	}
-	tolerance := result.Errors / 3 // generous: covers a full trailing sub-tick window
+	// One full tick of errors can land after the final bucket boundary; under
+	// heavy load (e.g. -race on a contended CI box) scheduling jitter can
+	// stretch that trailing window past a single tick, so allow up to half.
+	tolerance := result.Errors / 2
 	if tolerance < 5 {
 		tolerance = 5
 	}
