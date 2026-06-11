@@ -16,6 +16,19 @@ import (
 // the run completes.
 var dialRetriesCounter atomic.Uint64
 
+// connectErrorsCounter counts dial/handshake failures (TCP connect, TLS,
+// WS/SSE upgrade, H1 reconnect dials) as their own error class, separate
+// from the per-request errors total. Process-global for the same reason as
+// dialRetriesCounter; drained into Result.ConnectErrors / WarmupStats via
+// Swap at the end of each phase.
+var connectErrorsCounter atomic.Uint64
+
+func recordConnectError() { connectErrorsCounter.Add(1) }
+
+// snapshotConnectErrors returns the current connect-error count and resets
+// the global counter, scoping the value to the phase that just ended.
+func snapshotConnectErrors() uint64 { return connectErrorsCounter.Swap(0) }
+
 // maxDialAttempts is the total number of TCP SYN attempts per dial,
 // including the first. Only transient SYN-RST responses trigger a
 // retry; every other error fails fast.
