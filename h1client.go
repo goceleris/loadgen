@@ -49,6 +49,11 @@ type h1Conn struct {
 	writeBufferSize int
 	scheme          string
 	tlsConfig       *tls.Config
+
+	// backoff paces reconnect attempts after a failed redial. Only the
+	// owning worker touches it (reconnect runs on the worker goroutine),
+	// so it needs no mu.
+	backoff connectBackoff
 }
 
 // newH1Client creates a new zero-alloc HTTP/1.1 client.
@@ -223,8 +228,15 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		}
 		// Reconnect and retry once
 		if reconnErr := hc.reconnect(); reconnErr != nil {
+			recordConnectError()
+			// Server-death guard: pace this conn's next attempt with
+			// exponential backoff (ctx-abortable) so a dead server cannot
+			// induce a redial hot loop (v3.8 crash cell: 33.1M dial errors
+			// at ~370k/s). Reset below on the next successful reconnect.
+			hc.backoff.sleep(ctx, nil)
 			return 0, fmt.Errorf("h1client: conn[%d] reconnect failed: %w", connIdx, reconnErr)
 		}
+		hc.backoff.reset()
 		if _, err = hc.conn.Write(c.reqBuf); err != nil {
 			return 0, fmt.Errorf("h1client: conn[%d] write after reconnect: %w", connIdx, err)
 		}
