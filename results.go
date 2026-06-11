@@ -11,9 +11,9 @@ type TimeseriesPoint struct {
 	P99Ms          float64 `json:"p99_ms,omitempty"`
 	Errors         int64   `json:"errors,omitempty"`
 
-	// ConnectErrors is the dial/handshake-failure subset of Errors that
-	// landed in this 1-second window. Lets a consumer tell "server
-	// answering with errors" from "server gone" per bucket.
+	// ConnectErrors counts the dial/handshake failures that landed in
+	// this 1-second window. Lets a consumer tell "server answering with
+	// errors" from "server gone" per bucket.
 	ConnectErrors int64 `json:"connect_errors,omitempty"`
 }
 
@@ -57,8 +57,10 @@ type Result struct {
 	// WS/SSE upgrade, H1 reconnect dials) observed during the measured
 	// run. A separate error class from Errors (which lumps every failed
 	// request together): Errors ≈ ConnectErrors means the server was
-	// unreachable, not misbehaving. Additive — existing consumers keep
-	// parsing Errors unchanged.
+	// unreachable, not misbehaving. Counted at the driver, so it can
+	// differ from the matching Errors increments by a few attempts cut
+	// off at phase boundaries. Additive — existing consumers keep parsing
+	// Errors unchanged.
 	ConnectErrors uint64 `json:"connect_errors,omitempty"`
 
 	// Warmup, when non-nil, summarises the warmup phase, whose counters

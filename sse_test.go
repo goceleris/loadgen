@@ -2,7 +2,9 @@ package loadgen
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -88,6 +90,164 @@ func TestSSERejectsNonStream(t *testing.T) {
 	if _, err := c.DoRequest(context.Background(), 0); err == nil {
 		t.Fatal("expected DoRequest to fail against a non-event-stream response")
 	}
+}
+
+// TestSSEFailFastNeverConnected drives the driver directly against a
+// refusing port with a shrunken window: attempts must be backoff-paced and
+// end in an ErrNeverConnected-wrapped fatal error.
+func TestSSEFailFastNeverConnected(t *testing.T) {
+	host, port := refusedAddr(t)
+
+	cfg := Config{URL: "http://" + net.JoinHostPort(host, port) + "/events", Mode: sseMode, scheme: "http"}
+	c, err := newSSEClient(host, port, "/events", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	window := 300 * time.Millisecond
+	c.(*sseClient).failFast = newFailFastTracker(window)
+
+	start := time.Now()
+	attempts := 0
+	for {
+		_, err := c.DoRequest(context.Background(), 0)
+		if err == nil {
+			t.Fatal("expected every DoRequest to fail against a refusing port")
+		}
+		attempts++
+		if errors.Is(err, ErrNeverConnected) {
+			break
+		}
+		if attempts > 200 {
+			t.Fatalf("no fail-fast after %d attempts — dials are hot-looping", attempts)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < window {
+		t.Errorf("fail-fast tripped after %v, before the %v window elapsed", elapsed, window)
+	}
+	t.Logf("fail-fast after %d attempts in %v", attempts, time.Since(start))
+}
+
+// TestSSECloseAbortsDial parks a dial inside the GET handshake (the server
+// accepts but never responds) and verifies Close() aborts it promptly.
+func TestSSECloseAbortsDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var held []net.Conn
+	defer func() {
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	}()
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, conn) // hold open, never answer the GET
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		URL:         "http://" + ln.Addr().String() + "/events",
+		Mode:        sseMode,
+		scheme:      "http",
+		DialTimeout: 30 * time.Second, // Close, not the timeout, must abort
+	}
+	c, err := newSSEClient(host, port, "/events", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, derr := c.DoRequest(context.Background(), 0)
+		done <- derr
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let the dial park in the handshake read
+	start := time.Now()
+	c.Close()
+
+	select {
+	case derr := <-done:
+		if derr == nil {
+			t.Error("expected an error from the aborted dial")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("Close took %v to abort the in-flight dial", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not abort the in-flight dial")
+	}
+	_ = ln.Close()
+	<-acceptDone
+}
+
+// TestSSEDialHonorsDialTimeout parks the handshake against a silent server
+// and verifies DialTimeout bounds it (the v1.4.7 driver ignored it).
+func TestSSEDialHonorsDialTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var held []net.Conn
+	defer func() {
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	}()
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held = append(held, conn)
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		URL:         "http://" + ln.Addr().String() + "/events",
+		Mode:        sseMode,
+		scheme:      "http",
+		DialTimeout: 150 * time.Millisecond,
+	}
+	c, err := newSSEClient(host, port, "/events", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	start := time.Now()
+	_, derr := c.DoRequest(context.Background(), 0)
+	elapsed := time.Since(start)
+	if derr == nil {
+		t.Fatal("expected the dial to time out against a silent server")
+	}
+	// Budget: 150ms timeout + one backoff sleep (≤10ms) + slack.
+	if elapsed > 2*time.Second {
+		t.Errorf("DoRequest took %v, want ~150ms (DialTimeout-bounded)", elapsed)
+	}
+	_ = ln.Close()
+	<-acceptDone
 }
 
 func TestSSERunIntegration(t *testing.T) {

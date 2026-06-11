@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 const sseMode = "sse-fanout"
@@ -19,14 +20,26 @@ const sseMode = "sse-fanout"
 // therefore becomes the recorded latency — one DoRequest == one event through
 // the existing worker/RecordSuccess/timeseries pipeline.
 type sseClient struct {
-	host     string // host:port to dial
-	path     string // request path, e.g. /events
-	tls      bool
-	insecure bool
-	headers  map[string]string
+	host        string // host:port to dial
+	path        string // request path, e.g. /events
+	tls         bool
+	insecure    bool
+	headers     map[string]string
+	dialTimeout time.Duration
 
-	mu    sync.Mutex
-	conns map[int]*sseConn
+	// closeCtx is cancelled by Close() so in-flight dials, handshakes and
+	// backoff sleeps abort instead of outliving the client.
+	closeCtx  context.Context
+	closeStop context.CancelFunc
+
+	// failFast aborts the run when no stream was EVER established and
+	// connect attempts have failed for a sustained window. A client that
+	// had live streams retries with backoff forever.
+	failFast *failFastTracker
+
+	mu       sync.Mutex
+	conns    map[int]*sseConn
+	backoffs map[int]*connectBackoff // per-worker reconnect pacing
 }
 
 func newSSEClient(host, port, path string, cfg Config) (Client, error) {
@@ -36,18 +49,24 @@ func newSSEClient(host, port, path string, cfg Config) (Client, error) {
 	if path == "" {
 		path = "/"
 	}
+	closeCtx, closeStop := context.WithCancel(context.Background())
 	return &sseClient{
-		host:     net.JoinHostPort(host, port),
-		path:     path,
-		tls:      cfg.scheme == "https",
-		insecure: cfg.InsecureSkipVerify,
-		headers:  cfg.Headers,
-		conns:    make(map[int]*sseConn),
+		host:        net.JoinHostPort(host, port),
+		path:        path,
+		tls:         cfg.scheme == "https",
+		insecure:    cfg.InsecureSkipVerify,
+		headers:     cfg.Headers,
+		dialTimeout: cfg.DialTimeout,
+		closeCtx:    closeCtx,
+		closeStop:   closeStop,
+		failFast:    newFailFastTracker(failFastWindow),
+		conns:       make(map[int]*sseConn),
+		backoffs:    make(map[int]*connectBackoff),
 	}, nil
 }
 
 func (c *sseClient) DoRequest(ctx context.Context, workerID int) (int, error) {
-	conn, err := c.conn(workerID)
+	conn, err := c.conn(ctx, workerID)
 	if err != nil {
 		return 0, err
 	}
@@ -63,6 +82,7 @@ func (c *sseClient) DoRequest(ctx context.Context, workerID int) (int, error) {
 }
 
 func (c *sseClient) Close() {
+	c.closeStop() // abort in-flight dials, handshakes, and backoff sleeps
 	c.mu.Lock()
 	conns := c.conns
 	c.conns = make(map[int]*sseConn)
@@ -72,20 +92,45 @@ func (c *sseClient) Close() {
 	}
 }
 
-func (c *sseClient) conn(workerID int) (*sseConn, error) {
+func (c *sseClient) conn(ctx context.Context, workerID int) (*sseConn, error) {
 	c.mu.Lock()
 	if conn, ok := c.conns[workerID]; ok {
 		c.mu.Unlock()
 		return conn, nil
 	}
+	bo := c.backoffs[workerID]
+	if bo == nil {
+		bo = &connectBackoff{}
+		c.backoffs[workerID] = bo
+	}
 	c.mu.Unlock()
 
-	conn, err := c.dial()
+	conn, err := c.dial(ctx)
 	if err != nil {
+		if ctx.Err() != nil || c.closeCtx.Err() != nil {
+			return nil, err // shutdown, not a server failure
+		}
+		recordConnectError()
+		if fatal := c.failFast.failure(time.Now(), err); fatal != nil {
+			return nil, fatal
+		}
+		// One attempt per DoRequest: sleep the (growing) backoff before
+		// surfacing the error so a dead server cannot induce a redial hot
+		// loop, then let the worker loop call back in.
+		bo.sleep(ctx, c.closeCtx.Done())
 		return nil, err
 	}
+	c.failFast.success()
+	bo.reset()
 
 	c.mu.Lock()
+	if c.closeCtx.Err() != nil {
+		// Close() won the race while we were handshaking; don't leak the
+		// conn into a map nobody will drain.
+		c.mu.Unlock()
+		conn.close()
+		return nil, c.closeCtx.Err()
+	}
 	c.conns[workerID] = conn
 	c.mu.Unlock()
 	return conn, nil
@@ -103,29 +148,57 @@ func (c *sseClient) drop(workerID int) {
 	}
 }
 
-func (c *sseClient) dial() (*sseConn, error) {
+// dial opens one SSE stream. The whole sequence — TCP/TLS connect plus the
+// GET handshake — is bounded by DialTimeout and aborts on ctx cancellation
+// or Close().
+func (c *sseClient) dial(ctx context.Context) (*sseConn, error) {
+	var cancel context.CancelFunc
+	if c.dialTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, c.dialTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+	// Propagate Close() into the dial context (and from there into the
+	// in-flight connect and handshake I/O below).
+	stopClose := context.AfterFunc(c.closeCtx, cancel)
+	defer stopClose()
+
 	var (
 		raw net.Conn
 		err error
 	)
 	if c.tls {
-		raw, err = tls.Dial("tcp", c.host, &tls.Config{InsecureSkipVerify: c.insecure}) //nolint:gosec // InsecureSkipVerify is opt-in for self-signed test targets
+		d := &tls.Dialer{Config: &tls.Config{InsecureSkipVerify: c.insecure}} //nolint:gosec // InsecureSkipVerify is opt-in for self-signed test targets
+		raw, err = d.DialContext(ctx, "tcp", c.host)
 	} else {
-		raw, err = net.Dial("tcp", c.host)
+		var d net.Dialer
+		raw, err = d.DialContext(ctx, "tcp", c.host)
 	}
 	if err != nil {
 		return nil, err
 	}
 
+	// The GET handshake is plain conn I/O with no deadline of its own;
+	// closing the socket when ctx fires keeps it bounded too.
+	stopIO := context.AfterFunc(ctx, func() { _ = raw.Close() })
+
 	if _, err := raw.Write([]byte(sseGetRequest(c.host, c.path, c.headers))); err != nil {
+		stopIO()
 		_ = raw.Close()
 		return nil, err
 	}
 
 	br := bufio.NewReader(raw)
 	if err := sseReadHandshake(br); err != nil {
+		stopIO()
 		_ = raw.Close()
 		return nil, err
+	}
+	if !stopIO() {
+		// ctx fired while the handshake was completing; raw is closed (or
+		// about to be) — treat as a failed dial.
+		return nil, ctx.Err()
 	}
 	return &sseConn{raw: raw, br: br}, nil
 }
