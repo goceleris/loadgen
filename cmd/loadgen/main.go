@@ -185,6 +185,13 @@ func main() {
 		log.Fatalf("benchmark failed: %v", err)
 	}
 
+	if result.Warmup != nil {
+		fmt.Fprintf(os.Stderr, "warmup: %d ok, %d errors (%d connect)\n",
+			result.Warmup.Requests, result.Warmup.Errors, result.Warmup.ConnectErrors)
+		if result.Warmup.Requests == 0 && result.Warmup.Errors > 0 {
+			fmt.Fprintln(os.Stderr, "warmup: WARNING — no request succeeded during warmup; the target may be down")
+		}
+	}
 	if result.Upgrade != nil {
 		// UpgradeAttempted == UpgradeSucceeded by construction today:
 		// newH2ClientWithDialer fails the whole run on the first dial error,

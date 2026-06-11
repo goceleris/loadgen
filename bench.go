@@ -329,9 +329,41 @@ type Benchmarker struct {
 	// Latency tracking (also holds per-shard request/bytes counters)
 	latencies *ShardedLatencyRecorder
 
+	// Fatal abort: the first ErrNeverConnected-wrapped failure a worker
+	// observes lands in fatalErr and closes fatalCh, so Run/warmup stop
+	// waiting out the clock instead of burning the full duration against
+	// a dead target.
+	fatalOnce sync.Once
+	fatalErr  error
+	fatalCh   chan struct{}
+
+	// warmupStats is captured at the end of the warmup phase (before
+	// counters reset) and surfaced on Result.Warmup.
+	warmupStats *WarmupStats
+
 	// Control
 	running atomic.Bool
 	wg      sync.WaitGroup
+}
+
+// recordFatal stores the first fatal error and signals Run/warmup to stop
+// waiting out the clock. Later calls are no-ops.
+func (b *Benchmarker) recordFatal(err error) {
+	b.fatalOnce.Do(func() {
+		b.fatalErr = err
+		close(b.fatalCh)
+	})
+}
+
+// fatalError returns the recorded fatal error, or nil. The channel-close
+// check gives the necessary happens-before edge for reading fatalErr.
+func (b *Benchmarker) fatalError() error {
+	select {
+	case <-b.fatalCh:
+		return b.fatalErr
+	default:
+		return nil
+	}
 }
 
 // parseURL extracts host, port, path, and scheme from a raw URL.
@@ -411,6 +443,7 @@ func New(cfg Config) (*Benchmarker, error) {
 			config:    cfg,
 			raw:       cfg.Client,
 			latencies: NewShardedLatencyRecorder(cfg.Workers, flushInterval),
+			fatalCh:   make(chan struct{}),
 		}, nil
 	}
 
@@ -453,6 +486,7 @@ func New(cfg Config) (*Benchmarker, error) {
 		config:    cfg,
 		raw:       raw,
 		latencies: NewShardedLatencyRecorder(cfg.Workers, flushInterval),
+		fatalCh:   make(chan struct{}),
 	}
 	if mc, ok := raw.(*mixClient); ok {
 		b.mix = mc
@@ -469,9 +503,24 @@ func New(cfg Config) (*Benchmarker, error) {
 // outcome. Federation is best-effort: failure to reach the peer is
 // recorded on Result.Federation but does not fail the whole run.
 func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
+	// Scope the global connect-error counter to this run.
+	connectErrorsCounter.Store(0)
+
 	// Warmup phase
 	if b.config.Warmup > 0 {
 		b.warmup(ctx)
+		// Snapshot warmup outcomes before the counters reset for the
+		// measured run — a 100%-failing warmup must stay observable.
+		b.latencies.FlushLocal()
+		warmupReqs, _ := b.latencies.Totals()
+		b.warmupStats = &WarmupStats{
+			Requests:      warmupReqs,
+			Errors:        b.errors.Load(),
+			ConnectErrors: snapshotConnectErrors(),
+		}
+		if ferr := b.fatalError(); ferr != nil {
+			return nil, ferr
+		}
 	}
 
 	// Reset metrics for actual benchmark
@@ -549,6 +598,7 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	var timeseries []TimeseriesPoint
 	var prevReqs int64
 	var prevErrors int64
+	var prevConnErrors uint64
 
 	// Start workers — each gets a unique workerID for connection partitioning
 	b.running.Store(true)
@@ -598,13 +648,16 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 				prevReqs = reqs
 				p99 := b.latencies.SnapshotWindowP99Ms()
 				curErr := b.errors.Load()
+				curConnErr := connectErrorsCounter.Load()
 				timeseries = append(timeseries, TimeseriesPoint{
 					TimestampSec:   elapsed,
 					RequestsPerSec: float64(deltaReqs), // 1-second window
 					P99Ms:          p99,
 					Errors:         curErr - prevErrors,
+					ConnectErrors:  int64(curConnErr - prevConnErrors),
 				})
 				prevErrors = curErr
+				prevConnErrors = curConnErr
 				if b.config.OnProgress != nil {
 					snapshot := Result{
 						Requests:       reqs,
@@ -619,10 +672,11 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		}
 	}()
 
-	// Wait for duration
+	// Wait for duration — or a fatal fail-fast abort from a worker.
 	select {
 	case <-ctx.Done():
 	case <-time.After(b.config.Duration):
+	case <-b.fatalCh:
 	}
 
 	b.running.Store(false)
@@ -659,6 +713,16 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	}
 	if recvqProbe != nil {
 		result.RecvQHigh = recvqProbe.Stop()
+	}
+
+	// A fatal fail-fast abort overrides the (empty) partial result so the
+	// caller can classify the run as did-not-finish rather than reading a
+	// zero-request Result as "ran clean with no traffic".
+	if ferr := b.fatalError(); ferr != nil {
+		if fed != nil {
+			_ = fed.Close()
+		}
+		return nil, ferr
 	}
 
 	// Collect peer histogram if federation is active.
@@ -707,8 +771,14 @@ func (b *Benchmarker) warmup(ctx context.Context) {
 		b.wg.Go(func() { b.worker(warmupCtx, workerID) })
 	}
 
-	<-warmupCtx.Done()
+	// A fatal fail-fast abort cuts the warmup short; Run surfaces the
+	// error after capturing warmup stats.
+	select {
+	case <-warmupCtx.Done():
+	case <-b.fatalCh:
+	}
 	b.running.Store(false)
+	cancel() // unblock workers stuck in dials or backoff sleeps
 	b.wg.Wait()
 }
 
@@ -801,6 +871,10 @@ func (b *Benchmarker) ratedWorker(ctx context.Context, workerID int, slots <-cha
 				if !b.running.Load() && ctx.Err() != nil {
 					return
 				}
+				if errors.Is(err, ErrNeverConnected) {
+					b.recordFatal(err)
+					return
+				}
 				b.errors.Add(1)
 				if b.mix != nil {
 					b.mix.recordError(workerID)
@@ -849,6 +923,12 @@ func (b *Benchmarker) worker(ctx context.Context, workerID int) {
 			if !b.running.Load() && ctx.Err() != nil {
 				return
 			}
+			// A fail-fast abort from a streaming driver kills the whole
+			// run; the attempts leading up to it are already counted.
+			if errors.Is(err, ErrNeverConnected) {
+				b.recordFatal(err)
+				return
+			}
 			b.errors.Add(1)
 			if b.mix != nil {
 				b.mix.recordError(workerID)
@@ -875,6 +955,8 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		ThroughputBPS:  throughput,
 		Latency:        b.latencies.Percentiles(),
 		DialRetries:    snapshotDialRetries(),
+		ConnectErrors:  snapshotConnectErrors(),
+		Warmup:         b.warmupStats,
 	}
 
 	if hist, err := b.latencies.EncodeHistogram(); err == nil {
