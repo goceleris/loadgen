@@ -146,6 +146,18 @@ type mixClient struct {
 	h2Errors        atomic.Int64
 	upgradeErrors   atomic.Int64
 
+	// Measured-window baselines captured by markMeasureStart at the
+	// warmup→measure handoff; stats() subtracts them so the reported
+	// per-protocol counts cover the measured window only. Plain fields:
+	// written once by the Run goroutine before the measured phase
+	// begins, read by stats() after the workers drain.
+	h1ReqBase      int64
+	h2ReqBase      int64
+	upgradeReqBase int64
+	h1ErrBase      int64
+	h2ErrBase      int64
+	upgradeErrBase int64
+
 	// Per-protocol conn counts (informational, surfaced in Result).
 	h1Conns      int
 	h2Conns      int
@@ -303,6 +315,20 @@ func (c *mixClient) recordError(workerID int) {
 	}
 }
 
+// markMeasureStart records the current counter values as the measured-window
+// baselines. Called once by Benchmarker.Run at the warmup→measure handoff.
+// Baselines (rather than Store(0) resets) keep the handoff safe while
+// saturation-mode workers are still adding to the counters: a concurrent
+// Add can never be lost to a racing reset.
+func (c *mixClient) markMeasureStart() {
+	c.h1ReqBase = c.h1Requests.Load()
+	c.h2ReqBase = c.h2Requests.Load()
+	c.upgradeReqBase = c.upgradeRequests.Load()
+	c.h1ErrBase = c.h1Errors.Load()
+	c.h2ErrBase = c.h2Errors.Load()
+	c.upgradeErrBase = c.upgradeErrors.Load()
+}
+
 // Close shuts down every sub-client.
 func (c *mixClient) Close() {
 	if c.h1 != nil {
@@ -316,17 +342,19 @@ func (c *mixClient) Close() {
 	}
 }
 
-// stats returns the per-protocol counters as a MixStats snapshot.
+// stats returns the per-protocol counters as a MixStats snapshot, scoped
+// to the measured window (counts accumulated before markMeasureStart are
+// subtracted out).
 func (c *mixClient) stats() MixStats {
 	return MixStats{
 		H1Conns:         c.h1Conns,
 		H2Conns:         c.h2Conns,
 		UpgradeConns:    c.upgradeConns,
-		H1Requests:      c.h1Requests.Load(),
-		H2Requests:      c.h2Requests.Load(),
-		UpgradeRequests: c.upgradeRequests.Load(),
-		H1Errors:        c.h1Errors.Load(),
-		H2Errors:        c.h2Errors.Load(),
-		UpgradeErrors:   c.upgradeErrors.Load(),
+		H1Requests:      c.h1Requests.Load() - c.h1ReqBase,
+		H2Requests:      c.h2Requests.Load() - c.h2ReqBase,
+		UpgradeRequests: c.upgradeRequests.Load() - c.upgradeReqBase,
+		H1Errors:        c.h1Errors.Load() - c.h1ErrBase,
+		H2Errors:        c.h2Errors.Load() - c.h2ErrBase,
+		UpgradeErrors:   c.upgradeErrors.Load() - c.upgradeErrBase,
 	}
 }
