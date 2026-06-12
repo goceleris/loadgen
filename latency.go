@@ -234,7 +234,10 @@ func (s *ShardedLatencyRecorder) SnapshotWindowP99Ms() float64 {
 	return float64(merged.ValueAtQuantile(99)) / 1e6
 }
 
-// Reset clears all shards (called between warmup and main benchmark).
+// Reset clears all shards. Only safe while no workers are recording —
+// the warmup→measure handoff swaps in a fresh recorder instead of
+// resetting, because saturation-mode workers keep running across the
+// boundary.
 func (s *ShardedLatencyRecorder) Reset() {
 	for i := range s.shards {
 		sh := &s.shards[i]
