@@ -10,6 +10,11 @@ type TimeseriesPoint struct {
 	RequestsPerSec float64 `json:"rps"`
 	P99Ms          float64 `json:"p99_ms,omitempty"`
 	Errors         int64   `json:"errors,omitempty"`
+
+	// ConnectErrors counts the dial/handshake failures that landed in
+	// this 1-second window. Lets a consumer tell "server answering with
+	// errors" from "server gone" per bucket.
+	ConnectErrors int64 `json:"connect_errors,omitempty"`
 }
 
 // Result holds the benchmark results.
@@ -23,7 +28,7 @@ type Result struct {
 
 	// LoadgenVersion records which loadgen build produced this run, so
 	// downstream consumers (probatorium) can attribute a Result to a
-	// specific release. Stamped from the Version constant by buildResult.
+	// specific release. Stamped from Version by buildResult.
 	LoadgenVersion string `json:"loadgen_version,omitempty"`
 
 	ClientCPUPercent float64           `json:"client_cpu_percent,omitempty"`
@@ -47,6 +52,22 @@ type Result struct {
 	// port" window and the run survived it only because loadgen
 	// retried — the peer may still want to investigate.
 	DialRetries uint64 `json:"dial_retries,omitempty"`
+
+	// ConnectErrors counts dial/handshake failures (TCP connect, TLS,
+	// WS/SSE upgrade, H1 reconnect dials) observed during the measured
+	// run. A separate error class from Errors (which lumps every failed
+	// request together): Errors ≈ ConnectErrors means the server was
+	// unreachable, not misbehaving. Counted at the driver, so it can
+	// differ from the matching Errors increments by a few attempts cut
+	// off at phase boundaries. Additive — existing consumers keep parsing
+	// Errors unchanged.
+	ConnectErrors uint64 `json:"connect_errors,omitempty"`
+
+	// Warmup, when non-nil, summarises the warmup phase, whose counters
+	// are otherwise reset away before the measured run begins. A warmup
+	// with zero requests and nonzero errors means the target was never
+	// healthy — previously invisible. Omitted when Warmup is 0.
+	Warmup *WarmupStats `json:"warmup,omitempty"`
 
 	// Histogram is the V2-compressed HdrHistogram payload covering the
 	// full latency distribution recorded during the run. Range covers
@@ -98,6 +119,16 @@ type FederationStats struct {
 	PeerErrors     int64  `json:"peer_errors"`     // errors observed by the sidecar
 	MergeSucceeded bool   `json:"merge_succeeded"` // true when the histograms merged cleanly
 	MergeError     string `json:"merge_error,omitempty"`
+}
+
+// WarmupStats reports what happened during the warmup phase: successful
+// requests, total errors, and the dial/handshake-failure subset of those
+// errors. Surfaced on Result.Warmup so a 100%-failing warmup is observable
+// instead of being silently reset before the measured run.
+type WarmupStats struct {
+	Requests      int64  `json:"requests"`
+	Errors        int64  `json:"errors"`
+	ConnectErrors uint64 `json:"connect_errors,omitempty"`
 }
 
 // UpgradeStats summarises the outcome of h2c-upgrade handshakes across all

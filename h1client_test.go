@@ -531,3 +531,128 @@ func TestH1MultipleWorkersConnectionIsolation(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// startKillableH1Server is startH1Server plus a kill function that tears
+// down the listener AND every accepted conn, simulating server death
+// (plain cleanup() leaves established keep-alive conns serving).
+func startKillableH1Server(t *testing.T) (host, port string, kill func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			go func() {
+				reader := bufio.NewReader(conn)
+				for {
+					if !readH1Request(reader) {
+						return
+					}
+					resp := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+					if _, err := conn.Write([]byte(resp)); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	h, p, _ := net.SplitHostPort(ln.Addr().String())
+	return h, p, func() {
+		_ = ln.Close()
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}
+}
+
+// TestH1ReconnectBackoffAfterServerDeath verifies the mid-cell
+// reconnect-after-server-death path is backoff-paced (v3.8 crash cell:
+// 33.1M dial errors at ~370k/s) and lands in the connect-error class.
+func TestH1ReconnectBackoffAfterServerDeath(t *testing.T) {
+	host, port, kill := startKillableH1Server(t)
+
+	client, err := newH1Client(host, port, "/", testH1Cfg(true, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.DoRequest(context.Background(), 0); err != nil {
+		t.Fatalf("priming request: %v", err)
+	}
+
+	before := connectErrorsCounter.Swap(0)
+	defer connectErrorsCounter.Add(before)
+
+	kill() // server dies mid-cell; port now refuses
+
+	deadline := time.Now().Add(700 * time.Millisecond)
+	errCount := 0
+	for time.Now().Before(deadline) {
+		if _, err := client.DoRequest(context.Background(), 0); err != nil {
+			errCount++
+		}
+	}
+	if errCount == 0 {
+		t.Fatal("expected reconnect errors after server death")
+	}
+	// 10ms-doubling backoff allows roughly 7 reconnect attempts in 700ms;
+	// a hot loop would produce hundreds of thousands.
+	if errCount > 100 {
+		t.Errorf("errCount = %d in 700ms — reconnects are not backoff-paced", errCount)
+	}
+	if n := connectErrorsCounter.Swap(0); n == 0 {
+		t.Error("expected reconnect dial failures in the connect-error class")
+	}
+	if next := client.conns[0].backoff.next; next <= reconnectBackoffMin {
+		t.Errorf("backoff.next = %v after repeated failures, want > %v", next, reconnectBackoffMin)
+	}
+	t.Logf("reconnect errors in 700ms: %d", errCount)
+}
+
+// TestH1ReconnectBackoffCtxAbort verifies ctx cancellation cuts a pending
+// reconnect-backoff sleep short instead of holding the worker hostage.
+func TestH1ReconnectBackoffCtxAbort(t *testing.T) {
+	host, port, kill := startKillableH1Server(t)
+
+	client, err := newH1Client(host, port, "/", testH1Cfg(true, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.DoRequest(context.Background(), 0); err != nil {
+		t.Fatalf("priming request: %v", err)
+	}
+	kill()
+
+	// Force the next failure onto a long backoff sleep, then cancel.
+	client.conns[0].backoff.next = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, derr := client.DoRequest(ctx, 0)
+	elapsed := time.Since(start)
+	if derr == nil {
+		t.Fatal("expected an error against a dead server")
+	}
+	if elapsed > time.Second {
+		t.Errorf("DoRequest took %v — ctx cancellation did not abort the backoff sleep", elapsed)
+	}
+}

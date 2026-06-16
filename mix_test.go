@@ -352,3 +352,33 @@ func TestMixProtoString(t *testing.T) {
 		}
 	}
 }
+
+// TestMixMarkMeasureStartBaselines verifies the per-protocol counters are
+// scoped to the measured window via baselines rather than racy resets: in
+// saturation mode the warmup→measure handoff happens while workers are
+// still adding to the counters, so a Store(0) reset could lose increments.
+func TestMixMarkMeasureStartBaselines(t *testing.T) {
+	mc := &mixClient{}
+	mc.h1Requests.Store(10)
+	mc.h2Requests.Store(20)
+	mc.upgradeRequests.Store(30)
+	mc.h1Errors.Store(1)
+	mc.h2Errors.Store(2)
+	mc.upgradeErrors.Store(3)
+
+	mc.markMeasureStart()
+
+	mc.h1Requests.Add(5)
+	mc.h2Requests.Add(6)
+	mc.upgradeRequests.Add(7)
+	mc.h1Errors.Add(1)
+
+	got := mc.stats()
+	want := MixStats{
+		H1Requests: 5, H2Requests: 6, UpgradeRequests: 7,
+		H1Errors: 1, H2Errors: 0, UpgradeErrors: 0,
+	}
+	if got != want {
+		t.Errorf("stats after markMeasureStart = %+v, want %+v", got, want)
+	}
+}

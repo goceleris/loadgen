@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -93,6 +94,156 @@ func TestBenchmarkerWarmup(t *testing.T) {
 		t.Error("expected requests > 0")
 	}
 	t.Logf("warmup: elapsed=%v, result.Duration=%v, requests=%d", elapsed, result.Duration, result.Requests)
+}
+
+func TestBenchmarkerWarmupStats(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:         srv.URL,
+		Method:      "GET",
+		Duration:    500 * time.Millisecond,
+		Connections: 2,
+		Workers:     2,
+		Warmup:      500 * time.Millisecond,
+		CPUMonitor:  false,
+		RecvQProbe:  false,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.Warmup == nil {
+		t.Fatal("expected Result.Warmup to be populated when Warmup > 0")
+	}
+	if result.Warmup.Requests == 0 {
+		t.Error("expected warmup requests > 0 against a healthy server")
+	}
+	if result.Warmup.Errors != 0 {
+		t.Errorf("unexpected warmup errors: %d", result.Warmup.Errors)
+	}
+	// Warmup traffic must not leak into the measured totals.
+	if result.Requests == 0 {
+		t.Error("expected measured requests > 0")
+	}
+	t.Logf("warmup stats: %d ok, %d errors", result.Warmup.Requests, result.Warmup.Errors)
+}
+
+func TestBenchmarkerNoWarmupNoStats(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := Config{
+		URL:         srv.URL,
+		Method:      "GET",
+		Duration:    300 * time.Millisecond,
+		Connections: 1,
+		Workers:     1,
+		Warmup:      0,
+		CPUMonitor:  false,
+		RecvQProbe:  false,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Warmup != nil {
+		t.Errorf("expected nil Result.Warmup when Warmup == 0, got %+v", result.Warmup)
+	}
+}
+
+// fatalClient returns an ErrNeverConnected-wrapped error from every
+// DoRequest, simulating a streaming driver whose fail-fast tripped.
+type fatalClient struct{}
+
+func (f *fatalClient) DoRequest(_ context.Context, _ int) (int, error) {
+	return 0, fmt.Errorf("loadgen: dial: dial tcp 127.0.0.1:1: connect: connection refused (fail-fast: %w within 5s)", ErrNeverConnected)
+}
+
+func (f *fatalClient) Close() {}
+
+// TestBenchmarkerFatalAbortsRun verifies a worker surfacing an
+// ErrNeverConnected error aborts the run immediately instead of waiting out
+// the full Duration, and that Run reports the fatal error.
+func TestBenchmarkerFatalAbortsRun(t *testing.T) {
+	cfg := Config{
+		URL:         "http://127.0.0.1:1/",
+		Method:      "GET",
+		Duration:    30 * time.Second, // must NOT be waited out
+		Connections: 2,
+		Workers:     2,
+		Warmup:      0,
+		Client:      &fatalClient{},
+		CPUMonitor:  false,
+		RecvQProbe:  false,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	result, err := b.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Run to return the fatal error")
+	}
+	if !errors.Is(err, ErrNeverConnected) {
+		t.Errorf("Run error must wrap ErrNeverConnected: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result on fatal abort, got %+v", result)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("fatal abort took %v — Run waited out the duration instead of aborting", elapsed)
+	}
+}
+
+// TestBenchmarkerFatalAbortsWarmup verifies a fatal error during the warmup
+// phase aborts the run before the measured phase even starts.
+func TestBenchmarkerFatalAbortsWarmup(t *testing.T) {
+	cfg := Config{
+		URL:         "http://127.0.0.1:1/",
+		Method:      "GET",
+		Duration:    30 * time.Second,
+		Connections: 2,
+		Workers:     2,
+		Warmup:      30 * time.Second, // must NOT be waited out either
+		Client:      &fatalClient{},
+		CPUMonitor:  false,
+		RecvQProbe:  false,
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err = b.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil || !errors.Is(err, ErrNeverConnected) {
+		t.Fatalf("expected ErrNeverConnected from warmup abort, got: %v", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("warmup fatal abort took %v — warmup was waited out instead of aborting", elapsed)
+	}
 }
 
 func TestBenchmarkerContextCancellation(t *testing.T) {
