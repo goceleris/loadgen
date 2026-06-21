@@ -73,6 +73,15 @@ func (f *h2Frame) GoAwayErrCode() uint32 {
 	return 0
 }
 
+// WindowUpdateIncrement returns the 31-bit window-size increment from a
+// WINDOW_UPDATE frame (payload[0:4], reserved high bit masked off).
+func (f *h2Frame) WindowUpdateIncrement() uint32 {
+	if len(f.payload) >= 4 {
+		return binary.BigEndian.Uint32(f.payload[:4]) & 0x7FFFFFFF
+	}
+	return 0
+}
+
 // PingData returns the 8-byte ping data.
 func (f *h2Frame) PingData() [8]byte {
 	var d [8]byte

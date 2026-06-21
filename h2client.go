@@ -113,7 +113,6 @@ type h2WriteReq struct {
 	block    []byte           // HEADERS: header block fragment
 	data     []byte           // HEADERS w/ body: data payload
 	hasBody  bool             // HEADERS: has data frames to follow
-	maxFrame uint32           // HEADERS w/ body: max frame size
 	pingData [8]byte          // PING: response data
 	respCh   *chan h2Response // HEADERS: writeLoop registers this in the stream slot
 }
@@ -150,8 +149,26 @@ type h2Conn struct {
 
 	// Flow control — readLoop accumulates via atomic add,
 	// writeLoop flushes between processing worker requests.
+	//
+	// maxFrameSize is the SERVER's SETTINGS_MAX_FRAME_SIZE (default 16384):
+	// DATA frames we SEND must not exceed it or the server replies
+	// FRAME_SIZE_ERROR and tears down the conn (the post-64k-h2 failure —
+	// a 64KiB frame against a 16384-default server).
 	maxFrameSize      uint32
 	pendingConnWindow atomic.Uint32
+
+	// SEND-side flow control (data WE send to the server). The conn window
+	// starts at 65535 (RFC 7540 §6.9.2, NOT affected by SETTINGS); the
+	// per-stream window starts at the server's SETTINGS_INITIAL_WINDOW_SIZE.
+	// The writer goroutine is sequential (one body at a time), so the
+	// currently-writing stream's window lives in curStreamWindow keyed by
+	// curStreamID; readLoop replenishes both on WINDOW_UPDATE. Without this a
+	// 64KiB body (post-64k-h2 = 65536 B) exceeds the 65535 window by one byte
+	// and the request hangs to the 5-min deadline.
+	connSendWindow   atomic.Int64
+	curStreamID      atomic.Uint32
+	curStreamWindow  atomic.Int64
+	serverInitWindow uint32
 
 	// Concurrency limit
 	streamSem chan struct{}
@@ -479,10 +496,25 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 	}
 
 	serverMaxStreams := uint32(maxStreams)
+	// RFC 7540 defaults: SETTINGS_MAX_FRAME_SIZE 16384, INITIAL_WINDOW_SIZE 65535.
+	serverMaxFrame := uint32(16384)
+	serverInitWin := uint32(65535)
 	if serverSettings.Type == frameSettings {
 		serverSettings.ForeachSetting(func(id uint16, val uint32) {
-			if id == settingMaxConcurrentStreams && val > 0 {
-				serverMaxStreams = val
+			switch id {
+			case settingMaxConcurrentStreams:
+				if val > 0 {
+					serverMaxStreams = val
+				}
+			case settingMaxFrameSize:
+				// Spec range 16384..16777215; clamp to be safe.
+				if val >= 16384 && val <= 16777215 {
+					serverMaxFrame = val
+				}
+			case settingInitialWindowSize:
+				if val <= 0x7FFFFFFF {
+					serverInitWin = val
+				}
 			}
 		})
 		if err := framer.WriteSettingsAck(); err != nil {
@@ -522,15 +554,17 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 	numSlots := 2 * effectiveStreams
 
 	hc := &h2Conn{
-		conn:         conn,
-		framer:       framer,
-		bufWriter:    bw,
-		writeCh:      make(chan h2WriteReq, 4096),
-		streamSlots:  make([]h2StreamSlot, numSlots),
-		maxFrameSize: h2MaxFrameSize,
-		streamSem:    make(chan struct{}, effectiveStreams),
-		done:         make(chan struct{}),
-		addr:         addr,
+		conn:        conn,
+		framer:      framer,
+		bufWriter:   bw,
+		writeCh:     make(chan h2WriteReq, 4096),
+		streamSlots: make([]h2StreamSlot, numSlots),
+		// DATA-send split = the SERVER's max frame size (not our 64KiB receive cap).
+		maxFrameSize:     serverMaxFrame,
+		serverInitWindow: serverInitWin,
+		streamSem:        make(chan struct{}, effectiveStreams),
+		done:             make(chan struct{}),
+		addr:             addr,
 		chanPool: sync.Pool{
 			New: func() any {
 				ch := make(chan h2Response, 1)
@@ -539,6 +573,7 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		},
 	}
 	hc.nextStreamID.Store(initialStreamID)
+	hc.connSendWindow.Store(65535) // RFC 7540 §6.9.2: conn window starts at 65535
 
 	for range effectiveStreams {
 		hc.streamSem <- struct{}{}
@@ -625,7 +660,7 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 
 		err := hc.framer.WriteHeaders(streamID, req.block, !req.hasBody)
 		if err == nil && req.hasBody {
-			err = writeDataFrames(hc.framer, streamID, req.data, req.maxFrame)
+			err = hc.writeBodyFlowControlled(streamID, req.data)
 		}
 		if err != nil {
 			hc.streamSlots[slotIdx].ch.Store(nil)
@@ -733,7 +768,16 @@ func (hc *h2Conn) readLoop() {
 			return
 
 		case frameWindowUpdate:
-			// Ignore server-side window updates
+			// Replenish our SEND window so writeBodyFlowControlled can finish a
+			// body larger than the initial window (post-64k-h2). streamID 0 =
+			// connection-level; otherwise it targets a stream — apply it to the
+			// currently-writing stream's window (the writer is sequential).
+			incr := int64(frame.WindowUpdateIncrement())
+			if frame.StreamID == 0 {
+				hc.connSendWindow.Add(incr)
+			} else if frame.StreamID == hc.curStreamID.Load() {
+				hc.curStreamWindow.Add(incr)
+			}
 		}
 	}
 }
@@ -769,12 +813,11 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	// On write error, writeLoop sends to *respCh directly.
 	select {
 	case hc.writeCh <- h2WriteReq{
-		kind:     h2WriteHeaders,
-		block:    c.headerBlock,
-		data:     c.dataPayload,
-		hasBody:  c.hasBody,
-		maxFrame: hc.maxFrameSize,
-		respCh:   chPtr,
+		kind:    h2WriteHeaders,
+		block:   c.headerBlock,
+		data:    c.dataPayload,
+		hasBody: c.hasBody,
+		respCh:  chPtr,
 	}:
 	case <-hc.done:
 		hc.chanPool.Put(chPtr)
@@ -811,18 +854,55 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	}
 }
 
-// writeDataFrames writes body data, splitting into frames if needed.
-func writeDataFrames(framer *h2Framer, streamID uint32, data []byte, maxFrameSize uint32) error {
+// writeBodyFlowControlled sends a request body as DATA frames, respecting BOTH
+// the server's SETTINGS_MAX_FRAME_SIZE and its connection + per-stream send
+// windows (RFC 7540 §6.9). The writer goroutine is sequential (one body at a
+// time), so the active stream's window lives in hc.curStreamWindow keyed by
+// hc.curStreamID; readLoop replenishes connSendWindow/curStreamWindow on
+// WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
+// server can consume + replenish) and poll — no extra goroutine/channel. The
+// conn's 5-min deadline (completeH2Handshake) is the deadlock backstop.
+//
+// Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
+// (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
+func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
+	hc.curStreamWindow.Store(int64(hc.serverInitWindow))
+	hc.curStreamID.Store(streamID)
+
+	maxFrame := int(hc.maxFrameSize)
+	if maxFrame < 16384 {
+		maxFrame = 16384
+	}
 	for len(data) > 0 {
-		chunk := data
-		endStream := true
-		if uint32(len(chunk)) > maxFrameSize {
-			chunk = data[:maxFrameSize]
-			endStream = false
+		avail := maxFrame
+		if cw := int(hc.connSendWindow.Load()); cw < avail {
+			avail = cw
 		}
-		if err := framer.WriteData(streamID, endStream, chunk); err != nil {
+		if sw := int(hc.curStreamWindow.Load()); sw < avail {
+			avail = sw
+		}
+		if avail <= 0 {
+			// Window exhausted: flush so the peer receives what we've sent and
+			// can send WINDOW_UPDATE, then wait for readLoop to replenish.
+			_ = hc.bufWriter.Flush()
+			select {
+			case <-hc.done:
+				return fmt.Errorf("h2client: conn closed mid-body (flow-control wait)")
+			default:
+			}
+			time.Sleep(50 * time.Microsecond)
+			continue
+		}
+		if avail > len(data) {
+			avail = len(data)
+		}
+		chunk := data[:avail]
+		endStream := len(chunk) == len(data)
+		if err := hc.framer.WriteData(streamID, endStream, chunk); err != nil {
 			return err
 		}
+		hc.connSendWindow.Add(-int64(len(chunk)))
+		hc.curStreamWindow.Add(-int64(len(chunk)))
 		data = data[len(chunk):]
 	}
 	return nil

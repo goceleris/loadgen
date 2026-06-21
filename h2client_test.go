@@ -3,6 +3,7 @@ package loadgen
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -207,6 +208,80 @@ func TestH2StressXLargeResponse(t *testing.T) {
 
 	ok, errs := stressH2(t, client, 50, 15*time.Second)
 	t.Logf("xlarge (2MB): %d OK, %d errors", ok, errs)
+}
+
+// startStrictUploadH2CServer runs an h2c server that advertises the RFC 7540
+// default limits real bench targets (celeris, etc.) use — SETTINGS_MAX_FRAME_SIZE
+// 16384 and a 65535-byte connection + per-stream receive window — rather than
+// x/net's lenient 1 MiB defaults. Its /drain endpoint reads the whole request
+// body and 200s only if every declared byte arrived. A client that sends an
+// oversized DATA frame trips FRAME_SIZE_ERROR; one that sends past the window
+// trips FLOW_CONTROL_ERROR — both surface as a DoRequest error.
+func startStrictUploadH2CServer(tb testing.TB) (host, port string, cleanup func()) {
+	tb.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/drain", func(w http.ResponseWriter, r *http.Request) {
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil || (r.ContentLength >= 0 && n != r.ContentLength) {
+			w.WriteHeader(400)
+			return
+		}
+		w.WriteHeader(200)
+	})
+
+	h2s := &http2.Server{
+		MaxConcurrentStreams:         100,
+		MaxReadFrameSize:             16384, // advertised SETTINGS_MAX_FRAME_SIZE
+		MaxUploadBufferPerStream:     65535, // advertised SETTINGS_INITIAL_WINDOW_SIZE
+		MaxUploadBufferPerConnection: 65535, // no extra connection-window WINDOW_UPDATE
+	}
+	handler := h2c.NewHandler(mux, h2s) //nolint:staticcheck // see import-line comment
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	h, p, _ := net.SplitHostPort(ln.Addr().String())
+	return h, p, func() { _ = srv.Close(); _ = ln.Close() }
+}
+
+// TestH2CPostBodyExceedsWindowAndFrameSize is the upload counterpart to the
+// download flow-control tests above. It POSTs a body larger than BOTH
+// SETTINGS_MAX_FRAME_SIZE (16384) and the initial connection/stream send
+// window (65535), so a correct client must split the body into frame-sized
+// DATA frames and pace them against the peer's advertised window
+// (RFC 7540 §6.9). The strict server enforces both limits, so an oversized
+// frame trips FRAME_SIZE_ERROR and an over-window send trips
+// FLOW_CONTROL_ERROR, each surfacing as a DoRequest error; the /drain handler
+// additionally 400s unless every declared byte arrived. This exercises the
+// post-64k-h2 scenario that previously sent a single 64 KiB DATA frame.
+func TestH2CPostBodyExceedsWindowAndFrameSize(t *testing.T) {
+	host, port, cleanup := startStrictUploadH2CServer(t)
+	defer cleanup()
+
+	body := make([]byte, 200000) // > 65535 window and > 16384 max-frame
+	for i := range body {
+		body[i] = byte(i)
+	}
+
+	client, err := newH2Client(host, port, "/drain", testH2Cfg("POST", nil, body, 1, 100))
+	if err != nil {
+		t.Fatalf("newH2Client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Repeat so a one-shot window mishap (e.g. window not replenished between
+	// requests) surfaces on a later iteration.
+	for i := range 10 {
+		if _, err := client.DoRequest(ctx, 0); err != nil {
+			t.Fatalf("DoRequest %d with %d-byte body: %v", i, len(body), err)
+		}
+	}
 }
 
 // TestH2StressMultiConn tests with many connections and high stream counts,
