@@ -88,10 +88,19 @@ func resetError(code uint32) error {
 // Uses pre-encoded HPACK headers, dedicated writer goroutine per connection,
 // lock-free stream slot dispatch, and batched WINDOW_UPDATE writes.
 type h2Client struct {
-	conns       []*h2Conn
+	conns       []*h2ConnSlot
 	headerBlock []byte // pre-encoded HPACK header block (immutable)
 	dataPayload []byte // body bytes for POST (nil for GET)
 	hasBody     bool
+
+	// redial re-establishes a single connection (prior-knowledge or h2c
+	// upgrade, whichever this client was built with). A server that closes
+	// or GOAWAYs a connection mid-cell — hypercorn does this periodically —
+	// would otherwise strand the slot dead and the worker would spin
+	// closed-conn errors with no recovery (fastapi-h2 logged ~1.1B errors /
+	// 0 requests from exactly this). reconnectSlot calls it under the slot
+	// lock, paced by the slot's backoff.
+	redial func() (*h2Conn, error)
 
 	// dialedViaUpgrade reports whether this client's connections were
 	// established via the h2c upgrade handshake vs prior-knowledge H2.
@@ -105,6 +114,17 @@ type h2Client struct {
 	upgradeAttempted int
 }
 
+// h2ConnSlot owns one logical connection that can be re-dialed in place. cur
+// holds the live *h2Conn (swapped atomically on reconnect so other workers
+// observe the new one without locking); mu single-flights the redial so a
+// fleet of workers sharing the slot dials once, not N times; backoff paces
+// retries against a server that stays down.
+type h2ConnSlot struct {
+	cur     atomic.Pointer[h2Conn]
+	mu      sync.Mutex
+	backoff connectBackoff
+}
+
 // h2WriteReq is a frame write request submitted to the writer goroutine.
 // For HEADERS: writeLoop allocates the streamID and registers the stream slot,
 // eliminating the need for a mutex on the worker side.
@@ -113,7 +133,6 @@ type h2WriteReq struct {
 	block    []byte           // HEADERS: header block fragment
 	data     []byte           // HEADERS w/ body: data payload
 	hasBody  bool             // HEADERS: has data frames to follow
-	maxFrame uint32           // HEADERS w/ body: max frame size
 	pingData [8]byte          // PING: response data
 	respCh   *chan h2Response // HEADERS: writeLoop registers this in the stream slot
 }
@@ -150,8 +169,26 @@ type h2Conn struct {
 
 	// Flow control — readLoop accumulates via atomic add,
 	// writeLoop flushes between processing worker requests.
+	//
+	// maxFrameSize is the SERVER's SETTINGS_MAX_FRAME_SIZE (default 16384):
+	// DATA frames we SEND must not exceed it or the server replies
+	// FRAME_SIZE_ERROR and tears down the conn (the post-64k-h2 failure —
+	// a 64KiB frame against a 16384-default server).
 	maxFrameSize      uint32
 	pendingConnWindow atomic.Uint32
+
+	// SEND-side flow control (data WE send to the server). The conn window
+	// starts at 65535 (RFC 7540 §6.9.2, NOT affected by SETTINGS); the
+	// per-stream window starts at the server's SETTINGS_INITIAL_WINDOW_SIZE.
+	// The writer goroutine is sequential (one body at a time), so the
+	// currently-writing stream's window lives in curStreamWindow keyed by
+	// curStreamID; readLoop replenishes both on WINDOW_UPDATE. Without this a
+	// 64KiB body (post-64k-h2 = 65536 B) exceeds the 65535 window by one byte
+	// and the request hangs to the 5-min deadline.
+	connSendWindow   atomic.Int64
+	curStreamID      atomic.Uint32
+	curStreamWindow  atomic.Int64
+	serverInitWindow uint32
 
 	// Concurrency limit
 	streamSem chan struct{}
@@ -302,22 +339,30 @@ func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*
 		}
 	}
 
-	conns := make([]*h2Conn, numConns)
-	for i := range numConns {
-		var hc *h2Conn
-		var err error
+	// redial captures the dial parameters so a slot can re-establish its
+	// connection after the server closes/GOAWAYs it mid-cell. Used for both
+	// the initial dials below and reconnectSlot.
+	redial := func() (*h2Conn, error) {
 		if upgrade {
-			hc, err = dialH2CUpgrade(addr, scheme, path, host, port, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
-		} else {
-			hc, err = dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+			return dialH2CUpgrade(addr, scheme, path, host, port, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
 		}
+		return dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+	}
+
+	conns := make([]*h2ConnSlot, numConns)
+	for i := range numConns {
+		hc, err := redial()
 		if err != nil {
 			for j := range i {
-				conns[j].closeConn()
+				if c := conns[j].cur.Load(); c != nil {
+					c.closeConn()
+				}
 			}
 			return nil, fmt.Errorf("h2client: dial conn[%d]: %w", i, err)
 		}
-		conns[i] = hc
+		slot := &h2ConnSlot{}
+		slot.cur.Store(hc)
+		conns[i] = slot
 	}
 
 	var payload []byte
@@ -331,9 +376,40 @@ func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*
 		headerBlock:      headerBlock,
 		dataPayload:      payload,
 		hasBody:          hasBody,
+		redial:           redial,
 		dialedViaUpgrade: upgrade,
 		upgradeAttempted: numConns,
 	}, nil
+}
+
+// reconnectSlot re-establishes a dead slot's connection, single-flighted under
+// the slot lock and paced by the slot's backoff. Returns the live conn, or nil
+// if the redial failed (caller surfaces a connect error) or ctx ended. A
+// concurrent caller that finds the slot already healed returns immediately.
+func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) *h2Conn {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+
+	if hc := slot.cur.Load(); hc != nil && !hc.closed.Load() {
+		return hc // another worker already re-dialed this slot
+	}
+	if old := slot.cur.Load(); old != nil {
+		old.closeConn() // release fds/goroutines of the dead conn
+	}
+
+	// Pace retries so a server that stays down can't be hot-redialled.
+	if !slot.backoff.sleep(ctx, nil) {
+		return nil // ctx cancelled mid-backoff
+	}
+	hc, err := c.redial()
+	if err != nil {
+		recordConnectError()
+		slot.cur.Store(nil)
+		return nil
+	}
+	slot.backoff.reset()
+	slot.cur.Store(hc)
+	return hc
 }
 
 // h2HopByHopHeaders lists HTTP/1.1 connection-specific headers that are
@@ -479,10 +555,25 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 	}
 
 	serverMaxStreams := uint32(maxStreams)
+	// RFC 7540 defaults: SETTINGS_MAX_FRAME_SIZE 16384, INITIAL_WINDOW_SIZE 65535.
+	serverMaxFrame := uint32(16384)
+	serverInitWin := uint32(65535)
 	if serverSettings.Type == frameSettings {
 		serverSettings.ForeachSetting(func(id uint16, val uint32) {
-			if id == settingMaxConcurrentStreams && val > 0 {
-				serverMaxStreams = val
+			switch id {
+			case settingMaxConcurrentStreams:
+				if val > 0 {
+					serverMaxStreams = val
+				}
+			case settingMaxFrameSize:
+				// Spec range 16384..16777215; clamp to be safe.
+				if val >= 16384 && val <= 16777215 {
+					serverMaxFrame = val
+				}
+			case settingInitialWindowSize:
+				if val <= 0x7FFFFFFF {
+					serverInitWin = val
+				}
 			}
 		})
 		if err := framer.WriteSettingsAck(); err != nil {
@@ -522,15 +613,17 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 	numSlots := 2 * effectiveStreams
 
 	hc := &h2Conn{
-		conn:         conn,
-		framer:       framer,
-		bufWriter:    bw,
-		writeCh:      make(chan h2WriteReq, 4096),
-		streamSlots:  make([]h2StreamSlot, numSlots),
-		maxFrameSize: h2MaxFrameSize,
-		streamSem:    make(chan struct{}, effectiveStreams),
-		done:         make(chan struct{}),
-		addr:         addr,
+		conn:        conn,
+		framer:      framer,
+		bufWriter:   bw,
+		writeCh:     make(chan h2WriteReq, 4096),
+		streamSlots: make([]h2StreamSlot, numSlots),
+		// DATA-send split = the SERVER's max frame size (not our 64KiB receive cap).
+		maxFrameSize:     serverMaxFrame,
+		serverInitWindow: serverInitWin,
+		streamSem:        make(chan struct{}, effectiveStreams),
+		done:             make(chan struct{}),
+		addr:             addr,
 		chanPool: sync.Pool{
 			New: func() any {
 				ch := make(chan h2Response, 1)
@@ -539,6 +632,7 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		},
 	}
 	hc.nextStreamID.Store(initialStreamID)
+	hc.connSendWindow.Store(65535) // RFC 7540 §6.9.2: conn window starts at 65535
 
 	for range effectiveStreams {
 		hc.streamSem <- struct{}{}
@@ -625,7 +719,7 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 
 		err := hc.framer.WriteHeaders(streamID, req.block, !req.hasBody)
 		if err == nil && req.hasBody {
-			err = writeDataFrames(hc.framer, streamID, req.data, req.maxFrame)
+			err = hc.writeBodyFlowControlled(streamID, req.data)
 		}
 		if err != nil {
 			hc.streamSlots[slotIdx].ch.Store(nil)
@@ -733,7 +827,16 @@ func (hc *h2Conn) readLoop() {
 			return
 
 		case frameWindowUpdate:
-			// Ignore server-side window updates
+			// Replenish our SEND window so writeBodyFlowControlled can finish a
+			// body larger than the initial window (post-64k-h2). streamID 0 =
+			// connection-level; otherwise it targets a stream — apply it to the
+			// currently-writing stream's window (the writer is sequential).
+			incr := int64(frame.WindowUpdateIncrement())
+			if frame.StreamID == 0 {
+				hc.connSendWindow.Add(incr)
+			} else if frame.StreamID == hc.curStreamID.Load() {
+				hc.curStreamWindow.Add(incr)
+			}
 		}
 	}
 }
@@ -743,10 +846,20 @@ func (hc *h2Conn) readLoop() {
 // which receives from either writeLoop (on error) or readLoop (on response).
 func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	idx := workerID % len(c.conns)
-	hc := c.conns[idx]
+	slot := c.conns[idx]
+	hc := slot.cur.Load()
 
-	if hc.closed.Load() {
-		return 0, fmt.Errorf("h2client: conn[%d] connection closed", idx)
+	// A server that closed/GOAWAYed this connection mid-cell leaves the slot
+	// dead; re-dial (paced) so the next request gets a fresh conn instead of
+	// spinning closed-conn errors. backoff lives in reconnectSlot.
+	if hc == nil || hc.closed.Load() {
+		hc = c.reconnectSlot(ctx, slot)
+		if hc == nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, fmt.Errorf("h2client: conn[%d] reconnect failed", idx)
+		}
 	}
 
 	// Acquire stream semaphore
@@ -769,12 +882,11 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	// On write error, writeLoop sends to *respCh directly.
 	select {
 	case hc.writeCh <- h2WriteReq{
-		kind:     h2WriteHeaders,
-		block:    c.headerBlock,
-		data:     c.dataPayload,
-		hasBody:  c.hasBody,
-		maxFrame: hc.maxFrameSize,
-		respCh:   chPtr,
+		kind:    h2WriteHeaders,
+		block:   c.headerBlock,
+		data:    c.dataPayload,
+		hasBody: c.hasBody,
+		respCh:  chPtr,
 	}:
 	case <-hc.done:
 		hc.chanPool.Put(chPtr)
@@ -811,18 +923,55 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	}
 }
 
-// writeDataFrames writes body data, splitting into frames if needed.
-func writeDataFrames(framer *h2Framer, streamID uint32, data []byte, maxFrameSize uint32) error {
+// writeBodyFlowControlled sends a request body as DATA frames, respecting BOTH
+// the server's SETTINGS_MAX_FRAME_SIZE and its connection + per-stream send
+// windows (RFC 7540 §6.9). The writer goroutine is sequential (one body at a
+// time), so the active stream's window lives in hc.curStreamWindow keyed by
+// hc.curStreamID; readLoop replenishes connSendWindow/curStreamWindow on
+// WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
+// server can consume + replenish) and poll — no extra goroutine/channel. The
+// conn's 5-min deadline (completeH2Handshake) is the deadlock backstop.
+//
+// Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
+// (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
+func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
+	hc.curStreamWindow.Store(int64(hc.serverInitWindow))
+	hc.curStreamID.Store(streamID)
+
+	maxFrame := int(hc.maxFrameSize)
+	if maxFrame < 16384 {
+		maxFrame = 16384
+	}
 	for len(data) > 0 {
-		chunk := data
-		endStream := true
-		if uint32(len(chunk)) > maxFrameSize {
-			chunk = data[:maxFrameSize]
-			endStream = false
+		avail := maxFrame
+		if cw := int(hc.connSendWindow.Load()); cw < avail {
+			avail = cw
 		}
-		if err := framer.WriteData(streamID, endStream, chunk); err != nil {
+		if sw := int(hc.curStreamWindow.Load()); sw < avail {
+			avail = sw
+		}
+		if avail <= 0 {
+			// Window exhausted: flush so the peer receives what we've sent and
+			// can send WINDOW_UPDATE, then wait for readLoop to replenish.
+			_ = hc.bufWriter.Flush()
+			select {
+			case <-hc.done:
+				return fmt.Errorf("h2client: conn closed mid-body (flow-control wait)")
+			default:
+			}
+			time.Sleep(50 * time.Microsecond)
+			continue
+		}
+		if avail > len(data) {
+			avail = len(data)
+		}
+		chunk := data[:avail]
+		endStream := len(chunk) == len(data)
+		if err := hc.framer.WriteData(streamID, endStream, chunk); err != nil {
 			return err
 		}
+		hc.connSendWindow.Add(-int64(len(chunk)))
+		hc.curStreamWindow.Add(-int64(len(chunk)))
 		data = data[len(chunk):]
 	}
 	return nil
@@ -830,8 +979,12 @@ func writeDataFrames(framer *h2Framer, streamID uint32, data []byte, maxFrameSiz
 
 // Close closes all connections.
 func (c *h2Client) Close() {
-	for _, hc := range c.conns {
-		hc.closeConn()
+	for _, slot := range c.conns {
+		slot.mu.Lock()
+		if hc := slot.cur.Load(); hc != nil {
+			hc.closeConn()
+		}
+		slot.mu.Unlock()
 	}
 }
 

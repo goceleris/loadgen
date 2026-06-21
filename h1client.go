@@ -248,6 +248,18 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
+		// Close-after-response / churn guard (mirrors the write-error path
+		// above): a Connection:close server — or one closing mid-response under
+		// churn-close — yields a read EOF here. Reconnect so the NEXT request
+		// gets a fresh conn, and back off ONLY if the server is genuinely down.
+		// Without this, a close-after-one server (drogon collapsed to 0 req from
+		// exactly this) spins read-EOFs with no pacing and never recovers.
+		if reconnErr := hc.reconnect(); reconnErr != nil {
+			recordConnectError()
+			hc.backoff.sleep(ctx, nil)
+			return 0, fmt.Errorf("h1client: conn[%d] read status (reconnect failed): %w", connIdx, reconnErr)
+		}
+		hc.backoff.reset()
 		return 0, fmt.Errorf("h1client: conn[%d] read status: %w", connIdx, err)
 	}
 
@@ -267,6 +279,18 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	for {
 		line, err := hc.reader.ReadSlice('\n')
 		if err != nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			// Same close-after-response / churn guard as the status read:
+			// reconnect for the next request, back off only if the server is
+			// genuinely down.
+			if reconnErr := hc.reconnect(); reconnErr != nil {
+				recordConnectError()
+				hc.backoff.sleep(ctx, nil)
+				return 0, fmt.Errorf("h1client: conn[%d] read header (reconnect failed): %w", connIdx, reconnErr)
+			}
+			hc.backoff.reset()
 			return 0, fmt.Errorf("h1client: conn[%d] read header: %w", connIdx, err)
 		}
 		if len(line) <= 2 {
