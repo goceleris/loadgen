@@ -284,6 +284,58 @@ func TestH2CPostBodyExceedsWindowAndFrameSize(t *testing.T) {
 	}
 }
 
+// TestH2ReconnectAfterConnClosed verifies that a connection the server closes
+// or GOAWAYs mid-cell is transparently re-dialed, instead of stranding the slot
+// dead and spinning closed-conn errors (fastapi-h2 under hypercorn logged ~1.1B
+// errors / 0 requests from exactly this — hypercorn GOAWAYs connections
+// periodically). We close the live conn out from under the client, then assert
+// the next requests recover against the still-running server and the slot now
+// holds a fresh, live conn.
+func TestH2ReconnectAfterConnClosed(t *testing.T) {
+	host, port, cleanup := startH2CServer(t, 100)
+	defer cleanup()
+
+	client, err := newH2Client(host, port, "/simple", testH2Cfg("GET", nil, nil, 1, 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := client.DoRequest(ctx, 0); err != nil {
+		t.Fatalf("initial DoRequest: %v", err)
+	}
+
+	// Simulate the server dropping the connection (GOAWAY + close).
+	old := client.conns[0].cur.Load()
+	old.closeConn()
+	if !old.closed.Load() {
+		t.Fatal("conn not marked closed after closeConn")
+	}
+
+	// Subsequent requests must re-dial the (still-running) server and succeed.
+	var lastErr error
+	recovered := false
+	for range 50 {
+		_, err := client.DoRequest(ctx, 0)
+		if err == nil {
+			recovered = true
+			break
+		}
+		lastErr = err
+	}
+	if !recovered {
+		t.Fatalf("client did not recover after conn close; last err: %v", lastErr)
+	}
+
+	// The slot now holds a fresh, live conn — not the dead one.
+	if cur := client.conns[0].cur.Load(); cur == nil || cur == old || cur.closed.Load() {
+		t.Fatalf("slot not healed after reconnect (cur==nil:%v, cur==old:%v)", cur == nil, cur == old)
+	}
+}
+
 // TestH2StressMultiConn tests with many connections and high stream counts,
 // mimicking the real benchmark configuration.
 func TestH2StressMultiConn(t *testing.T) {
@@ -455,7 +507,7 @@ func TestH2StreamIDExhaustion(t *testing.T) {
 	defer client.Close()
 
 	// Fast-forward stream ID close to max
-	client.conns[0].nextStreamID.Store(0x7FFFFFF0)
+	client.conns[0].cur.Load().nextStreamID.Store(0x7FFFFFF0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

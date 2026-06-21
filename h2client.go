@@ -88,10 +88,19 @@ func resetError(code uint32) error {
 // Uses pre-encoded HPACK headers, dedicated writer goroutine per connection,
 // lock-free stream slot dispatch, and batched WINDOW_UPDATE writes.
 type h2Client struct {
-	conns       []*h2Conn
+	conns       []*h2ConnSlot
 	headerBlock []byte // pre-encoded HPACK header block (immutable)
 	dataPayload []byte // body bytes for POST (nil for GET)
 	hasBody     bool
+
+	// redial re-establishes a single connection (prior-knowledge or h2c
+	// upgrade, whichever this client was built with). A server that closes
+	// or GOAWAYs a connection mid-cell — hypercorn does this periodically —
+	// would otherwise strand the slot dead and the worker would spin
+	// closed-conn errors with no recovery (fastapi-h2 logged ~1.1B errors /
+	// 0 requests from exactly this). reconnectSlot calls it under the slot
+	// lock, paced by the slot's backoff.
+	redial func() (*h2Conn, error)
 
 	// dialedViaUpgrade reports whether this client's connections were
 	// established via the h2c upgrade handshake vs prior-knowledge H2.
@@ -103,6 +112,17 @@ type h2Client struct {
 	// New() currently fails the whole benchmark on any dial error so these
 	// are equal in the happy path.
 	upgradeAttempted int
+}
+
+// h2ConnSlot owns one logical connection that can be re-dialed in place. cur
+// holds the live *h2Conn (swapped atomically on reconnect so other workers
+// observe the new one without locking); mu single-flights the redial so a
+// fleet of workers sharing the slot dials once, not N times; backoff paces
+// retries against a server that stays down.
+type h2ConnSlot struct {
+	cur     atomic.Pointer[h2Conn]
+	mu      sync.Mutex
+	backoff connectBackoff
 }
 
 // h2WriteReq is a frame write request submitted to the writer goroutine.
@@ -319,22 +339,30 @@ func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*
 		}
 	}
 
-	conns := make([]*h2Conn, numConns)
-	for i := range numConns {
-		var hc *h2Conn
-		var err error
+	// redial captures the dial parameters so a slot can re-establish its
+	// connection after the server closes/GOAWAYs it mid-cell. Used for both
+	// the initial dials below and reconnectSlot.
+	redial := func() (*h2Conn, error) {
 		if upgrade {
-			hc, err = dialH2CUpgrade(addr, scheme, path, host, port, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
-		} else {
-			hc, err = dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+			return dialH2CUpgrade(addr, scheme, path, host, port, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
 		}
+		return dialH2(addr, scheme, maxStreams, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
+	}
+
+	conns := make([]*h2ConnSlot, numConns)
+	for i := range numConns {
+		hc, err := redial()
 		if err != nil {
 			for j := range i {
-				conns[j].closeConn()
+				if c := conns[j].cur.Load(); c != nil {
+					c.closeConn()
+				}
 			}
 			return nil, fmt.Errorf("h2client: dial conn[%d]: %w", i, err)
 		}
-		conns[i] = hc
+		slot := &h2ConnSlot{}
+		slot.cur.Store(hc)
+		conns[i] = slot
 	}
 
 	var payload []byte
@@ -348,9 +376,40 @@ func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*
 		headerBlock:      headerBlock,
 		dataPayload:      payload,
 		hasBody:          hasBody,
+		redial:           redial,
 		dialedViaUpgrade: upgrade,
 		upgradeAttempted: numConns,
 	}, nil
+}
+
+// reconnectSlot re-establishes a dead slot's connection, single-flighted under
+// the slot lock and paced by the slot's backoff. Returns the live conn, or nil
+// if the redial failed (caller surfaces a connect error) or ctx ended. A
+// concurrent caller that finds the slot already healed returns immediately.
+func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) *h2Conn {
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+
+	if hc := slot.cur.Load(); hc != nil && !hc.closed.Load() {
+		return hc // another worker already re-dialed this slot
+	}
+	if old := slot.cur.Load(); old != nil {
+		old.closeConn() // release fds/goroutines of the dead conn
+	}
+
+	// Pace retries so a server that stays down can't be hot-redialled.
+	if !slot.backoff.sleep(ctx, nil) {
+		return nil // ctx cancelled mid-backoff
+	}
+	hc, err := c.redial()
+	if err != nil {
+		recordConnectError()
+		slot.cur.Store(nil)
+		return nil
+	}
+	slot.backoff.reset()
+	slot.cur.Store(hc)
+	return hc
 }
 
 // h2HopByHopHeaders lists HTTP/1.1 connection-specific headers that are
@@ -787,10 +846,20 @@ func (hc *h2Conn) readLoop() {
 // which receives from either writeLoop (on error) or readLoop (on response).
 func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	idx := workerID % len(c.conns)
-	hc := c.conns[idx]
+	slot := c.conns[idx]
+	hc := slot.cur.Load()
 
-	if hc.closed.Load() {
-		return 0, fmt.Errorf("h2client: conn[%d] connection closed", idx)
+	// A server that closed/GOAWAYed this connection mid-cell leaves the slot
+	// dead; re-dial (paced) so the next request gets a fresh conn instead of
+	// spinning closed-conn errors. backoff lives in reconnectSlot.
+	if hc == nil || hc.closed.Load() {
+		hc = c.reconnectSlot(ctx, slot)
+		if hc == nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, fmt.Errorf("h2client: conn[%d] reconnect failed", idx)
+		}
 	}
 
 	// Acquire stream semaphore
@@ -910,8 +979,12 @@ func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
 
 // Close closes all connections.
 func (c *h2Client) Close() {
-	for _, hc := range c.conns {
-		hc.closeConn()
+	for _, slot := range c.conns {
+		slot.mu.Lock()
+		if hc := slot.cur.Load(); hc != nil {
+			hc.closeConn()
+		}
+		slot.mu.Unlock()
 	}
 }
 
