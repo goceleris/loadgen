@@ -12,7 +12,7 @@ const modulePath = "github.com/goceleris/loadgen"
 // fallbackVersion is reported when build info carries no usable module
 // version for loadgen ((devel) builds, tests, directory replaces). Keep in
 // sync with the release tag.
-const fallbackVersion = "1.4.7"
+const fallbackVersion = "1.4.9"
 
 // Version is the loadgen release version, stamped into Result.LoadgenVersion
 // so downstream consumers (probatorium, perfmatrix) can record which loadgen
