@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
-	github.com/goceleris/celeris v1.5.4
+	github.com/goceleris/celeris v1.5.5
 	golang.org/x/net v0.56.0
 )
 
