@@ -9,6 +9,21 @@ updates:
         patterns:
           - "*"
 
+  # The integration testserver is a nested module (it imports celeris to
+  # exercise loadgen against a real server). It is NEVER released or imported,
+  # so bumping its celeris pin here does NOT force a loadgen release — these
+  # PRs are harmless and just keep the integration test on recent celeris.
+  # (Keeping celeris OUT of loadgen's root module is what breaks the
+  # celeris<->loadgen dependabot cycle.)
+  - package-ecosystem: gomod
+    directory: /internal/integrationtest/testserver
+    schedule:
+      interval: weekly
+    groups:
+      all-go-deps:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -424,7 +424,14 @@ func buildTestServer(t *testing.T) string {
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
 		}
-		cmd := exec.Command("go", "build", "-o", bin, "./internal/integrationtest/testserver")
+		// The testserver lives in its OWN nested module
+		// (internal/integrationtest/testserver/go.mod) so loadgen's released
+		// module no longer requires celeris — that back-edge was the
+		// celeris<->loadgen dependabot cycle. Build it from inside its module
+		// dir (-o takes the absolute bin path) so its celeris dep resolves
+		// there and never leaks into loadgen's main module.
+		cmd := exec.Command("go", "build", "-o", bin, ".")
+		cmd.Dir = "internal/integrationtest/testserver"
 		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
