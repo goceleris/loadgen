@@ -586,11 +586,25 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		}
 	}
 
+	// Connection-level WINDOW_UPDATE the server sends in its preface (before
+	// its SETTINGS ack) must be captured here, not discarded: Kestrel/ASP.NET
+	// grows the connection flow-control window this way (65535 ->
+	// InitialConnectionWindowSize, e.g. 1 MiB). Dropping it strands
+	// connSendWindow at the RFC 7540 §6.9.2 floor of 65535, which deadlocks
+	// sustained request-body sends (post-4k-h2 / post-64k-h2) after ~65535
+	// bytes — the server only replenishes against its larger configured
+	// window, a threshold the stranded client never reaches. Servers that send
+	// the WINDOW_UPDATE after their ack are handled by readLoop once it starts.
+	var connWindowGrant int64
 	for range 5 {
 		frame, err := framer.ReadFrame()
 		if err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("read settings ack: %w", err)
+		}
+		if frame.Type == frameWindowUpdate && frame.StreamID == 0 {
+			connWindowGrant += int64(frame.WindowUpdateIncrement())
+			continue
 		}
 		if frame.Type == frameSettings && frame.IsAck() {
 			break
@@ -632,7 +646,9 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		},
 	}
 	hc.nextStreamID.Store(initialStreamID)
-	hc.connSendWindow.Store(65535) // RFC 7540 §6.9.2: conn window starts at 65535
+	// RFC 7540 §6.9.2 floor of 65535, plus any connection-level WINDOW_UPDATE
+	// the server granted in its preface (captured above).
+	hc.connSendWindow.Store(65535 + connWindowGrant)
 
 	for range effectiveStreams {
 		hc.streamSem <- struct{}{}
