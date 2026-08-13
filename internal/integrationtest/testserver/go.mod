@@ -2,7 +2,7 @@ module github.com/goceleris/loadgen/internal/integrationtest/testserver
 
 go 1.26.4
 
-require github.com/goceleris/celeris v1.5.7
+require github.com/goceleris/celeris v1.5.8
 
 require (
 	golang.org/x/net v0.56.0 // indirect
