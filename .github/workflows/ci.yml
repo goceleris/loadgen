@@ -20,7 +20,7 @@ jobs:
           go-version: "1.27.0"
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
         # runner labels, malformed shell, action input misuse — the
