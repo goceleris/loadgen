@@ -1,0 +1,16 @@
+# Code owners for goceleris/loadgen.
+#
+# GitHub requests a review from the matching owners on every pull request
+# that touches these paths; with "Require review from Code Owners" enabled on
+# the main branch protection, their approval is mandatory before merging.
+# Later rules take precedence over earlier ones — keep the catch-all first.
+#
+# Syntax: https://docs.github.com/articles/about-code-owners
+
+# Default owner for everything in the repository.
+* @FumingPower3925
+
+# Area delegation example — uncomment and adjust when a second maintainer
+# takes ownership of a subsystem (the more specific rule wins):
+# /cmd/loadgen/ @FumingPower3925 @WdnLiu
+# /.github/     @FumingPower3925
