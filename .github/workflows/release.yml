@@ -35,6 +35,10 @@ jobs:
     # orchestrators can fetch them without re-cloning + rebuilding.
     name: Build cmd/loadgen binaries (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # action-gh-release uploads the tarball to the release
+      id-token: write       # OIDC token that signs the SLSA provenance (Sigstore)
+      attestations: write   # store the attestation in the repository's attestation store
     strategy:
       matrix:
         include:
@@ -69,6 +73,12 @@ jobs:
         run: |
           cd dist
           tar czf "loadgen_${GOOS}_${GOARCH}.tar.gz" "loadgen-${GOOS}-${GOARCH}"
+      # SLSA build provenance for the exact archive that ships. Consumers
+      # verify with: gh attestation verify <asset> -R goceleris/loadgen
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
       - name: Attach to release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:

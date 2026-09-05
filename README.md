@@ -328,6 +328,16 @@ chmod +x /tmp/loadgen-${OS}-${ARCH}
 
 GitHub displays the SHA-256 of each release asset on the release page — `gh release download <tag>` and the web UI verify checksums automatically, so no separate `.sha256` sidecar ships.
 
+### Verify a release
+
+Every release tarball is built by the [release workflow](.github/workflows/release.yml) and carries a signed [SLSA build provenance](https://slsa.dev/provenance/) attestation, generated with `actions/attest-build-provenance` and recorded in GitHub's attestation store. Before running a downloaded binary on a bench host, check that the asset really came from this repository's release pipeline:
+
+```bash
+gh attestation verify loadgen_linux_amd64.tar.gz -R goceleris/loadgen
+```
+
+The command fails if the archive was tampered with after the build or was not produced by a `goceleris/loadgen` workflow. Add `--format json` to inspect the attested source commit, workflow path and builder. Releases published before the attestation step was added (v1.4.13 and earlier) have no attestation and will fail verification.
+
 ### Reference orchestrator
 
 The probatorium cluster bench drives this contract: it cross-compiles loadgen (or fetches a release tarball), pushes it to the load host, executes it, and parses the stdout JSON — decoding `histogram` for cross-cell re-aggregation. See [goceleris/probatorium](https://github.com/goceleris/probatorium).
