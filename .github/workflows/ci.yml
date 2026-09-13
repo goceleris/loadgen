@@ -23,6 +23,11 @@ jobs:
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13
+      # fallbackVersion (what a (devel) build reports) and the README's
+      # download TAG must agree; the Release workflow refuses to tag while
+      # they disagree with the tag.
+      - name: Release stamps agree
+        run: scripts/check-release-stamps.sh
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
         # runner labels, malformed shell, action input misuse — the

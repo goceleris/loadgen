@@ -1,20 +1,74 @@
 name: Release
 
+# The intended path is the manual dispatch from `main` with the version as
+# input: the gate checks the hand-written version stamps
+# (scripts/check-release-stamps.sh), the tests run, and only then does the
+# workflow create the tag and the GitHub Release itself, so a stale stamp
+# means no tag exists. The `release: published` path covers a release created
+# by hand: it runs the same gate first and stops before attaching binaries or
+# pinging the Go proxy.
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, vX.Y.Z; both stamps must already say it"
+        required: true
+        type: string
   release:
     types: [published]
 
 permissions:
-  contents: write   # upload-release-asset writes back to the release
+  contents: read
 
 jobs:
-  publish:
-    name: Publish to Go Package Registry
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      dispatch: ${{ steps.v.outputs.dispatch }}
+    steps:
+      - name: Version and semver format
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          TAG="${INPUT_VERSION:-$RELEASE_TAG}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z or vX.Y.Z-beta.N)"
+            exit 1
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main, not from $REF"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "dispatch=$([ "$EVENT" = workflow_dispatch ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: Version stamps agree, module verifies
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Tag must not exist yet (dispatch)
+        if: needs.resolve.outputs.dispatch == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists; a version is never re-tagged"
+            exit 1
+          fi
+      - name: Release stamps agree
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: scripts/check-release-stamps.sh "$VERSION"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
@@ -23,9 +77,40 @@ jobs:
           go mod verify
           go build ./...
           go vet ./...
-      - name: Request pkg.go.dev indexing
+          go test -race -count=1 -timeout 120s ./...
+
+  publish:
+    name: Create tag and release
+    needs: [resolve, gate]
+    if: needs.resolve.outputs.dispatch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ github.sha }}
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          # The tag is created at the exact commit the gate ran on. A release
+          # published with the job token does not re-trigger this workflow,
+          # so the binaries and the proxy ping below run from this same run.
+          gh release create "$VERSION" --target "$TARGET" --title "$VERSION" --generate-notes --verify-tag=false
+
+  proxy:
+    name: Request pkg.go.dev indexing
+    needs: [resolve, gate, publish]
+    if: always() && needs.gate.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request indexing
+        env:
+          TAG: ${{ needs.resolve.outputs.version }}
+        run: |
           curl -s "https://proxy.golang.org/github.com/goceleris/loadgen/@v/${TAG}.info" || true
           curl -s "https://sum.golang.org/lookup/github.com/goceleris/loadgen@${TAG}" || true
           echo "Published github.com/goceleris/loadgen@${TAG}"
@@ -34,6 +119,8 @@ jobs:
     # Cross-compiled binary artifacts for `cmd/loadgen` so cluster-bench
     # orchestrators can fetch them without re-cloning + rebuilding.
     name: Build cmd/loadgen binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [resolve, gate, publish]
+    if: always() && needs.gate.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write       # action-gh-release uploads the tarball to the release
@@ -82,4 +169,5 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          tag_name: ${{ needs.resolve.outputs.version }}
           files: dist/loadgen_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
