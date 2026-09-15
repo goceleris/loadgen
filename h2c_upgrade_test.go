@@ -32,8 +32,8 @@ func startH2CUpgradeServer(tb testing.TB) (host, port string, cleanup func()) {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("OK"))
 	})
-	h2s := &http2.Server{MaxConcurrentStreams: 100}
-	handler := h2c.NewHandler(mux, h2s) //nolint:staticcheck // see import-line comment
+	h2s := &http2.Server{MaxConcurrentStreams: 100} //nolint:staticcheck // x/net 0.59.0 deprecates http2.Server and its stream/window fields in favour of http.Server.HTTP2 + http.HTTP2Config, but h2c.NewHandler takes an *http2.Server and net/http exposes no replacement for prior-knowledge h2c, so this literal cannot migrate until the h2c scaffold does. Tracked with the import-line waiver.
+	handler := h2c.NewHandler(mux, h2s)             //nolint:staticcheck // see import-line comment
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

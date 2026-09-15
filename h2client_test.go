@@ -60,8 +60,8 @@ func startH2CServer(t *testing.T, maxStreams uint32) (host, port string, cleanup
 		_, _ = w.Write(body2MB)
 	})
 
-	h2s := &http2.Server{MaxConcurrentStreams: maxStreams}
-	handler := h2c.NewHandler(mux, h2s) //nolint:staticcheck // see import-line comment
+	h2s := &http2.Server{MaxConcurrentStreams: maxStreams} //nolint:staticcheck // x/net 0.59.0 deprecates http2.Server and its stream/window fields in favour of http.Server.HTTP2 + http.HTTP2Config, but h2c.NewHandler takes an *http2.Server and net/http exposes no replacement for prior-knowledge h2c, so this literal cannot migrate until the h2c scaffold does. Tracked with the import-line waiver.
+	handler := h2c.NewHandler(mux, h2s)                    //nolint:staticcheck // see import-line comment
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -229,13 +229,14 @@ func startStrictUploadH2CServer(tb testing.TB) (host, port string, cleanup func(
 		w.WriteHeader(200)
 	})
 
-	h2s := &http2.Server{
-		MaxConcurrentStreams:         100,
-		MaxReadFrameSize:             16384, // advertised SETTINGS_MAX_FRAME_SIZE
-		MaxUploadBufferPerStream:     65535, // advertised SETTINGS_INITIAL_WINDOW_SIZE
-		MaxUploadBufferPerConnection: 65535, // no extra connection-window WINDOW_UPDATE
-	}
-	handler := h2c.NewHandler(mux, h2s) //nolint:staticcheck // see import-line comment
+	// MaxReadFrameSize is the advertised SETTINGS_MAX_FRAME_SIZE,
+	// MaxUploadBufferPerStream the advertised SETTINGS_INITIAL_WINDOW_SIZE, and
+	// MaxUploadBufferPerConnection equals it so the server sends no extra
+	// connection-window WINDOW_UPDATE. On one line because a nolint directive
+	// suppresses only its own line and staticcheck reports one issue per
+	// deprecated field.
+	h2s := &http2.Server{MaxConcurrentStreams: 100, MaxReadFrameSize: 16384, MaxUploadBufferPerStream: 65535, MaxUploadBufferPerConnection: 65535} //nolint:staticcheck // x/net 0.59.0 deprecates http2.Server and its stream/window fields in favour of http.Server.HTTP2 + http.HTTP2Config, but h2c.NewHandler takes an *http2.Server and net/http exposes no replacement for prior-knowledge h2c, so this literal cannot migrate until the h2c scaffold does. Tracked with the import-line waiver.
+	handler := h2c.NewHandler(mux, h2s)                                                                                                            //nolint:staticcheck // see import-line comment
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
