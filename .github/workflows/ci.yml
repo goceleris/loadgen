@@ -49,6 +49,31 @@ jobs:
       - name: Run tests
         run: go test -race -count=1 -timeout 120s ./...
 
+  # govulncheck reports a known vulnerability only when this code can reach
+  # the vulnerable symbol, and exits non-zero (3) when it finds one. It runs
+  # on both modules: the testserver helper is a separate module that pins
+  # its own celeris. The scanner is pinned to a release rather than @latest
+  # so a new scanner cannot change this job's verdict unannounced; the
+  # vulnerability database itself is fetched live from vuln.go.dev on every
+  # run, so new advisories still land here without a bump.
+  vulncheck:
+    name: Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: Root module
+        run: govulncheck ./...
+      - name: internal/integrationtest/testserver
+        run: govulncheck ./...
+        working-directory: internal/integrationtest/testserver
+
   integration:
     name: Integration (live celeris)
     runs-on: ubuntu-latest
