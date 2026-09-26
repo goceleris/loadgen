@@ -1,0 +1,79 @@
+name: CodSpeed
+
+# Continuous benchmarking of the root package's testing.B benchmarks on a
+# CodSpeed macro runner (walltime instrument, the only one CodSpeed's Go
+# integration supports). Results appear on the PR as the "CodSpeed Performance
+# Analysis" check, which is informational until it is made a required check.
+#
+# Runner: codspeed-macro-arm64-graviton-ubuntu-22-04, the macro runner CodSpeed's
+# free plan includes (600 minutes a month, shared by every goceleris repository).
+# The x64 Ryzen macro runner is not available on the free plan. A PR is only
+# compared with main runs made on this same runner.
+#
+# Budget: the benchmarks only live in the root package, so this runs only when a
+# root-level .go file, go.mod or go.sum changes; drafts and superseded PR pushes
+# are skipped. See goceleris/celeris#690 for the estimate.
+#
+# Until an organization owner allows public repositories in the Default runner
+# group (Organization settings > Actions > Runner groups > Default), this job
+# waits in the queue with no runner. That is expected, not a failure.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.go"
+      - go.mod
+      - go.sum
+      - .github/workflows/codspeed.yml
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "*.go"
+      - go.mod
+      - go.sum
+      - .github/workflows/codspeed.yml
+  # Lets CodSpeed trigger backtests of past commits, and a maintainer run it by
+  # hand.
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmarks:
+    name: Benchmarks (CodSpeed walltime, arm64 macro runner)
+    # A macro runner is a self-hosted runner registered in this organization:
+    # code from a fork never runs on it. Drafts wait until they are ready.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft)
+    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # CodSpeed OIDC upload
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
+        with:
+          mode: walltime
+          # go-runner 1.3.0 is the first release that supports Go 1.27. It is
+          # pinned so a runner upgrade cannot shift the measurements unannounced.
+          go-runner-version: "1.3.0"
+          # -benchtime=1s matches plain `go test -bench` (the go-runner defaults
+          # to 3s): it keeps local and CodSpeed numbers comparable, costs about
+          # 40 s less per run, and keeps BenchmarkH2CUpgradeDial, which opens a
+          # TCP connection per iteration, below ephemeral-port exhaustion.
+          run: go test -bench=. -benchtime=1s .
