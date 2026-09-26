@@ -116,8 +116,10 @@ func TestH1KeepAlive(t *testing.T) {
 }
 
 func TestH1ConnectionClose(t *testing.T) {
+	var accepted atomic.Int64
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()
+		accepted.Add(1)
 		reader := bufio.NewReader(conn)
 		if !readH1Request(reader) {
 			return
@@ -136,15 +138,22 @@ func TestH1ConnectionClose(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
-	// Send multiple requests; client should reconnect via round-robin pool
-	for i := range 5 {
+	// Three full cycles of the worker's pool plus one, so every slot is
+	// reused: a slot whose connection the server closed must dial a fresh
+	// one for its next request (loadgen#87). With fewer requests than
+	// PoolSize no slot is reused and the test cannot fail.
+	numRequests := 3*cfg.PoolSize + 1
+	for i := range numRequests {
 		n, err := client.DoRequest(ctx, 0)
 		if err != nil {
-			t.Fatalf("request %d: %v", i, err)
+			t.Fatalf("request %d of %d: %v", i+1, numRequests, err)
 		}
 		if n != 2 {
-			t.Fatalf("request %d: bytesRead=%d, want 2", i, n)
+			t.Fatalf("request %d: bytesRead=%d, want 2", i+1, n)
 		}
+	}
+	if a := accepted.Load(); a != int64(numRequests) {
+		t.Errorf("server accepted %d connections for %d close-mode requests, want one per request", a, numRequests)
 	}
 }
 

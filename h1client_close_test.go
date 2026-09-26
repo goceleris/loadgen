@@ -7,7 +7,9 @@ package loadgen
 // socket and the EOF that follows would be counted as a failed request,
 // although the server answered every request that reached it. Genuine
 // failures (a refused dial, a reset or a truncated body) must still be
-// counted, exactly once each.
+// counted, exactly once each. And the close itself must not leave a
+// TIME_WAIT on the loadgen host: the client closes after the server's FIN,
+// or resets a connection the server keeps open.
 
 import (
 	"bufio"
@@ -61,6 +63,7 @@ const (
 	// half-closes (FIN) and keeps reading until the client closes: a
 	// keep-alive connection the server ends without notice, whose socket
 	// stays open, so a request written into it does not provoke an RST.
+	// How the client then closes (FIN or RST) is recorded in clientReset.
 	replyHalfClose
 	// replyErrorAnnounceClose answers 503 with Connection: close, then
 	// closes the connection.
@@ -96,7 +99,7 @@ const (
 
 // rawH1Server is a raw HTTP/1.1 server that counts the connections it
 // accepts, the requests it reads on each, and the connections the CLIENT
-// closed (EOF while the server waited for a next request).
+// closed (EOF or a reset while the server waited for a next request).
 type rawH1Server struct {
 	host, port string
 	stop       func() // closes the listener; established conns stay up
@@ -104,6 +107,11 @@ type rawH1Server struct {
 	accepted     atomic.Int64
 	handled      atomic.Int64
 	clientClosed atomic.Int64
+	// clientReset counts the client closes of clientClosed that were an
+	// abort (RST, SO_LINGER 0) rather than a FIN. An aborted connection
+	// leaves no TIME_WAIT on either side; a client that closes first with
+	// a FIN keeps one on the loadgen host.
+	clientReset atomic.Int64
 
 	// replyAnnounceCloseLate: which side closed the connection first.
 	clientClosedFirst atomic.Int64
@@ -123,8 +131,8 @@ func startRawH1Server(t *testing.T, reply func(conn, req int) h1Reply) *rawH1Ser
 		id := int(s.accepted.Add(1))
 		r := bufio.NewReader(c)
 		for req := 1; ; req++ {
-			if !readH1Request(r) {
-				s.clientClosed.Add(1)
+			if err := readH1RequestErr(r); err != nil {
+				s.clientGone(err)
 				return
 			}
 			s.handled.Add(1)
@@ -177,8 +185,11 @@ func startRawH1Server(t *testing.T, reply func(conn, req int) h1Reply) *rawH1Ser
 				if tc, ok := c.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
-				_, _ = io.Copy(io.Discard, r)
-				s.clientClosed.Add(1)
+				_, err := io.Copy(io.Discard, r)
+				if err == nil {
+					err = io.EOF
+				}
+				s.clientGone(err)
 				return
 			case replyErrorAnnounceClose:
 				_, _ = c.Write([]byte(resp503Close))
@@ -191,6 +202,41 @@ func startRawH1Server(t *testing.T, reply func(conn, req int) h1Reply) *rawH1Ser
 	})
 	t.Cleanup(s.stop)
 	return s
+}
+
+// clientGone records that the client ended a connection; err is the
+// server's read error (io.EOF for a FIN, ECONNRESET for an RST).
+func (s *rawH1Server) clientGone(err error) {
+	s.clientClosed.Add(1)
+	if errors.Is(err, syscall.ECONNRESET) {
+		s.clientReset.Add(1)
+	}
+}
+
+// readH1RequestErr is readH1Request returning the read error, so the
+// server can tell a client's FIN (io.EOF) from its RST (ECONNRESET).
+func readH1RequestErr(r *bufio.Reader) error {
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" || line == "\n" {
+			return nil
+		}
+	}
+}
+
+// waitFor polls cond every 5ms for up to 2s and reports whether it held.
+func waitFor(cond func() bool) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return true
 }
 
 func (s *rawH1Server) requestsPerConn() map[int]int {
@@ -263,9 +309,12 @@ func TestH1CloseModeServerCloseIsNotAnError(t *testing.T) {
 // TestH1CloseModeServerIgnoringCloseGetsOneConnPerRequest: a server that
 // ignores Connection: close keeps the connection open. The client asked
 // for close, so it must not send another request on that connection
-// (RFC 9112 §9.6): it closes it itself and dials a fresh one. Before the
+// (RFC 9112 §9.6): it ends it itself and dials a fresh one. Before the
 // fix the client reused the connection, so churn-close measured plain
-// keep-alive against such a server.
+// keep-alive against such a server (probatorium's lithium, and ntex before
+// v1.5.8). The client ends the connection with a reset, not a FIN: a FIN
+// from the client first leaves a TIME_WAIT on the loadgen host for every
+// request, and at churn rates those exhaust its ephemeral ports.
 func TestH1CloseModeServerIgnoringCloseGetsOneConnPerRequest(t *testing.T) {
 	srv := startRawH1Server(t, func(_, _ int) h1Reply { return replyKeepOpen })
 
@@ -296,13 +345,15 @@ func TestH1CloseModeServerIgnoringCloseGetsOneConnPerRequest(t *testing.T) {
 			t.Errorf("connection %d carried %d requests, want 1", id, reqs)
 		}
 	}
-	// Every connection that carried its request was closed by the client.
-	deadline := time.Now().Add(2 * time.Second)
-	for srv.clientClosed.Load() < n && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Every connection that carried its request was ended by the client,
+	// with a reset.
+	waitFor(func() bool { return srv.clientClosed.Load() >= n })
 	if c := srv.clientClosed.Load(); c < n {
 		t.Errorf("client closed %d of %d connections after their response, want all", c, n)
+	}
+	if r := srv.clientReset.Load(); r != n {
+		t.Errorf("client reset %d of the %d connections the server kept open; the rest it closed with a FIN, "+
+			"which leaves a TIME_WAIT on the loadgen host for every request", r, n)
 	}
 }
 
@@ -346,7 +397,8 @@ func TestH1KeepAliveAnnouncedCloseIsNotAnError(t *testing.T) {
 // holds the TIME_WAIT (at churn rates client-side TIME_WAIT exhausts the
 // ephemeral ports of a host that does not reuse them). The wait is off the
 // request's measured latency, and bounded: a server that keeps the
-// connection open is closed by the client after that bound (50ms).
+// connection open is reset by the client after that bound (50ms), which
+// leaves no TIME_WAIT on either side.
 func TestH1ServerClosesFirst(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -423,15 +475,62 @@ func TestH1ServerClosesFirst(t *testing.T) {
 		if a := srv.accepted.Load(); a != n {
 			t.Errorf("server accepted %d connections for %d requests, want %d", a, n, n)
 		}
-		// The client closes each connection itself once its bound passes.
-		deadline := time.Now().Add(2 * time.Second)
-		for srv.clientClosed.Load() < n && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
+		// The client ends each connection itself once its bound passes,
+		// with a reset.
+		waitFor(func() bool { return srv.clientClosed.Load() >= n })
 		if c := srv.clientClosed.Load(); c != n {
 			t.Errorf("client closed %d of %d connections the server kept open, want all (the wait for the server's close is unbounded)", c, n)
 		}
+		if r := srv.clientReset.Load(); r != n {
+			t.Errorf("client reset %d of the %d connections the server kept open, want all (a FIN leaves a TIME_WAIT on the loadgen host)", r, n)
+		}
 	})
+}
+
+// TestH1DefaultFINWaitLetsServerCloseFirst: with the shipped bound on the
+// wait for the server's FIN (the ordering tests above widen it), a server
+// that closes right after its response is still seen closing first: the
+// client closes after it with a FIN, and never resets it. A bound of zero,
+// or none, would make the client abort every connection before the
+// server's FIN could arrive.
+func TestH1DefaultFINWaitLetsServerCloseFirst(t *testing.T) {
+	if defaultPeerCloseWait < 5*lateCloseDelay {
+		t.Fatalf("defaultPeerCloseWait = %v, want at least %v: a server that closes right after its response "+
+			"must be seen closing first on a loaded host", defaultPeerCloseWait, 5*lateCloseDelay)
+	}
+	// The server half-closes (FIN) right behind its response, then reads
+	// until the client closes: EOF is a client FIN, ECONNRESET its abort.
+	srv := startRawH1Server(t, func(_, _ int) h1Reply { return replyHalfClose })
+	cfg := testH1Cfg(false, 1)
+	cfg.PoolSize = 1
+	client, err := newH1Client(srv.host, srv.port, "/", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	for i, hc := range client.conns {
+		if hc.peerCloseWait != defaultPeerCloseWait {
+			t.Fatalf("conn[%d].peerCloseWait = %v, want defaultPeerCloseWait (%v)", i, hc.peerCloseWait, defaultPeerCloseWait)
+		}
+	}
+
+	const n = 8
+	for i := range n {
+		if _, err := client.DoRequest(context.Background(), 0); err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+	}
+	if !waitFor(func() bool { return srv.clientClosed.Load() >= n }) {
+		t.Fatalf("client closed %d of %d connections within 2s", srv.clientClosed.Load(), n)
+	}
+	// One abort is tolerated: a server goroutine descheduled for longer
+	// than the bound between its response and its FIN on a loaded runner.
+	// A bound too short to see the FIN aborts every connection.
+	t.Logf("client closed %d connections, %d of them with a reset", srv.clientClosed.Load(), srv.clientReset.Load())
+	if r := srv.clientReset.Load(); r > 1 {
+		t.Errorf("client reset %d of %d connections whose server sent its FIN right behind the response: "+
+			"it did not wait for the server's close", r, n)
+	}
 }
 
 // TestH1TruncatedBodyCountsOnce: a truncated body is a genuine failure and
@@ -519,6 +618,8 @@ func TestH1ResetMidResponseCounts(t *testing.T) {
 
 			if _, err := client.DoRequest(context.Background(), 0); err == nil {
 				t.Fatal("request 1: reset mid-response returned no error")
+			} else if !errors.Is(err, syscall.ECONNRESET) {
+				t.Errorf("request 1: %v is not ECONNRESET: the server's reset did not reach the client as one", err)
 			} else {
 				t.Logf("request 1 (reset): %v", err)
 			}
@@ -584,9 +685,10 @@ func TestH1UnannouncedCloseCountsOnce(t *testing.T) {
 	if _, err := client.DoRequest(context.Background(), 0); err != nil {
 		t.Fatalf("request 1: %v", err)
 	}
-	if _, err := client.DoRequest(context.Background(), 0); err == nil {
-		t.Fatal("request 2: written into a connection the server had closed, returned no error")
-	} else {
+	// Request 2 meets the close. It fails today (it is not retried: see
+	// DoRequest); a safe retry of an idempotent request would let it
+	// succeed. Either way the close costs at most that one request.
+	if _, err := client.DoRequest(context.Background(), 0); err != nil {
 		t.Logf("request 2 (unannounced close): %v", err)
 	}
 	for i := 3; i <= 4; i++ {
@@ -661,6 +763,13 @@ func TestH1DialAfterCloseIsNotInstalled(t *testing.T) {
 	if h := srv.handled.Load(); h != 1 {
 		t.Errorf("server handled %d requests, want 1 (none after Close)", h)
 	}
+	// The connection dialed after Close is closed at once, not leaked: the
+	// server sees the client end it.
+	waitFor(func() bool { return srv.accepted.Load() == 2 && srv.clientClosed.Load() == 1 })
+	if a, c := srv.accepted.Load(), srv.clientClosed.Load(); a != 2 || c != 1 {
+		t.Errorf("server accepted %d connections and saw the client end %d of them, want 2 and 1: "+
+			"the connection dialed after Close was left open", a, c)
+	}
 }
 
 // TestBenchmarkerCloseModeCountsNoErrors is loadgen#87 end to end, the
@@ -716,6 +825,102 @@ func TestBenchmarkerCloseModeCountsNoErrors(t *testing.T) {
 			if d := h - res.Requests; d < 0 || d > workers {
 				t.Errorf("server handled %d, loadgen counted %d successes: difference %d is outside [0, %d]",
 					h, res.Requests, d, workers)
+			}
+		})
+	}
+}
+
+// TestIsConnectionClose: the Connection header's option list decides
+// whether a keep-alive connection carries the next request, so the parser
+// must find the close option in any case and among other options, and
+// nothing else (RFC 9110 §7.6.1).
+func TestIsConnectionClose(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want bool
+	}{
+		{"Connection: close\r\n", true},
+		{"connection: close\r\n", true},
+		{"CONNECTION: CLOSE\r\n", true},
+		{"Connection:close\r\n", true},
+		{"Connection: \tclose \r\n", true},
+		{"Connection: keep-alive, close\r\n", true},
+		{"Connection: Keep-Alive,Close\r\n", true},
+		{"Connection: close, Upgrade\r\n", true},
+		{"Connection: keep-alive\r\n", false},
+		{"connection: Keep-Alive\r\n", false},
+		{"CONNECTION: KEEP-ALIVE\r\n", false},
+		{"Connection: Upgrade\r\n", false},
+		{"Connection: closed\r\n", false},
+		{"Connection: x-close\r\n", false},
+		{"Connection: \r\n", false},
+		{"Connection-Token: close\r\n", false},
+		{"Content-Type: close\r\n", false},
+		{"Keep-Alive: timeout=5, max=100\r\n", false},
+	} {
+		if got := isConnectionClose([]byte(tc.line)); got != tc.want {
+			t.Errorf("isConnectionClose(%q) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
+
+// TestH1ConnectionHeaderDecidesReuse: in keep-alive mode the response's
+// Connection header alone decides whether the connection carries the next
+// request. The server keeps every connection open whatever it announces,
+// so only the client's reading of the header can change the count. A
+// keep-alive option (what Node, nginx and Apache send on every response)
+// must keep the worker on one connection: over-matching it would silently
+// turn every keep-alive cell into one dial per request with zero errors. A
+// close option, in any case and among other options, must retire the
+// connection after its response (RFC 9112 §9.6).
+func TestH1ConnectionHeaderDecidesReuse(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+		reuse        bool
+	}{
+		{"keep-alive", "Connection: keep-alive\r\n", true},
+		{"Keep-Alive+params", "connection: Keep-Alive\r\nKeep-Alive: timeout=5, max=100\r\n", true},
+		{"KEEP-ALIVE", "CONNECTION: KEEP-ALIVE\r\n", true},
+		{"closed-is-not-close", "Connection: closed\r\n", true},
+		{"close-lowercase", "connection: close\r\n", false},
+		{"CLOSE", "CONNECTION: CLOSE\r\n", false},
+		{"close-no-space", "Connection:close\r\n", false},
+		{"keep-alive,close", "Connection: Keep-Alive, Close\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var accepted atomic.Int64
+			resp := "HTTP/1.1 200 OK\r\n" + tc.header + "Content-Length: 2\r\n\r\nOK"
+			host, port, stop := startH1Server(t, func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				accepted.Add(1)
+				r := bufio.NewReader(c)
+				for readH1Request(r) {
+					if _, err := c.Write([]byte(resp)); err != nil {
+						return
+					}
+				}
+			})
+			t.Cleanup(stop)
+
+			client, err := newH1Client(host, port, "/", testH1Cfg(true, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			const n = 4
+			for i := range n {
+				if _, err := client.DoRequest(context.Background(), 0); err != nil {
+					t.Fatalf("request %d: %v", i+1, err)
+				}
+			}
+			want := int64(1)
+			if !tc.reuse {
+				want = n
+			}
+			if a := accepted.Load(); a != want {
+				t.Errorf("response header %q: server accepted %d connections for %d keep-alive requests, want %d",
+					tc.header, a, n, want)
 			}
 		})
 	}
