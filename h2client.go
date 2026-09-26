@@ -215,6 +215,7 @@ type h2StreamSlot struct {
 	streamID uint32
 	status   int  // :status of the response; 0 when absent or not parseable
 	final    bool // the final (non-1xx) response HEADERS arrived; a later HEADERS frame carries trailers
+	bytes    int  // body bytes: the data of every DATA frame so far, padding excluded
 }
 
 // h2Response is the result dispatched from the read loop to a waiting worker.
@@ -825,24 +826,29 @@ func (hc *h2Conn) readLoop() {
 			if frame.StreamEnded() {
 				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
-					*chPtr <- h2Response{status: st.status, bytesRead: 0}
+					*chPtr <- h2Response{status: st.status, bytesRead: st.bytes}
 				}
 			}
 
 		case frameData:
-			bytesRead := len(frame.Data())
-
 			// Accumulate connection-level WINDOW_UPDATE via atomic counter.
 			// writeLoop flushes this between processing worker requests.
-			if bytesRead > 0 {
-				hc.pendingConnWindow.Add(uint32(bytesRead))
+			// Flow control counts the whole payload, padding included.
+			if frame.Length > 0 {
+				hc.pendingConnWindow.Add(frame.Length)
 			}
 
+			// The body is every DATA frame of the stream, not the one that
+			// ends it: a body split over 16 KiB frames, or followed by an
+			// empty END_STREAM frame (net/http, after a flush), counts in full.
+			// Padding is framing, as chunk sizes are in HTTP/1.1: not counted.
+			st := hc.stream(frame.StreamID)
+			st.bytes += len(frame.Data())
+
 			if frame.StreamEnded() {
-				st := hc.stream(frame.StreamID)
 				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
-					*chPtr <- h2Response{status: st.status, bytesRead: bytesRead}
+					*chPtr <- h2Response{status: st.status, bytesRead: st.bytes}
 				}
 			}
 
@@ -904,6 +910,7 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 		st.streamID = streamID
 		st.status = 0
 		st.final = false
+		st.bytes = 0
 	}
 	return st
 }

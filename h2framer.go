@@ -80,8 +80,9 @@ func (f *h2Frame) unpadded() []byte {
 	return p[1 : len(p)-int(p[0])]
 }
 
-// Data returns the data payload from a DATA frame.
-func (f *h2Frame) Data() []byte { return f.payload }
+// Data returns the data of a DATA frame, without its padding. Flow control
+// counts the whole payload, padding included (RFC 9113 §6.9.1): use Length.
+func (f *h2Frame) Data() []byte { return f.unpadded() }
 
 // ErrCode returns the error code from a RST_STREAM frame (payload[0:4]).
 func (f *h2Frame) ErrCode() uint32 {
