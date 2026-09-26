@@ -130,14 +130,15 @@ cfg := loadgen.Config{
 ```
 
 ```go
-// HTTPS against a self-signed certificate. For client certificates, a custom CA pool
-// or a pinned cipher list, set Config.TLSConfig to a *tls.Config instead.
+// HTTPS. The certificate and host name are verified against the system CA pool.
+// For a private CA, client certificates or a pinned cipher list, set
+// Config.TLSConfig (for example TLSConfig.RootCAs). InsecureSkipVerify (-insecure
+// on the CLI) turns verification off; keep it for throwaway test certificates.
 cfg := loadgen.Config{
-	URL:                "https://api.example.com/health",
-	Duration:           30 * time.Second,
-	Connections:        128,
-	Workers:            128,
-	InsecureSkipVerify: true, // self-signed certs only
+	URL:         "https://api.example.com/health",
+	Duration:    30 * time.Second,
+	Connections: 128,
+	Workers:     128,
 }
 ```
 
@@ -218,8 +219,9 @@ a client that simply slowed down to match. Rated runs set `rated_mode: true`, `t
 `mode: "rated"` in the result.
 
 `-rate` (constant rate, coordinated-omission corrected) and `-max-rps` are independent rate controls.
-`-max-rps` only paces each closed-loop worker to at most `max(1, max-rps / workers)` req/s, so latency
-is still measured from the actual send and it does not apply in rated mode. `-rate` is the right one for
+`-max-rps` only paces each closed-loop worker on its own to at most `max(1, max-rps / workers)` req/s
+(no shared cap, so with more workers than `max-rps` the total exceeds it); latency is still measured
+from the actual send, and it does not apply in rated mode. `-rate` is the right one for
 latency-SLO measurement.
 
 ## Federation
@@ -296,7 +298,7 @@ loadgen [flags] -url <target>
 | `-h2-streams int` | `100` | Max concurrent H2 streams per connection. |
 | `-mode string` | | Streaming driver: `ws-echo` \| `ws-large-echo` \| `ws-hub` \| `sse-fanout`. Mutually exclusive with `-h2` / `-h2c-upgrade` / `-mix`. |
 | `-insecure` | `false` | Skip TLS certificate verification. |
-| `-max-rps int` | `0` | Cap on total req/s, applied by pacing each worker to `max(1, max-rps / workers)` (`0` = unlimited; ignored in rated mode). |
+| `-max-rps int` | `0` | Paces each worker on its own to `max(1, max-rps / workers)` req/s (integer division). There is no shared cap: with more workers than `max-rps` the total exceeds it. `0` = unlimited; ignored in rated mode. |
 | `-rate float` | `0` | Constant request rate (req/s). `>0` enables rated mode with coordinated-omission correction. |
 | `-peer host:port` | | Federation coordinator: dial a sidecar and merge its histogram. |
 | `-sidecar host:port` | | Run as a federation sidecar; all workload settings come from the coordinator. |
@@ -322,8 +324,8 @@ loadgen -url http://localhost:8080/ -rate 20000 -duration 60s
 # WebSocket echo latency.
 loadgen -url http://localhost:8080/ws -mode ws-echo -duration 30s
 
-# HTTPS with a request-rate cap and a result file.
-loadgen -url https://api.example.com/health -insecure -max-rps 5000 -duration 60s -out result.json
+# HTTPS with paced workers and a result file.
+loadgen -url https://api.example.com/health -max-rps 5000 -duration 60s -out result.json
 ```
 
 ### `-h2c-upgrade` (RFC 7540 §3.2)
@@ -421,8 +423,9 @@ chmod +x /tmp/loadgen-${OS}-${ARCH}
 /tmp/loadgen-${OS}-${ARCH} -url http://target:8080/ -duration 10s
 ```
 
-GitHub displays the SHA-256 of each release asset on the release page. `gh release download <tag>` and
-the web UI verify checksums automatically, so no separate `.sha256` sidecar ships.
+No separate `.sha256` sidecar ships. The release page lists each asset's SHA-256 digest, and
+`gh release view <tag> --repo goceleris/loadgen --json assets` prints it as `digest`; compare it with
+`shasum -a 256` of the file you downloaded.
 
 ### Verify a release
 
