@@ -1,0 +1,51 @@
+# Codecov configuration for goceleris/loadgen.
+# Reference: https://docs.codecov.com/docs/codecovyml-reference
+# Validate before pushing: curl --data-binary @codecov.yml https://api.codecov.io/validate
+#
+# Coverage is uploaded by .github/workflows/coverage.yml (flag: unit).
+# Everything here is informational for now: the statuses always pass, and the
+# PR comment only reports. Tracking issue: goceleris/celeris#690.
+
+codecov:
+  # Report as soon as the upload is processed. The defaults wait for every
+  # other check on the commit, and some of ours can stay pending for a long
+  # time (the CodSpeed job queues for a macro runner, CodeRabbit reviews on
+  # request), which would hold the Codecov status and comment back with them.
+  require_ci_to_pass: false
+  notify:
+    wait_for_ci: false
+
+coverage:
+  precision: 2
+  round: down
+  range: "60...90"
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: auto
+        informational: true
+
+comment:
+  layout: "condensed_header, condensed_files, condensed_footer"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+  hide_project_coverage: false
+
+# Line annotations cannot be withdrawn once posted (a later upload leaves the
+# stale ones), and Codecov documents that they do not work together with
+# flags, which this repository uses.
+github_checks:
+  annotations: false
+
+# The integration testserver is its own module (it imports celeris) and is
+# never part of the root module's profile; listed so a future integration
+# upload does not count a test helper as library code.
+ignore:
+  - "internal/integrationtest/**"
