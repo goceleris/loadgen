@@ -184,7 +184,7 @@ type h2Conn struct {
 	// currently-writing stream's window lives in curStreamWindow keyed by
 	// curStreamID; readLoop replenishes both on WINDOW_UPDATE. Without this a
 	// 64KiB body (post-64k-h2 = 65536 B) exceeds the 65535 window by one byte
-	// and the request hangs to the 5-min deadline.
+	// and the request hangs until the run ends.
 	connSendWindow   atomic.Int64
 	curStreamID      atomic.Uint32
 	curStreamWindow  atomic.Int64
@@ -644,11 +644,13 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		}
 	}
 
+	// The handshake is done: from here the connection has no deadline, as an
+	// HTTP/1.1 connection has none. It lives until the server or the network
+	// ends it or the client closes it, and Close is what interrupts a read or
+	// a write blocked on a peer that stopped reading. An absolute deadline
+	// here ended every connection of a run at the same instant, however
+	// healthy (#88).
 	_ = conn.SetReadDeadline(time.Time{})
-
-	// Set a deadline covering the entire benchmark lifetime.
-	// Prevents infinite blocks on TCP write if H2 flow control deadlocks.
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	effectiveStreams := min(serverMaxStreams, uint32(maxStreams))
 	if effectiveStreams < 1 {
@@ -1004,7 +1006,8 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 // hc.curStreamID; readLoop replenishes connSendWindow/curStreamWindow on
 // WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
 // server can consume + replenish) and poll — no extra goroutine/channel. The
-// conn's 5-min deadline (completeH2Handshake) is the deadlock backstop.
+// wait ends when the connection is closed (done), which Close does at the end
+// of a run: that is the backstop against a peer that never grants window.
 //
 // Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
 // (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
