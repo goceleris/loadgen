@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # CodSpeed macro runner used by codspeed.yml. CodSpeed registers it in the
+  # organization for each queued job and removes it afterwards, so actionlint
+  # cannot know the label; without this entry the Lint job's actionlint step
+  # fails on it.
+  labels:
+    - codspeed-macro-arm64-graviton-ubuntu-22-04
