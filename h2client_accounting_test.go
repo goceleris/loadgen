@@ -889,6 +889,25 @@ func TestH2ReadErrorMidStreamFailsEachInFlightStreamOnce(t *testing.T) {
 	}
 }
 
+// TestH2ResponseWinsOverConnectionClose: a worker that reaches its wait
+// after readLoop has both answered its stream and failed the connection finds
+// the response and the closed connection ready at once. The response is the
+// request's outcome; select alone would pick at random. (Found in review of
+// the #89 fix, which makes a close right after a response common.)
+func TestH2ResponseWinsOverConnectionClose(t *testing.T) {
+	hc := &h2Conn{done: make(chan struct{}), streamSem: make(chan struct{}, 1)}
+	close(hc.done)
+	for i := range 200 {
+		ch := make(chan h2Response, 1)
+		ch <- h2Response{status: 200, bytesRead: 2}
+		n, err := hc.await(context.Background(), &ch, 0)
+		<-hc.streamSem // the token await returned
+		if err != nil || n != 2 {
+			t.Fatalf("attempt %d: a delivered 200 response on a closed connection returned (%d, %v), want (2, nil)", i, n, err)
+		}
+	}
+}
+
 // failWritesConn fails every Write after the first okWrites on the
 // connection with ECONNRESET, writing nothing, while reads go on: the
 // connection's death shows on the write side only, as when the server is gone

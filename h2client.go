@@ -196,7 +196,7 @@ type h2Conn struct {
 
 	// Shutdown signal — closed by closeConn (once, under closeOnce) to unblock
 	// readLoop/writeLoop/workers, whether the client closes the connection or
-	// readLoop fails it (failConn).
+	// it dies under the client (failConn, from readLoop or writeLoop).
 	done      chan struct{}
 	closeOnce sync.Once
 
@@ -943,7 +943,7 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		hc := slot.cur.Load()
 
 		// A server that closed, reset or GOAWAYed this connection mid-cell
-		// leaves the slot dead (readLoop's failConn); re-dial (paced) so the
+		// leaves the slot dead (failConn); re-dial (paced) so the
 		// request gets a fresh conn instead of spinning closed-conn errors.
 		// backoff lives in reconnectSlot.
 		if hc == nil || hc.closed.Load() {
@@ -1014,21 +1014,18 @@ func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, err
 		return 0, ctx.Err()
 	}
 
-	// Single wait — receives normal responses (from readLoop) AND write errors (from writeLoop).
-	// The request is in flight now: if the connection dies, exactly one of
-	// failStreams, writeLoop (a write error, or its drain of writeCh) and
-	// done below answers it, so it is one error, never zero or two.
+	return hc.await(ctx, chPtr, idx)
+}
+
+// await waits for the answer to a request in flight on hc: a response (from
+// readLoop) or an error (from writeLoop, or failStreams). If the connection
+// dies, exactly one of failStreams, writeLoop (a write error, or its drain of
+// writeCh) and done below answers the request, so it is one error, never
+// zero or two.
+func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (int, error) {
 	select {
 	case resp := <-*chPtr:
-		hc.chanPool.Put(chPtr)
-		hc.streamSem <- struct{}{}
-		if resp.err != nil {
-			return 0, resp.err
-		}
-		if resp.status >= 400 {
-			return resp.bytesRead, statusError(resp.status)
-		}
-		return resp.bytesRead, nil
+		return hc.finish(chPtr, resp)
 	case <-ctx.Done():
 		// Worker exits, abandons chPtr. The heap-allocated channel (~120 bytes)
 		// will be GC'd when the slot is overwritten by the next stream ID at
@@ -1037,9 +1034,33 @@ func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, err
 		hc.streamSem <- struct{}{}
 		return 0, ctx.Err()
 	case <-hc.done:
+		// readLoop answers a stream before it fails the connection, so a
+		// response may be waiting here too. A worker parked in this select
+		// gets it by direct handoff before done closes, but one that reaches
+		// the select after both finds both ready, and select picks at random:
+		// a request the server answered must not become an error.
+		select {
+		case resp := <-*chPtr:
+			return hc.finish(chPtr, resp)
+		default:
+		}
 		hc.streamSem <- struct{}{}
 		return 0, fmt.Errorf("h2client: conn[%d] connection closing", idx)
 	}
+}
+
+// finish returns the stream's channel and token and turns its answer into
+// DoRequest's result: a status >= 400 is an error, as h1client counts it.
+func (hc *h2Conn) finish(chPtr *chan h2Response, resp h2Response) (int, error) {
+	hc.chanPool.Put(chPtr)
+	hc.streamSem <- struct{}{}
+	if resp.err != nil {
+		return 0, resp.err
+	}
+	if resp.status >= 400 {
+		return resp.bytesRead, statusError(resp.status)
+	}
+	return resp.bytesRead, nil
 }
 
 // writeBodyFlowControlled sends a request body as DATA frames, respecting BOTH
