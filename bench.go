@@ -59,7 +59,8 @@ type Config struct {
 
 	// Connections is the number of TCP connections for HTTP/1.1 mode.
 	// Each worker owns one connection in keep-alive mode. In close mode,
-	// each worker owns PoolSize connections and round-robins through them.
+	// each worker owns PoolSize connection slots and every request travels
+	// on a connection of its own (see DisableKeepAlive).
 	// Must be >= 1 when HTTP2 is false. Default: 256.
 	Connections int
 
@@ -80,9 +81,14 @@ type Config struct {
 	Warmup time.Duration
 
 	// DisableKeepAlive disables HTTP keep-alive (Connection: close mode).
-	// When true, the server closes connections after each response and
-	// the client round-robins through a pool of PoolSize connections per
-	// worker to hide reconnection latency. Default: false (keep-alive on).
+	// When true, every HTTP/1.1 request carries Connection: close and
+	// travels on a connection of its own: after the response the client
+	// lets the server close the connection (closing it itself if the
+	// server has not within 50ms, off the measured latency) and the next
+	// request dials a fresh one. The dial is part of that request, so it
+	// is inside its measured latency. The close is expected and is never
+	// counted as an error; a refused dial, a reset or a truncated body is.
+	// Default: false (keep-alive on).
 	DisableKeepAlive bool
 
 	// HTTP2 enables HTTP/2 over cleartext (h2c) mode.
@@ -129,8 +135,10 @@ type Config struct {
 	// Default: 256KB for HTTP/1.1, 2MB for HTTP/2. Must be non-negative.
 	WriteBufferSize int
 
-	// PoolSize is the number of connections per worker in Connection: close mode.
-	// Workers round-robin through the pool so reconnection latency is hidden.
+	// PoolSize is the number of connection slots per worker in
+	// Connection: close mode. New dials every slot up front, and the first
+	// request on each slot uses that connection; after it, each request
+	// dials a fresh connection, so the pool does not hide the dial.
 	// Only used when DisableKeepAlive is true. Default: 16.
 	PoolSize int
 

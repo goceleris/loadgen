@@ -13,10 +13,13 @@ import (
 
 // h1Client is a zero-allocation HTTP/1.1 benchmark client.
 // For keep-alive: each worker owns one dedicated connection (1:1 mapping).
-// For Connection: close: each worker owns connsPerWorker connections and
-// round-robins through them, so while one is reconnecting after close,
-// the worker can use the next. This amortizes reconnect latency and
-// matches wrk's behavior of having many in-flight reconnects per thread.
+// For Connection: close: each worker owns connsPerWorker connection slots
+// and round-robins through them. Every close-mode request travels on a
+// connection of its own: the slot's connection is closed after its
+// response and the next request on the slot dials a fresh one (see
+// DoRequest). The slots are dialed up front in newH1Client; after that
+// first cycle the worker dials once per request, so PoolSize does not
+// hide the dial.
 type h1Client struct {
 	conns           []*h1Conn
 	connCounters    []int // per-worker round-robin counter (no sync needed)
@@ -32,17 +35,24 @@ type h1Client struct {
 	tlsConfig       *tls.Config
 }
 
-// h1Conn is a single persistent TCP connection with a buffered reader.
+// h1Conn is one connection slot with a buffered reader.
 // Owned by exactly one worker for the request/response I/O path; the mu
 // guards conn/reader against concurrent access from (*h1Client).Close(),
 // which is invoked from Benchmarker.Run BEFORE the worker WaitGroup drains
-// in order to interrupt any in-flight I/O. Close and reconnect are the
-// only cold paths that acquire mu — DoRequest's hot path does not, because
-// reconnect is called from the same worker goroutine.
+// in order to interrupt any in-flight I/O. Close, finish and redial are
+// the only paths that acquire mu. DoRequest's hot path does not: only the
+// owning worker ever writes conn (under mu), so its own unlocked reads
+// cannot race, and Close only reads it.
 type h1Conn struct {
-	mu              sync.Mutex
-	conn            net.Conn
-	reader          *bufio.Reader
+	mu sync.Mutex
+	// conn is nil once the slot's connection is finished (closed by
+	// finish); the next request on the slot dials a fresh one.
+	conn   net.Conn
+	reader *bufio.Reader
+	// closed is set by (*h1Client).Close. A dial that completes after it
+	// closes the new connection instead of installing it, so a worker
+	// still running at shutdown cannot leak one.
+	closed          bool
 	addr            string
 	dialTimeout     time.Duration
 	readBufferSize  int
@@ -198,100 +208,125 @@ func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBu
 	return conn, nil
 }
 
+// peerCloseWait bounds how long a connection that is done (see
+// h1PeerCloses) waits for the server's FIN before the client closes it. A
+// server that closes after its response sends the FIN right behind it, so
+// the wait normally ends at once and the server, not loadgen, closes first
+// and holds the TIME_WAIT: at churn rates, client-side TIME_WAIT would
+// exhaust the ephemeral ports of a host that does not reuse them. The
+// bound only matters for a server that keeps the connection open.
+const peerCloseWait = 50 * time.Millisecond
+
+// h1Next says what happens to a slot's connection after a response.
+type h1Next uint8
+
+const (
+	// h1Reuse: the response was read completely; the connection is
+	// positioned at the next response and carries the next request.
+	h1Reuse h1Next = iota
+	// h1Close: an error left the stream at an unknown position; close the
+	// connection now.
+	h1Close
+	// h1PeerCloses: the response was read completely, but the connection
+	// is done: the request carried Connection: close, or the response
+	// did. Let the server close first (closeAfterPeer).
+	h1PeerCloses
+)
+
 // DoRequest sends a pre-formatted HTTP/1.1 request and reads the response.
 // Zero contention: each workerID maps to dedicated connection(s).
 // For keep-alive: 1 connection per worker.
-// For Connection: close: connsPerWorker connections, round-robin selection
-// so reconnects are amortized across the pool.
+// For Connection: close: connsPerWorker slots, round-robin selection.
+//
+// A slot's connection carries another request only while it is known to
+// be positioned at the start of the next response: keep-alive mode, the
+// previous response read completely, and no Connection: close from the
+// server. Otherwise (close mode, a response that announces
+// Connection: close, or an error in the middle of a response) the
+// connection leaves the slot right after the response and the next request
+// on the slot dials a fresh one, inside that request, so the dial is part
+// of that request's measured latency. A request is never written into a
+// connection the server has closed, and the EOF of a close that was asked
+// for or announced is never counted as a failed request (loadgen#87). A
+// genuine failure (a refused dial, a reset, a truncated body) fails its
+// request, once.
 func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
-	var hc *h1Conn
+	var connIdx int
 	if c.connsPerWorker == 1 {
-		hc = c.conns[workerID%len(c.conns)]
+		connIdx = workerID % len(c.conns)
 	} else {
-		// Round-robin through the worker's connection pool. For Connection:
-		// close, the server closes each connection after responding. The next
-		// Write() on a closed connection fails with broken pipe, triggering
-		// the reconnect-and-retry path below. With 16 connections per worker,
-		// reconnect latency (~2ms) is fully hidden behind the other 15 slots.
 		base := (workerID % (len(c.conns) / c.connsPerWorker)) * c.connsPerWorker
 		c.connCounters[workerID]++
-		hc = c.conns[base+(c.connCounters[workerID]%c.connsPerWorker)]
+		connIdx = base + (c.connCounters[workerID] % c.connsPerWorker)
+	}
+	hc := c.conns[connIdx]
+
+	// fresh: the connection is dialed by this request, so a failure to
+	// write into it is not a stale keep-alive connection and is not retried.
+	fresh := false
+	if hc.conn == nil {
+		if err := hc.redial(ctx, connIdx); err != nil {
+			return 0, err
+		}
+		fresh = true
 	}
 
-	connIdx := workerID % len(c.conns)
-
 	// Write request — single syscall for pre-formatted bytes
-	_, err := hc.conn.Write(c.reqBuf)
-	if err != nil {
+	if _, err := hc.conn.Write(c.reqBuf); err != nil {
+		hc.finish()
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
-		// Reconnect and retry once
-		if reconnErr := hc.reconnect(); reconnErr != nil {
-			recordConnectError()
-			// Server-death guard: pace this conn's next attempt with
-			// exponential backoff (ctx-abortable) so a dead server cannot
-			// induce a redial hot loop (v3.8 crash cell: 33.1M dial errors
-			// at ~370k/s). Reset below on the next successful reconnect.
-			hc.backoff.sleep(ctx, nil)
-			return 0, fmt.Errorf("h1client: conn[%d] reconnect failed: %w", connIdx, reconnErr)
+		if fresh {
+			return 0, fmt.Errorf("h1client: conn[%d] write: %w", connIdx, err)
 		}
-		hc.backoff.reset()
-		if _, err = hc.conn.Write(c.reqBuf); err != nil {
+		// A reused keep-alive connection the server closed while it sat
+		// idle: retry once on a fresh connection.
+		if err := hc.redial(ctx, connIdx); err != nil {
+			return 0, err
+		}
+		if _, err := hc.conn.Write(c.reqBuf); err != nil {
+			hc.finish()
 			return 0, fmt.Errorf("h1client: conn[%d] write after reconnect: %w", connIdx, err)
 		}
 	}
 
-	// Read status line: "HTTP/1.1 200 OK\r\n"
-	statusLine, err := hc.reader.ReadSlice('\n')
-	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		// Close-after-response / churn guard (mirrors the write-error path
-		// above): a Connection:close server — or one closing mid-response under
-		// churn-close — yields a read EOF here. Reconnect so the NEXT request
-		// gets a fresh conn, and back off ONLY if the server is genuinely down.
-		// Without this, a close-after-one server (drogon collapsed to 0 req from
-		// exactly this) spins read-EOFs with no pacing and never recovers.
-		if reconnErr := hc.reconnect(); reconnErr != nil {
-			recordConnectError()
-			hc.backoff.sleep(ctx, nil)
-			return 0, fmt.Errorf("h1client: conn[%d] read status (reconnect failed): %w", connIdx, reconnErr)
-		}
-		hc.backoff.reset()
-		return 0, fmt.Errorf("h1client: conn[%d] read status: %w", connIdx, err)
+	n, next, err := c.readResponse(hc.reader, connIdx)
+	switch next {
+	case h1PeerCloses:
+		hc.closeAfterPeer()
+	case h1Close:
+		hc.finish()
 	}
+	if err != nil && ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	return n, err
+}
 
+// readResponse reads one response from r and says what to do with the
+// connection afterwards. Any error that leaves the stream at an unknown
+// position returns h1Close.
+func (c *h1Client) readResponse(r *bufio.Reader, connIdx int) (int, h1Next, error) {
+	// Read status line: "HTTP/1.1 200 OK\r\n"
+	statusLine, err := r.ReadSlice('\n')
+	if err != nil {
+		return 0, h1Close, fmt.Errorf("h1client: conn[%d] read status: %w", connIdx, err)
+	}
 	if len(statusLine) < 12 {
-		return 0, fmt.Errorf("h1client: conn[%d] short status line", connIdx)
+		return 0, h1Close, fmt.Errorf("h1client: conn[%d] short status line", connIdx)
 	}
 	statusCode := parseStatusCode(statusLine[9:12])
-	if statusCode >= 400 {
-		n := drainH1Response(hc.reader)
-		return n, fmt.Errorf("h1client: conn[%d] status %d", connIdx, statusCode)
-	}
 
-	// Read headers, find Content-Length
+	// Read headers: Content-Length, Transfer-Encoding: chunked, and
+	// Connection: close.
 	contentLength := -1
 	chunked := false
-
+	peerCloses := false
 	for {
-		line, err := hc.reader.ReadSlice('\n')
+		line, err := r.ReadSlice('\n')
 		if err != nil {
-			if ctx.Err() != nil {
-				return 0, ctx.Err()
-			}
-			// Same close-after-response / churn guard as the status read:
-			// reconnect for the next request, back off only if the server is
-			// genuinely down.
-			if reconnErr := hc.reconnect(); reconnErr != nil {
-				recordConnectError()
-				hc.backoff.sleep(ctx, nil)
-				return 0, fmt.Errorf("h1client: conn[%d] read header (reconnect failed): %w", connIdx, reconnErr)
-			}
-			hc.backoff.reset()
-			return 0, fmt.Errorf("h1client: conn[%d] read header: %w", connIdx, err)
+			return 0, h1Close, fmt.Errorf("h1client: conn[%d] read header: %w", connIdx, err)
 		}
 		if len(line) <= 2 {
 			break
@@ -299,6 +334,8 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		if (line[0] == 'C' || line[0] == 'c') && len(line) > 16 {
 			if cl := parseContentLengthHeader(line); cl >= 0 {
 				contentLength = cl
+			} else if isConnectionClose(line) {
+				peerCloses = true
 			}
 		}
 		if (line[0] == 'T' || line[0] == 't') && len(line) > 26 {
@@ -308,34 +345,51 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		}
 	}
 
+	if statusCode >= 400 {
+		// Discard the error body (no MaxResponseSize limit) so a
+		// keep-alive connection stays in sync for the next request.
+		n, derr := discardH1Body(r, contentLength, chunked)
+		next := c.nextAfter(peerCloses)
+		if derr != nil {
+			next = h1Close
+		}
+		return n, next, fmt.Errorf("h1client: conn[%d] status %d", connIdx, statusCode)
+	}
+
 	// Read body
 	totalRead := 0
 	if contentLength >= 0 {
-		// MaxResponseSize enforcement for content-length responses
+		// MaxResponseSize enforcement for content-length responses. The
+		// body is not read: the connection is dropped instead.
 		if c.maxResponseSize > 0 && int64(contentLength) > c.maxResponseSize {
-			drainH1Response(hc.reader)
-			return 0, fmt.Errorf("h1client: conn[%d] response body %d bytes exceeds MaxResponseSize %d", connIdx, contentLength, c.maxResponseSize)
+			return 0, h1Close, fmt.Errorf("h1client: conn[%d] response body %d bytes exceeds MaxResponseSize %d", connIdx, contentLength, c.maxResponseSize)
 		}
 		totalRead = contentLength
 		if contentLength > 0 {
-			discarded, err := hc.reader.Discard(contentLength)
+			discarded, err := r.Discard(contentLength)
 			if err != nil {
-				return discarded, fmt.Errorf("h1client: conn[%d] discard body: %w", connIdx, err)
+				return discarded, h1Close, fmt.Errorf("h1client: conn[%d] discard body: %w", connIdx, err)
 			}
 		}
 	} else if chunked {
-		totalRead, err = readChunkedWithLimit(hc.reader, c.maxResponseSize)
+		totalRead, err = readChunkedWithLimit(r, c.maxResponseSize)
 		if err != nil {
-			return totalRead, fmt.Errorf("h1client: conn[%d] read chunked: %w", connIdx, err)
+			return totalRead, h1Close, fmt.Errorf("h1client: conn[%d] read chunked: %w", connIdx, err)
 		}
 	}
 
-	// For Connection: close, no explicit reconnect needed here. The server
-	// closes the connection after responding (it saw "Connection: close").
-	// On the next round-robin cycle back to this slot, the Write() will
-	// fail with broken pipe, triggering the reconnect-and-retry path above.
+	return totalRead, c.nextAfter(peerCloses), nil
+}
 
-	return totalRead, nil
+// nextAfter says what happens to a connection after a complete response.
+// A connection whose request or response carried Connection: close is done:
+// the client must not send another request on it (RFC 9112 §9.6), whether
+// or not the server closes it.
+func (c *h1Client) nextAfter(peerCloses bool) h1Next {
+	if peerCloses || !c.keepAlive {
+		return h1PeerCloses
+	}
+	return h1Reuse
 }
 
 // parseStatusCode parses a 3-digit status code from bytes without allocation.
@@ -403,6 +457,35 @@ func isChunkedHeader(line []byte) bool {
 	return asciiEqualFold(rem[:7], []byte("chunked"))
 }
 
+// isConnectionClose reports whether a header line is a Connection header
+// whose option list contains "close" (RFC 9110 §7.6.1), case-insensitively.
+func isConnectionClose(line []byte) bool {
+	const name = "Connection:"
+	if len(line) < len(name) || !asciiEqualFold(line[:len(name)], []byte(name)) {
+		return false
+	}
+	v := line[len(name):]
+	for len(v) > 0 {
+		i := 0
+		for i < len(v) && (v[i] == ' ' || v[i] == '\t' || v[i] == ',') {
+			i++
+		}
+		v = v[i:]
+		j := 0
+		for j < len(v) && v[j] != ',' && v[j] != ' ' && v[j] != '\t' && v[j] != '\r' && v[j] != '\n' {
+			j++
+		}
+		if j == 0 {
+			return false // end of the line
+		}
+		if j == 5 && asciiEqualFold(v[:5], []byte("close")) {
+			return true
+		}
+		v = v[j:]
+	}
+	return false
+}
+
 // readChunkedWithLimit reads a chunked transfer-encoded body, discarding all data.
 // If maxSize > 0 and the total exceeds maxSize, returns an error.
 func readChunkedWithLimit(r *bufio.Reader, maxSize int64) (int, error) {
@@ -438,60 +521,91 @@ func readChunkedWithLimit(r *bufio.Reader, maxSize int64) (int, error) {
 	}
 }
 
-// drainH1Response reads and discards the rest of an HTTP response (headers + body).
-func drainH1Response(r *bufio.Reader) int {
-	contentLength := -1
-	chunked := false
-	for {
-		line, err := r.ReadSlice('\n')
-		if err != nil || len(line) <= 2 {
-			break
-		}
-		if (line[0] == 'C' || line[0] == 'c') && len(line) > 16 {
-			if cl := parseContentLengthHeader(line); cl >= 0 {
-				contentLength = cl
-			}
-		}
-		if (line[0] == 'T' || line[0] == 't') && len(line) > 26 {
-			if isChunkedHeader(line) {
-				chunked = true
-			}
-		}
-	}
+// discardH1Body reads and discards a response body whose headers have
+// been read. It returns the body length (the declared Content-Length, or
+// the chunked total) and any read error. A body with neither framing is
+// taken as empty.
+func discardH1Body(r *bufio.Reader, contentLength int, chunked bool) (int, error) {
 	if contentLength > 0 {
-		_, _ = r.Discard(contentLength)
-		return contentLength
+		_, err := r.Discard(contentLength)
+		return contentLength, err
 	}
 	if chunked {
-		n, _ := readChunkedWithLimit(r, -1)
-		return n
+		return readChunkedWithLimit(r, -1)
 	}
-	return 0
+	return 0, nil
 }
 
-// reconnect closes and re-establishes the TCP connection. Acquires hc.mu
-// so the write to hc.conn cannot race with (*h1Client).Close reading it
-// from the Benchmarker shutdown goroutine.
-func (hc *h1Conn) reconnect() error {
-	hc.mu.Lock()
-	defer hc.mu.Unlock()
-	_ = hc.conn.Close()
+// redial dials a fresh connection into the slot, whose previous one is
+// finished. A failed dial is a connect error: it is recorded, paced by the
+// slot's backoff (a dead server cannot induce a redial hot loop: the v3.8
+// crash cell logged 33.1M dial errors at ~370k/s), and returned, so the
+// request that needed the connection fails. The dial runs without hc.mu,
+// so Close is never stuck behind it; a dial that completes after Close is
+// closed instead of installed.
+func (hc *h1Conn) redial(ctx context.Context, connIdx int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	conn, err := dialH1(hc.addr, hc.scheme, hc.dialTimeout, hc.readBufferSize, hc.writeBufferSize, hc.tlsConfig)
 	if err != nil {
-		return err
+		recordConnectError()
+		hc.backoff.sleep(ctx, nil)
+		return fmt.Errorf("h1client: conn[%d] reconnect failed: %w", connIdx, err)
+	}
+	hc.mu.Lock()
+	if hc.closed {
+		hc.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("h1client: conn[%d]: %w", connIdx, net.ErrClosed)
 	}
 	hc.conn = conn
 	hc.reader.Reset(conn)
+	hc.mu.Unlock()
+	hc.backoff.reset()
 	return nil
+}
+
+// finish closes the slot's connection and drops it; the next request on
+// the slot dials a fresh one.
+func (hc *h1Conn) finish() {
+	hc.mu.Lock()
+	if hc.conn != nil {
+		_ = hc.conn.Close()
+		hc.conn = nil
+	}
+	hc.mu.Unlock()
+}
+
+// closeAfterPeer detaches the slot's connection, which is done after a
+// complete response, and closes it on a goroutine of its own once the
+// server's FIN arrives, at most peerCloseWait later. The server then
+// closes first and holds the TIME_WAIT, and the wait stays off the
+// request's measured latency: the response is already complete. The slot
+// is free at once; the next request on it dials a fresh connection.
+func (hc *h1Conn) closeAfterPeer() {
+	hc.mu.Lock()
+	conn := hc.conn
+	hc.conn = nil
+	hc.mu.Unlock()
+	go func() {
+		_ = conn.SetReadDeadline(time.Now().Add(peerCloseWait))
+		var b [1]byte
+		_, _ = conn.Read(b[:])
+		_ = conn.Close()
+	}()
 }
 
 // Close closes all connections. Benchmarker.Run calls Close before draining
 // the worker WaitGroup (to interrupt in-flight I/O), so we must take hc.mu
-// to synchronise with concurrent reconnect() writes on the conn field.
+// to synchronise with concurrent finish/redial writes on the conn field.
 func (c *h1Client) Close() {
 	for _, hc := range c.conns {
 		hc.mu.Lock()
-		_ = hc.conn.Close()
+		hc.closed = true
+		if hc.conn != nil {
+			_ = hc.conn.Close()
+		}
 		hc.mu.Unlock()
 	}
 }

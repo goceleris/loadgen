@@ -5,8 +5,8 @@
 // net/http library for maximum throughput and minimal measurement overhead:
 //
 //   - HTTP/1.1: one persistent TCP connection per worker with pre-formatted
-//     request bytes, auto-reconnect for Connection: close workloads via a
-//     round-robin connection pool.
+//     request bytes; in Connection: close mode, a connection of its own
+//     for every request.
 //
 //   - HTTP/2: lock-free stream dispatch over multiplexed connections with
 //     pre-encoded HPACK headers, batched WINDOW_UPDATE, and channel-pooled
