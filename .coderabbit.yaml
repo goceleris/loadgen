@@ -159,9 +159,9 @@ reviews:
         - The exported histogram is V2-compressed and base64 in JSON; federation
           uses the same encoding on the wire. Flag encoding changes that break
           round-tripping with DecodeHistogram.
-        - loadgen.Result is parsed by probatorium: a renamed or removed JSON tag,
-          a changed unit, or a new field without omitempty is a breaking change
-          and must be reflected in the README contract section.
+        - loadgen.Result is parsed by probatorium: a renamed or removed JSON tag
+          or a changed unit is a breaking change, and every field change must be
+          reflected in the README contract section.
     - path: "{h1client,h2client,h2framer,h2c_upgrade,ws,sse,recvq,recvq_other,cpumon,cpumon_other}.go"
       instructions: |
         Protocol clients and probes (the send/receive hot path).
@@ -194,9 +194,11 @@ reviews:
         a README update.
     - path: "checkpoint/**"
       instructions: |
-        Checkpoint files are read back across loadgen versions. Flag format
-        changes that an older file cannot be decoded with, and missing
-        validation of fields read from disk.
+        Checkpoint files persist results so an interrupted benchmark suite can
+        resume without re-running completed configurations. Flag changes that
+        make an existing checkpoint file unreadable, that skip or repeat a
+        configuration on resume, and missing validation of fields read from
+        disk.
     - path: "**/*_test.go"
       instructions: |
         - Tests must be deterministic: flag time.Sleep used for
@@ -206,9 +208,11 @@ reviews:
         - Benchmarks run on CodSpeed (walltime, macro runner) as well as
           locally. Prefer b.Loop(), keep setup outside the loop, and call
           b.ReportAllocs() for hot-path benchmarks. CodSpeed's Go runner only
-          supports the -bench flag, so a benchmark must not depend on
-          -benchtime, -cpu or -count. Renaming a benchmark starts a new series
-          on CodSpeed and loses its history.
+          honours -bench and -benchtime (codspeed.yml sets 1s), so a benchmark
+          must not depend on -cpu, -count or -benchmem. A benchmark that opens
+          a connection per iteration must stay within the ephemeral port range
+          at that benchtime. Renaming a benchmark starts a new series on
+          CodSpeed and loses its history.
         - A correctness fix needs a regression test that fails without the fix.
     - path: "internal/integrationtest/**"
       instructions: |
