@@ -72,8 +72,14 @@ const (
 
 // lateCloseDelay is how long replyAnnounceCloseLate and
 // replyCloseSilentlyLate hold their close back. It must stay well below
-// the client's bound on waiting for the server's FIN (50ms).
+// the client's bound on waiting for the server's FIN, which the tests that
+// use it widen to lateCloseClientWait.
 const lateCloseDelay = 10 * time.Millisecond
+
+// lateCloseClientWait replaces the client's 50ms bound in the tests that
+// assert the server closes first, so a server goroutine delayed on a
+// loaded CI runner cannot make the client close first.
+const lateCloseClientWait = 2 * time.Second
 
 // fastRequest: a request to a local server that takes less than this did
 // not wait for the connection's close. A request that waited would take at
@@ -360,6 +366,9 @@ func TestH1ServerClosesFirst(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer client.Close()
+			for _, hc := range client.conns {
+				hc.peerCloseWait = lateCloseClientWait
+			}
 
 			const n = 4
 			for i := range n {

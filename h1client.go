@@ -64,6 +64,10 @@ type h1Conn struct {
 	// owning worker touches it (reconnect runs on the worker goroutine),
 	// so it needs no mu.
 	backoff connectBackoff
+
+	// peerCloseWait is defaultPeerCloseWait; a field so a test can widen
+	// it. Read by the owning worker only.
+	peerCloseWait time.Duration
 }
 
 // newH1Client creates a new zero-alloc HTTP/1.1 client.
@@ -113,6 +117,7 @@ func newH1Client(host, port, path string, cfg Config) (*h1Client, error) {
 			writeBufferSize: cfg.WriteBufferSize,
 			scheme:          scheme,
 			tlsConfig:       tlsCfg,
+			peerCloseWait:   defaultPeerCloseWait,
 		}
 	}
 
@@ -208,14 +213,14 @@ func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBu
 	return conn, nil
 }
 
-// peerCloseWait bounds how long a connection that is done (see
+// defaultPeerCloseWait bounds how long a connection that is done (see
 // h1PeerCloses) waits for the server's FIN before the client closes it. A
 // server that closes after its response sends the FIN right behind it, so
 // the wait normally ends at once and the server, not loadgen, closes first
 // and holds the TIME_WAIT: at churn rates, client-side TIME_WAIT would
 // exhaust the ephemeral ports of a host that does not reuse them. The
 // bound only matters for a server that keeps the connection open.
-const peerCloseWait = 50 * time.Millisecond
+const defaultPeerCloseWait = 50 * time.Millisecond
 
 // h1Next says what happens to a slot's connection after a response.
 type h1Next uint8
@@ -579,7 +584,7 @@ func (hc *h1Conn) finish() {
 
 // closeAfterPeer detaches the slot's connection, which is done after a
 // complete response, and closes it on a goroutine of its own once the
-// server's FIN arrives, at most peerCloseWait later. The server then
+// server's FIN arrives, at most hc.peerCloseWait later. The server then
 // closes first and holds the TIME_WAIT, and the wait stays off the
 // request's measured latency: the response is already complete. The slot
 // is free at once; the next request on it dials a fresh connection.
@@ -588,8 +593,9 @@ func (hc *h1Conn) closeAfterPeer() {
 	conn := hc.conn
 	hc.conn = nil
 	hc.mu.Unlock()
+	wait := hc.peerCloseWait
 	go func() {
-		_ = conn.SetReadDeadline(time.Now().Add(peerCloseWait))
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		var b [1]byte
 		_, _ = conn.Read(b[:])
 		_ = conn.Close()
