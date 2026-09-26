@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -39,10 +41,13 @@ type h1Client struct {
 // Owned by exactly one worker for the request/response I/O path; the mu
 // guards conn/reader against concurrent access from (*h1Client).Close(),
 // which is invoked from Benchmarker.Run BEFORE the worker WaitGroup drains
-// in order to interrupt any in-flight I/O. Close, finish and redial are
-// the only paths that acquire mu. DoRequest's hot path does not: only the
-// owning worker ever writes conn (under mu), so its own unlocked reads
-// cannot race, and Close only reads it.
+// in order to interrupt any in-flight I/O. mu is held only to swap the
+// slot's connection (redial, finish, closeAfterPeer, Close), never across
+// I/O: a connection is closed after it is released. A keep-alive request
+// on a live connection takes no lock; a close-mode request takes it twice
+// (redial and closeAfterPeer). Only the owning worker ever writes conn
+// (under mu), so its own unlocked reads cannot race, and Close only reads
+// it.
 type h1Conn struct {
 	mu sync.Mutex
 	// conn is nil once the slot's connection is finished (closed by
@@ -61,8 +66,8 @@ type h1Conn struct {
 	tlsConfig       *tls.Config
 
 	// backoff paces reconnect attempts after a failed redial. Only the
-	// owning worker touches it (reconnect runs on the worker goroutine),
-	// so it needs no mu.
+	// owning worker touches it (redial runs on the worker goroutine), so it
+	// needs no mu.
 	backoff connectBackoff
 
 	// peerCloseWait is defaultPeerCloseWait; a field so a test can widen
@@ -214,12 +219,12 @@ func dialH1(addr, scheme string, dialTimeout time.Duration, readBufSize, writeBu
 }
 
 // defaultPeerCloseWait bounds how long a connection that is done (see
-// h1PeerCloses) waits for the server's FIN before the client closes it. A
-// server that closes after its response sends the FIN right behind it, so
-// the wait normally ends at once and the server, not loadgen, closes first
-// and holds the TIME_WAIT: at churn rates, client-side TIME_WAIT would
-// exhaust the ephemeral ports of a host that does not reuse them. The
-// bound only matters for a server that keeps the connection open.
+// h1PeerCloses) waits for the server's FIN. A server that closes after its
+// response sends the FIN right behind it, so the wait normally ends at once
+// and the server, not loadgen, closes first and holds the TIME_WAIT. The
+// bound only matters for a server that keeps the connection open (one that
+// ignores Connection: close): the client then resets the connection, so
+// the loadgen host keeps no TIME_WAIT either (see closeAfterPeer).
 const defaultPeerCloseWait = 50 * time.Millisecond
 
 // h1Next says what happens to a slot's connection after a response.
@@ -250,11 +255,17 @@ const (
 // Connection: close, or an error in the middle of a response) the
 // connection leaves the slot right after the response and the next request
 // on the slot dials a fresh one, inside that request, so the dial is part
-// of that request's measured latency. A request is never written into a
-// connection the server has closed, and the EOF of a close that was asked
-// for or announced is never counted as a failed request (loadgen#87). A
+// of that request's measured latency. So a request is never written into a
+// connection whose request or response carried Connection: close, and the
+// EOF of such a close is never counted as a failed request (loadgen#87). A
 // genuine failure (a refused dial, a reset, a truncated body) fails its
 // request, once.
+//
+// Two limits. A keep-alive connection the server closes without notice is
+// seen only by the request written into it, which fails; it is not
+// retried, since the server may have received it. And "read completely"
+// is only as good as readResponse's framing, which knows Content-Length
+// and chunked; the cases it misreads are loadgen#93.
 func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	var connIdx int
 	if c.connsPerWorker == 1 {
@@ -311,7 +322,11 @@ func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 
 // readResponse reads one response from r and says what to do with the
 // connection afterwards. Any error that leaves the stream at an unknown
-// position returns h1Close.
+// position returns h1Close. The body is framed by Content-Length, else
+// chunked, else taken as empty; RFC 9112 §6.3 has more cases (a
+// close-delimited body, HEAD/1xx/204/304, Transfer-Encoding over
+// Content-Length, trailers, an HTTP/1.0 status line), which this does not
+// implement: loadgen#93.
 func (c *h1Client) readResponse(r *bufio.Reader, connIdx int) (int, h1Next, error) {
 	// Read status line: "HTTP/1.1 200 OK\r\n"
 	statusLine, err := r.ReadSlice('\n')
@@ -572,22 +587,36 @@ func (hc *h1Conn) redial(ctx context.Context, connIdx int) error {
 }
 
 // finish closes the slot's connection and drops it; the next request on
-// the slot dials a fresh one.
+// the slot dials a fresh one. The connection is released under mu and
+// closed after it: a TLS close writes a close_notify alert.
 func (hc *h1Conn) finish() {
 	hc.mu.Lock()
-	if hc.conn != nil {
-		_ = hc.conn.Close()
-		hc.conn = nil
-	}
+	conn := hc.conn
+	hc.conn = nil
 	hc.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // closeAfterPeer detaches the slot's connection, which is done after a
-// complete response, and closes it on a goroutine of its own once the
-// server's FIN arrives, at most hc.peerCloseWait later. The server then
-// closes first and holds the TIME_WAIT, and the wait stays off the
-// request's measured latency: the response is already complete. The slot
-// is free at once; the next request on it dials a fresh connection.
+// complete response, and ends it on a goroutine of its own, so the wait
+// stays off the request's measured latency: the response is already
+// complete. The slot is free at once; the next request on it dials a fresh
+// connection.
+//
+// The goroutine waits for the server's FIN, at most hc.peerCloseWait:
+//   - The FIN arrives (the server closes, as Connection: close asks): the
+//     client closes after it, so the server holds the TIME_WAIT.
+//   - Anything else, normally the bound expiring on a server that keeps
+//     the connection open: the client resets the connection (abortClose),
+//     so neither side keeps a TIME_WAIT. A FIN from the client first would
+//     leave a TIME_WAIT on the loadgen host for every request, and at
+//     churn rates those exhaust its ephemeral ports: the run would then
+//     report loadgen's own port ceiling as the server's connect errors.
+//
+// The goroutine is not tracked. It ends within hc.peerCloseWait (plus a
+// TLS close_notify write), after Close and Run have returned if need be.
 func (hc *h1Conn) closeAfterPeer() {
 	hc.mu.Lock()
 	conn := hc.conn
@@ -597,21 +626,41 @@ func (hc *h1Conn) closeAfterPeer() {
 	go func() {
 		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		var b [1]byte
-		_, _ = conn.Read(b[:])
+		if _, err := conn.Read(b[:]); !errors.Is(err, io.EOF) {
+			abortClose(conn)
+			return
+		}
 		_ = conn.Close()
 	}()
+}
+
+// abortClose closes conn with an RST instead of a FIN (SO_LINGER 0), so
+// the client keeps no TIME_WAIT for it. Over TLS the close_notify alert is
+// still written first.
+func abortClose(conn net.Conn) {
+	raw := conn
+	if tc, ok := conn.(*tls.Conn); ok {
+		raw = tc.NetConn()
+	}
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = conn.Close()
 }
 
 // Close closes all connections. Benchmarker.Run calls Close before draining
 // the worker WaitGroup (to interrupt in-flight I/O), so we must take hc.mu
 // to synchronise with concurrent finish/redial writes on the conn field.
+// The connection is closed after mu is released; a worker that released
+// the same connection may close it too, which is harmless.
 func (c *h1Client) Close() {
 	for _, hc := range c.conns {
 		hc.mu.Lock()
 		hc.closed = true
-		if hc.conn != nil {
-			_ = hc.conn.Close()
-		}
+		conn := hc.conn
 		hc.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
 	}
 }
