@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -193,10 +194,15 @@ type h2Conn struct {
 	// Concurrency limit
 	streamSem chan struct{}
 
-	// Shutdown signal — closed by closeConn to unblock readLoop/writeLoop/workers
-	done chan struct{}
+	// Shutdown signal — closed by closeConn (once, under closeOnce) to unblock
+	// readLoop/writeLoop/workers, whether the client closes the connection or
+	// readLoop fails it (failConn).
+	done      chan struct{}
+	closeOnce sync.Once
 
-	addr   string
+	addr string
+	// closed marks a connection that takes no new request: DoRequest
+	// redials the slot instead. Set before done is closed.
 	closed atomic.Bool
 }
 
@@ -719,18 +725,18 @@ func (hc *h2Conn) writeLoop() {
 					count++
 					if count%64 == 0 {
 						hc.flushWindowUpdate()
-						_ = hc.bufWriter.Flush() // send WINDOW_UPDATE to the network NOW
+						hc.writeFailed(hc.bufWriter.Flush()) // send WINDOW_UPDATE to the network NOW
 					}
 				default:
 					break drain
 				}
 			}
 			hc.flushWindowUpdate()
-			_ = hc.bufWriter.Flush()
+			hc.writeFailed(hc.bufWriter.Flush())
 
 		case <-ticker.C:
 			hc.flushWindowUpdate()
-			_ = hc.bufWriter.Flush()
+			hc.writeFailed(hc.bufWriter.Flush())
 
 		case <-hc.done:
 			// Drain pending requests — send errors to respCh so workers unblock.
@@ -745,6 +751,17 @@ func (hc *h2Conn) writeLoop() {
 				}
 			}
 		}
+	}
+}
+
+// writeFailed ends the connection after a write to it failed (nil: no-op).
+// The peer is gone, and readLoop does not always see it: the server may keep
+// its side open, or its reset may not have reached the read yet. Without
+// this the bufio.Writer keeps the error and fails every later request on the
+// dead connection at once, a spin of errors that never redials (#89).
+func (hc *h2Conn) writeFailed(err error) {
+	if err != nil && !hc.closed.Load() {
+		hc.failConn(fmt.Errorf("connection error: %w", err))
 	}
 }
 
@@ -772,12 +789,14 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 		if err == nil && req.hasBody {
 			err = hc.writeBodyFlowControlled(streamID, req.data)
 		}
-		if err != nil {
-			hc.streamSlots[slotIdx].ch.Store(nil)
-			if req.respCh != nil {
-				*req.respCh <- h2Response{err: err}
-			}
+		// Whoever takes respCh out of the slot answers it, exactly once:
+		// readLoop may have taken it first (a response, a reset, or
+		// failStreams on a connection that died while this was written).
+		// Answering it twice would block here on the full channel.
+		if err != nil && req.respCh != nil && hc.streamSlots[slotIdx].ch.CompareAndSwap(req.respCh, nil) {
+			*req.respCh <- h2Response{err: err}
 		}
+		hc.writeFailed(err)
 
 	case h2WriteSettingsAck:
 		_ = hc.framer.WriteSettingsAck()
@@ -801,15 +820,12 @@ func (hc *h2Conn) readLoop() {
 		frame, err := hc.framer.ReadFrame()
 		if err != nil {
 			if hc.closed.Load() {
-				return
+				return // the client closed it (Close, or reconnectSlot replacing it)
 			}
-			// Notify all pending streams
-			for i := range hc.streamSlots {
-				chPtr := hc.streamSlots[i].ch.Swap(nil)
-				if chPtr != nil {
-					*chPtr <- h2Response{err: fmt.Errorf("connection error: %w", err)}
-				}
-			}
+			// The server or the network ended the connection without a
+			// GOAWAY: a close, a reset, a timeout. Fail it, so its in-flight
+			// streams are errors and DoRequest redials.
+			hc.failConn(fmt.Errorf("connection error: %w", err))
 			return
 		}
 
@@ -880,13 +896,7 @@ func (hc *h2Conn) readLoop() {
 			}
 
 		case frameGoAway:
-			hc.closed.Store(true)
-			for i := range hc.streamSlots {
-				chPtr := hc.streamSlots[i].ch.Swap(nil)
-				if chPtr != nil {
-					*chPtr <- h2Response{err: fmt.Errorf("goaway: code=%d", frame.GoAwayErrCode())}
-				}
-			}
+			hc.failConn(fmt.Errorf("goaway: code=%d", frame.GoAwayErrCode()))
 			return
 
 		case frameWindowUpdate:
@@ -917,32 +927,62 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 	return st
 }
 
+// errH2NotSent is roundTrip's report that the connection died before the
+// request was handed to it. Nothing reached the server, so it is not a
+// failed request: DoRequest takes the request to the redialed connection.
+// Never returned to DoRequest's caller.
+var errH2NotSent = errors.New("h2client: connection gone before the request was sent")
+
 // DoRequest sends an HTTP/2 request and waits for the response.
 // Fire-and-forget to writeLoop: no resultCh round-trip. Workers wait only on respCh,
 // which receives from either writeLoop (on error) or readLoop (on response).
 func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	idx := workerID % len(c.conns)
 	slot := c.conns[idx]
-	hc := slot.cur.Load()
+	for {
+		hc := slot.cur.Load()
 
-	// A server that closed/GOAWAYed this connection mid-cell leaves the slot
-	// dead; re-dial (paced) so the next request gets a fresh conn instead of
-	// spinning closed-conn errors. backoff lives in reconnectSlot.
-	if hc == nil || hc.closed.Load() {
-		hc = c.reconnectSlot(ctx, slot)
-		if hc == nil {
-			if ctx.Err() != nil {
-				return 0, ctx.Err()
+		// A server that closed, reset or GOAWAYed this connection mid-cell
+		// leaves the slot dead (readLoop's failConn); re-dial (paced) so the
+		// request gets a fresh conn instead of spinning closed-conn errors.
+		// backoff lives in reconnectSlot.
+		if hc == nil || hc.closed.Load() {
+			hc = c.reconnectSlot(ctx, slot)
+			if hc == nil {
+				if ctx.Err() != nil {
+					return 0, ctx.Err()
+				}
+				return 0, fmt.Errorf("h2client: conn[%d] reconnect failed", idx)
 			}
-			return 0, fmt.Errorf("h2client: conn[%d] reconnect failed", idx)
 		}
-	}
 
-	// Acquire stream semaphore
+		n, err := c.roundTrip(ctx, hc, idx)
+		if err != errH2NotSent { // the sentinel itself, never wrapped
+			return n, err
+		}
+		// The connection died while this request waited for a stream. Each
+		// pass through here needs a connection to have died, and every
+		// connection is dialed through reconnectSlot's backoff, so a server
+		// that keeps closing connections cannot make this loop spin; ctx
+		// ends it.
+	}
+}
+
+// roundTrip sends one request on hc and waits for its response. It returns
+// errH2NotSent if hc died before the request was handed to its writer.
+func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, error) {
+	// Acquire a stream. When the connection dies, the workers queued here
+	// wake through done, or through the tokens its failed streams return.
 	select {
 	case <-hc.streamSem:
+	case <-hc.done:
+		return 0, errH2NotSent
 	case <-ctx.Done():
 		return 0, ctx.Err()
+	}
+	if hc.closed.Load() {
+		hc.streamSem <- struct{}{}
+		return 0, errH2NotSent
 	}
 
 	// Get heap-allocated response channel pointer from pool
@@ -967,14 +1007,17 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	case <-hc.done:
 		hc.chanPool.Put(chPtr)
 		hc.streamSem <- struct{}{}
-		return 0, fmt.Errorf("h2client: conn[%d] connection closing", idx)
+		return 0, errH2NotSent
 	case <-ctx.Done():
 		hc.chanPool.Put(chPtr)
 		hc.streamSem <- struct{}{}
 		return 0, ctx.Err()
 	}
 
-	// Single wait — receives normal responses (from readLoop) AND write errors (from writeLoop)
+	// Single wait — receives normal responses (from readLoop) AND write errors (from writeLoop).
+	// The request is in flight now: if the connection dies, exactly one of
+	// failStreams, writeLoop (a write error, or its drain of writeCh) and
+	// done below answers it, so it is one error, never zero or two.
 	select {
 	case resp := <-*chPtr:
 		hc.chanPool.Put(chPtr)
@@ -1007,7 +1050,8 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 // WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
 // server can consume + replenish) and poll — no extra goroutine/channel. The
 // wait ends when the connection is closed (done), which Close does at the end
-// of a run: that is the backstop against a peer that never grants window.
+// of a run and failConn when the connection dies: that is the backstop
+// against a peer that never grants window.
 //
 // Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
 // (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
@@ -1065,10 +1109,36 @@ func (c *h2Client) Close() {
 	}
 }
 
+// closeConn closes the connection: it takes no new request, done unblocks
+// workers, readLoop and writeLoop, and the socket is released. Idempotent,
+// and safe from any goroutine.
 func (hc *h2Conn) closeConn() {
-	if !hc.closed.CompareAndSwap(false, true) {
-		return // already closed
+	hc.closed.Store(true)
+	hc.closeOnce.Do(func() {
+		close(hc.done) // unblock workers, readLoop, and writeLoop
+		_ = hc.conn.Close()
+	})
+}
+
+// failConn ends a connection that died under the client: the server closed
+// or reset it, sent GOAWAY, or a write to it failed. It marks the connection
+// closed first, so DoRequest redials instead of queueing onto a connection
+// nobody reads, fails every stream in flight on it once, and closes it,
+// which stops writeLoop, releases the socket and wakes the workers queued
+// for a stream. Called by readLoop and writeLoop; safe from both at once.
+func (hc *h2Conn) failConn(err error) {
+	hc.closed.Store(true)
+	hc.failStreams(err)
+	hc.closeConn()
+}
+
+// failStreams answers every stream still registered on the connection with
+// err. Each response channel is taken out of its slot before it is answered,
+// so no stream is answered twice.
+func (hc *h2Conn) failStreams(err error) {
+	for i := range hc.streamSlots {
+		if chPtr := hc.streamSlots[i].ch.Swap(nil); chPtr != nil {
+			*chPtr <- h2Response{err: err}
+		}
 	}
-	close(hc.done) // unblock workers, readLoop, and writeLoop
-	_ = hc.conn.Close()
 }
