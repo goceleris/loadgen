@@ -22,6 +22,8 @@ const (
 	flagEndStream  = 0x1
 	flagACK        = 0x1
 	flagEndHeaders = 0x4
+	flagPadded     = 0x8  // DATA, HEADERS: Pad Length byte first, that many padding bytes last
+	flagPriority   = 0x20 // HEADERS: 5 bytes of stream dependency and weight before the block
 )
 
 // H2 settings IDs.
@@ -51,8 +53,32 @@ func (f *h2Frame) StreamEnded() bool { return f.Flags&flagEndStream != 0 }
 // IsAck reports whether the ACK flag is set (for SETTINGS and PING).
 func (f *h2Frame) IsAck() bool { return f.Flags&flagACK != 0 }
 
-// HeaderBlockFragment returns the header block fragment from a HEADERS frame.
-func (f *h2Frame) HeaderBlockFragment() []byte { return f.payload }
+// HeaderBlockFragment returns the header block fragment from a HEADERS frame,
+// without the padding and priority fields a server may add (RFC 9113 §6.2).
+func (f *h2Frame) HeaderBlockFragment() []byte {
+	p := f.unpadded()
+	if f.Flags&flagPriority != 0 {
+		if len(p) < 5 {
+			return nil
+		}
+		p = p[5:]
+	}
+	return p
+}
+
+// unpadded returns the payload of a DATA or HEADERS frame without its Pad
+// Length field and padding. A pad length that does not fit the payload is a
+// PROTOCOL_ERROR (RFC 9113 §6.1); nothing in such a payload is usable.
+func (f *h2Frame) unpadded() []byte {
+	p := f.payload
+	if f.Flags&flagPadded == 0 {
+		return p
+	}
+	if len(p) == 0 || int(p[0]) >= len(p) {
+		return nil
+	}
+	return p[1 : len(p)-int(p[0])]
+}
 
 // Data returns the data payload from a DATA frame.
 func (f *h2Frame) Data() []byte { return f.payload }

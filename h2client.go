@@ -202,8 +202,19 @@ type h2Conn struct {
 
 // h2StreamSlot holds an atomic pointer to a response channel.
 // writeLoop stores; readLoop loads and clears.
+//
+// The other fields are the response state of the stream that last sent a
+// frame for this slot. Only readLoop touches them, so they need no
+// synchronisation, and they are keyed by stream ID: the first frame of a new
+// stream resets them (see h2Conn.stream), so nothing leaks from a stream
+// that used the slot before, whether it finished, was reset or was
+// abandoned.
 type h2StreamSlot struct {
 	ch atomic.Pointer[chan h2Response]
+
+	streamID uint32
+	status   int  // :status of the response; 0 when absent or not parseable
+	final    bool // the final (non-1xx) response HEADERS arrived; a later HEADERS frame carries trailers
 }
 
 // h2Response is the result dispatched from the read loop to a waiting worker.
@@ -263,8 +274,11 @@ func extractStatus(headerBlock []byte) int {
 		return h2StaticStatus[b-0x88]
 	}
 
-	// Fallback: literal header field with name index 8 (:status).
-	// Safe because we disabled the HPACK dynamic table (SettingHeaderTableSize=0).
+	// Fallback: literal header field whose name is a static :status entry.
+	// Static indices 8-14 all name :status, and encoders pick any of them:
+	// x/net's (net/http's) names it by the LAST match, 14, so a literal 503
+	// arrives as 0x0e 0x03 "503". Safe because we disabled the HPACK dynamic
+	// table (SettingHeaderTableSize=0).
 	var nameIdx int
 	pos++
 
@@ -279,25 +293,43 @@ func extractStatus(headerBlock []byte) int {
 		return 0
 	}
 
-	if nameIdx != 8 || pos >= len(headerBlock) {
+	if nameIdx < 8 || nameIdx > 14 || pos >= len(headerBlock) {
 		return 0
 	}
 
 	valueByte := headerBlock[pos]
 	pos++
 
-	// Skip Huffman-encoded values (unlikely for 3-digit status codes)
-	if valueByte&0x80 != 0 {
-		return 0
-	}
-
 	valueLen := int(valueByte & 0x7F)
-	if valueLen != 3 || pos+3 > len(headerBlock) {
+	if pos+valueLen > len(headerBlock) {
 		return 0
 	}
+	value := headerBlock[pos : pos+valueLen]
 
-	return parseStatusCode(headerBlock[pos : pos+3])
+	// A Huffman-coded value (RFC 7541 §5.2). Encoders pick it whenever it is
+	// shorter than the literal, which for a status is every code with at
+	// least two digits from {0, 1, 2}: 401, 402, 410, 412, 502, 103, 201,
+	// 301 and more (403 and 503 are not). net/http's server sends them so.
+	if valueByte&0x80 != 0 {
+		return h2HuffmanStatus[string(value)] // 0 when it is not a 3-digit status
+	}
+
+	if valueLen != 3 {
+		return 0
+	}
+	return parseStatusCode(value)
 }
+
+// h2HuffmanStatus maps the HPACK Huffman encoding of every status code
+// 100-599 to the code, so extractStatus decodes a Huffman-coded :status with
+// one map lookup (string(b) in a map index does not allocate).
+var h2HuffmanStatus = func() map[string]int {
+	m := make(map[string]int, 500)
+	for status := 100; status < 600; status++ {
+		m[string(hpack.AppendHuffmanString(nil, strconv.Itoa(status)))] = status
+	}
+	return m
+}()
 
 // newH2Client creates a new zero-alloc HTTP/2 client.
 func newH2Client(host, port, path string, cfg Config) (*h2Client, error) {
@@ -780,13 +812,20 @@ func (hc *h2Conn) readLoop() {
 
 		switch frame.Type {
 		case frameHeaders:
-			status := extractStatus(frame.HeaderBlockFragment())
+			// The status is the final response's :status, whatever ends the
+			// stream: this HEADERS frame, a DATA frame, or trailers. An
+			// interim 1xx response is replaced by the final one; a HEADERS
+			// frame after the final one carries trailers, not a status.
+			st := hc.stream(frame.StreamID)
+			if !st.final {
+				st.status = extractStatus(frame.HeaderBlockFragment())
+				st.final = st.status < 100 || st.status >= 200
+			}
 
 			if frame.StreamEnded() {
-				idx := (frame.StreamID >> 1) % numSlots
-				chPtr := hc.streamSlots[idx].ch.Swap(nil)
+				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
-					*chPtr <- h2Response{status: status, bytesRead: 0}
+					*chPtr <- h2Response{status: st.status, bytesRead: 0}
 				}
 			}
 
@@ -800,10 +839,10 @@ func (hc *h2Conn) readLoop() {
 			}
 
 			if frame.StreamEnded() {
-				idx := (frame.StreamID >> 1) % numSlots
-				chPtr := hc.streamSlots[idx].ch.Swap(nil)
+				st := hc.stream(frame.StreamID)
+				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
-					*chPtr <- h2Response{status: 200, bytesRead: bytesRead}
+					*chPtr <- h2Response{status: st.status, bytesRead: bytesRead}
 				}
 			}
 
@@ -855,6 +894,18 @@ func (hc *h2Conn) readLoop() {
 			}
 		}
 	}
+}
+
+// stream returns the slot of streamID with its response state reset if the
+// slot last held another stream. readLoop only.
+func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
+	st := &hc.streamSlots[(streamID>>1)%uint32(len(hc.streamSlots))]
+	if st.streamID != streamID {
+		st.streamID = streamID
+		st.status = 0
+		st.final = false
+	}
+	return st
 }
 
 // DoRequest sends an HTTP/2 request and waits for the response.
