@@ -1227,6 +1227,12 @@ func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (i
 			hc.streamSem <- struct{}{}
 			return 0, ctx.Err()
 		}
+		// writeLoop has returned, so whatever is still queued for it was
+		// never written: roundTrip's hand-off can win its race with done
+		// after the writer's final drain. Answer those requests too, this
+		// one among them (each is taken off the queue once, so answered
+		// once).
+		hc.answerQueued()
 		select {
 		case resp := <-*chPtr:
 			return hc.finish(chPtr, resp)
