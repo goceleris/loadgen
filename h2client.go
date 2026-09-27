@@ -218,7 +218,9 @@ type h2Conn struct {
 
 	addr string
 	// closed marks a connection that takes no new request: DoRequest
-	// redials the slot instead. Set before done is closed.
+	// redials the slot instead. Set before done is closed, and on its own
+	// when the connection's stream IDs run out (its last streams are still
+	// in flight then): closing, not closed, says the client closed it.
 	closed atomic.Bool
 	// served is set by readLoop once the connection carries a response
 	// frame for one of the run's requests (not the h2c upgrade's own stream
@@ -852,8 +854,22 @@ func (hc *h2Conn) loopExited() {
 // this the bufio.Writer keeps the error and fails every later request on the
 // dead connection at once, a spin of errors that never redials (#89).
 func (hc *h2Conn) writeFailed(err error) {
-	if err != nil && !hc.closed.Load() {
+	if err != nil && !hc.closing() {
 		hc.failConn(fmt.Errorf("connection error: %w", err))
+	}
+}
+
+// closing reports whether closeConn has run: the client closed the
+// connection (Close, reconnectSlot), or failConn is ending it. closed alone
+// does not say so: a connection whose stream IDs ran out is closed to new
+// requests while its last streams are still in flight, and if it then dies,
+// readLoop and writeFailed must fail it like any other.
+func (hc *h2Conn) closing() bool {
+	select {
+	case <-hc.done:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -958,8 +974,8 @@ func (hc *h2Conn) readLoop() {
 	for {
 		frame, err := hc.framer.ReadFrame()
 		if err != nil {
-			if hc.closed.Load() {
-				return // the client closed it (Close, or reconnectSlot replacing it)
+			if hc.closing() {
+				return // the client closed it (Close, or reconnectSlot replacing it), or failConn is ending it
 			}
 			// The server or the network ended the connection without a
 			// GOAWAY: a close, a reset, a timeout. Fail it, so its in-flight
