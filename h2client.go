@@ -216,6 +216,13 @@ type h2Conn struct {
 	loopsDone chan struct{}
 	loopsLeft atomic.Int32
 
+	// queueMu makes taking a request off writeCh and answering it one step
+	// for answerQueued's callers, the writer's last drain and every await on
+	// a closed connection: once an await's own answerQueued returns, any
+	// request someone else took off the queue has been answered, its own
+	// among them, so it can decide that it got no answer.
+	queueMu sync.Mutex
+
 	addr string
 	// closed marks a connection that takes no new request: DoRequest
 	// redials the slot instead. Set before done is closed, and on its own
@@ -834,8 +841,11 @@ func (hc *h2Conn) writeLoop() {
 // answerQueued answers every request still queued for a closed connection's
 // writer. None of them was written, so none reached the server: each goes
 // to the redialed connection (errH2NotSent), as a request still waiting for
-// a stream does, instead of counting as an error.
+// a stream does, instead of counting as an error. Callers take turns
+// (queueMu), so each request is off the queue only once it is answered.
 func (hc *h2Conn) answerQueued() {
+	hc.queueMu.Lock()
+	defer hc.queueMu.Unlock()
 	for {
 		select {
 		case req := <-hc.writeCh:
@@ -1265,7 +1275,8 @@ func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (i
 		// never written: roundTrip's hand-off can win its race with done
 		// after the writer's final drain. Answer those requests too, this
 		// one among them (each is taken off the queue once, so answered
-		// once).
+		// once). Another await may have taken this one: answerQueued waits
+		// for it to answer, so the receive below cannot miss that answer.
 		hc.answerQueued()
 		select {
 		case resp := <-*chPtr:
