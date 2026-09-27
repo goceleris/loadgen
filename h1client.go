@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,11 @@ type h1Client struct {
 	maxResponseSize int64
 	scheme          string
 	tlsConfig       *tls.Config
+
+	// closeAborts counts the done connections reset after the FIN wait
+	// (see closeAfterPeer); shared with every slot, reported as
+	// Result.CloseAborts.
+	closeAborts *atomic.Uint64
 }
 
 // h1Conn is one connection slot with a buffered reader.
@@ -74,6 +80,10 @@ type h1Conn struct {
 	// peerCloseWait is defaultPeerCloseWait; a field so a test can widen
 	// it. Read by the owning worker only.
 	peerCloseWait time.Duration
+
+	// closeAborts is the client's counter of done connections reset after
+	// the FIN wait; incremented by the closeAfterPeer goroutines.
+	closeAborts *atomic.Uint64
 }
 
 // newH1Client creates a new zero-alloc HTTP/1.1 client.
@@ -105,6 +115,7 @@ func newH1Client(host, port, path string, cfg Config) (*h1Client, error) {
 	}
 	numConns := cfg.Workers * connsPerWorker
 
+	closeAborts := new(atomic.Uint64)
 	conns := make([]*h1Conn, numConns)
 	for i := range numConns {
 		conn, err := dialH1(addr, scheme, cfg.DialTimeout, cfg.ReadBufferSize, cfg.WriteBufferSize, tlsCfg)
@@ -124,6 +135,7 @@ func newH1Client(host, port, path string, cfg Config) (*h1Client, error) {
 			scheme:          scheme,
 			tlsConfig:       tlsCfg,
 			peerCloseWait:   defaultPeerCloseWait,
+			closeAborts:     closeAborts,
 		}
 	}
 
@@ -140,6 +152,7 @@ func newH1Client(host, port, path string, cfg Config) (*h1Client, error) {
 		maxResponseSize: cfg.MaxResponseSize,
 		scheme:          scheme,
 		tlsConfig:       tlsCfg,
+		closeAborts:     closeAborts,
 	}, nil
 }
 
@@ -629,7 +642,10 @@ func (hc *h1Conn) finish() {
 //     server doing a bidirectional shutdown waits for it (serverClosed).
 //   - Anything else, normally the bound expiring on a server that keeps
 //     the connection open: the client resets the connection (abortClose),
-//     so neither side keeps a TIME_WAIT. A FIN from the client first would
+//     so neither side keeps a TIME_WAIT, and counts it in closeAborts
+//     (Result.CloseAborts), so a server that ignores Connection: close,
+//     or closes more than the bound after its response, shows in the
+//     Result. A FIN from the client first would
 //     leave a TIME_WAIT on the loadgen host for every request, and at
 //     churn rates those exhaust its ephemeral ports: the run would then
 //     report loadgen's own port ceiling as the server's connect errors.
@@ -642,9 +658,11 @@ func (hc *h1Conn) closeAfterPeer() {
 	hc.conn = nil
 	hc.mu.Unlock()
 	wait := hc.peerCloseWait
+	aborts := hc.closeAborts
 	go func() {
 		_ = conn.SetReadDeadline(time.Now().Add(wait))
 		if !serverClosed(conn) {
+			aborts.Add(1)
 			abortClose(conn)
 			return
 		}

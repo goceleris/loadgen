@@ -403,6 +403,7 @@ empty (`omitempty`).
 | `recvq_high` | bool | True when the receive-queue probe latched (loadgen-side backpressure). *(optional)* |
 | `dial_retries` | uint64 | TCP SYN retries after an RST (listener-replacement / engine-switch window). *(optional)* |
 | `connect_errors` | uint64 | Dial/handshake failures (TCP, TLS, WS/SSE upgrade, H1 reconnect). *(optional)* |
+| `close_aborts` | uint64 | H1 connections that were done (`-close`, or a response with `Connection: close`) and that the client reset because the server's FIN had not come 50 ms after the response: about one per request for a server that ignores `Connection: close`. *(optional)* |
 | `timeseries` | array | 1-second snapshots: `{t, rps, p99_ms, errors, connect_errors}`. *(optional)* |
 | `warmup` | object | Warmup-phase `{requests, errors, connect_errors}`; a zero-request, nonzero-error warmup means the target was never healthy. *(optional)* |
 | `upgrade` | object | h2c-upgrade handshake tally (`-h2c-upgrade`). *(optional)* |

@@ -650,6 +650,10 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	if b.config.Warmup > 0 {
 		b.warmupRec = b.latencies.Load()
 		b.errorsBase = b.errors.Load()
+		// Result.CloseAborts covers the measured window only.
+		if a := h1CloseAborts(b.raw); a != nil {
+			a.Store(0)
+		}
 		b.warmupStats = &WarmupStats{
 			Errors:        b.errorsBase,
 			ConnectErrors: snapshotConnectErrors(),
@@ -1064,6 +1068,20 @@ func (b *Benchmarker) worker(ctx context.Context, workerID int) {
 	}
 }
 
+// h1CloseAborts returns the close-abort counter of c's HTTP/1.1 client (c
+// itself, or a -mix run's h1 sub-client), or nil when c has none.
+func h1CloseAborts(c Client) *atomic.Uint64 {
+	switch c := c.(type) {
+	case *h1Client:
+		return c.closeAborts
+	case *mixClient:
+		if h1c, ok := c.h1.(*h1Client); ok {
+			return h1c.closeAborts
+		}
+	}
+	return nil
+}
+
 func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	rec := b.latencies.Load()
 	reqs, bytesRead := rec.Totals()
@@ -1085,6 +1103,9 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		DialRetries:    snapshotDialRetries(),
 		ConnectErrors:  snapshotConnectErrors(),
 		Warmup:         b.warmupStats,
+	}
+	if a := h1CloseAborts(b.raw); a != nil {
+		res.CloseAborts = a.Load()
 	}
 
 	if hist, err := rec.EncodeHistogram(); err == nil {

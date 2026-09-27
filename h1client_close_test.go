@@ -359,6 +359,10 @@ func TestH1CloseModeServerIgnoringCloseGetsOneConnPerRequest(t *testing.T) {
 		t.Errorf("client reset %d of the %d connections the server kept open; the rest it closed with a FIN, "+
 			"which leaves a TIME_WAIT on the loadgen host for every request", r, n)
 	}
+	// Each reset is counted (Result.CloseAborts) before it is sent.
+	if a := client.closeAborts.Load(); a != n {
+		t.Errorf("closeAborts = %d after %d connections reset by the client, want %d", a, n, n)
+	}
 }
 
 // TestH1KeepAliveAnnouncedCloseIsNotAnError: in keep-alive mode a server
@@ -534,6 +538,11 @@ func TestH1DefaultFINWaitLetsServerCloseFirst(t *testing.T) {
 	if r := srv.clientReset.Load(); r > 1 {
 		t.Errorf("client reset %d of %d connections whose server sent its FIN right behind the response: "+
 			"it did not wait for the server's close", r, n)
+	}
+	// closeAborts counts the resets only, not the connections the server
+	// closed first.
+	if a, r := client.closeAborts.Load(), srv.clientReset.Load(); a != uint64(r) {
+		t.Errorf("closeAborts = %d, but the client reset %d connections", a, r)
 	}
 }
 
