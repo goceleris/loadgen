@@ -688,8 +688,9 @@ func TestH1UnannouncedCloseCountsOnce(t *testing.T) {
 		t.Fatalf("request 1: %v", err)
 	}
 	// Request 2 meets the close. It fails today (it is not retried: see
-	// DoRequest); a safe retry of an idempotent request would let it
-	// succeed. Either way the close costs at most that one request.
+	// DoRequest); a retry of an idempotent request (RFC 9112 §9.3.1,
+	// loadgen#94) would let it succeed. Either way the close costs at most
+	// that one request.
 	if _, err := client.DoRequest(context.Background(), 0); err != nil {
 		t.Logf("request 2 (unannounced close): %v", err)
 	}
