@@ -216,7 +216,8 @@ func TestH1ErrorStatusKeepsConnection(t *testing.T) {
 // write side of the client's own socket (EPIPE on the next write), or the
 // server resets a connection once the request's first byte arrives, while
 // the client is still writing a 16 MB body, more than the socket buffers of
-// either side hold.
+// either side hold. The client keeps testH1Cfg's socket buffers: a 4 KB send
+// buffer made each 16 MB write take about 10 s on Linux.
 func TestH1WriteError(t *testing.T) {
 	bigBody := bytes.Repeat([]byte("x"), 16<<20)
 
@@ -287,7 +288,6 @@ func TestH1WriteError(t *testing.T) {
 		cfg := testH1Cfg(true, 1)
 		cfg.Method = "POST"
 		cfg.Body = bigBody
-		cfg.WriteBufferSize = 4096
 		client, err := newH1Client(srv.host, srv.port, "/", cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -328,7 +328,6 @@ func TestH1WriteError(t *testing.T) {
 		cfg.PoolSize = 1
 		cfg.Method = "POST"
 		cfg.Body = bigBody
-		cfg.WriteBufferSize = 4096
 		client, err := newH1Client(srv.host, srv.port, "/", cfg)
 		if err != nil {
 			t.Fatal(err)
