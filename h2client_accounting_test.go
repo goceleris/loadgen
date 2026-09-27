@@ -61,17 +61,19 @@ type rawH2Server struct {
 	killAfter      time.Duration   // > 0: the server closes each connection (no GOAWAY) this long after accepting it
 	closeAfterData int             // > 0: the server closes a connection (no GOAWAY) once it has read this many DATA bytes on it
 	settings       []http2.Setting // the server's SETTINGS (none: every default)
+	connWindow     uint32          // > 0: grant the client this much more connection send window in the handshake
 	answerUpgrade  bool            // answer the h2c upgrade request on stream 1, as celeris does (see rawH2Handshake)
 	goAwayAtOnce   bool            // send GOAWAY as soon as the client's SETTINGS are acked, before any request
 
-	accepted     atomic.Int64 // connections accepted
-	killed       atomic.Int64 // connections the server ended (rawClose or killAfter)
-	clientClosed atomic.Int64 // connections the client ended first
-	dataSent     atomic.Int64 // DATA frame payload bytes written, padding included
-	windowCredit atomic.Int64 // connection WINDOW_UPDATE increments received, minus each handshake's own
-	answeredLate atomic.Int64 // requests answered on a connection other than the first one
-	clientResets atomic.Int64 // RST_STREAM frames received from the client
-	clientCancel atomic.Int64 // of which with error code CANCEL
+	accepted       atomic.Int64 // connections accepted
+	killed         atomic.Int64 // connections the server ended (rawClose or killAfter)
+	clientClosed   atomic.Int64 // connections the client ended first
+	dataSent       atomic.Int64 // DATA frame payload bytes written, padding included
+	windowCredit   atomic.Int64 // connection WINDOW_UPDATE increments received, minus each handshake's own
+	answeredLate   atomic.Int64 // requests answered on a connection other than the first one
+	clientResets   atomic.Int64 // RST_STREAM frames received from the client
+	clientCancel   atomic.Int64 // of which with error code CANCEL
+	dataAfterReset atomic.Int64 // DATA payload bytes received on streams the server had reset (rawH2Conn.reset)
 
 	mu    sync.Mutex
 	conns []net.Conn
@@ -89,6 +91,7 @@ type rawH2Conn struct {
 	requests int   // request streams seen on this connection, the current one included
 	held     int   // streams a handler started answering and left open
 	dataRecv int   // DATA payload bytes read on this connection
+	resetIDs map[uint32]bool
 }
 
 // rawH2Opts are the rawH2Server options of the same names.
@@ -96,6 +99,7 @@ type rawH2Opts struct {
 	killAfter      time.Duration
 	closeAfterData int
 	settings       []http2.Setting
+	connWindow     uint32
 	answerUpgrade  bool
 	goAwayAtOnce   bool
 }
@@ -111,7 +115,7 @@ func startRawH2With(t *testing.T, opts rawH2Opts, h rawH2Handler) *rawH2Server {
 		t.Fatal(err)
 	}
 	s := &rawH2Server{ln: ln, handler: h, killAfter: opts.killAfter, closeAfterData: opts.closeAfterData, settings: opts.settings,
-		answerUpgrade: opts.answerUpgrade, goAwayAtOnce: opts.goAwayAtOnce}
+		connWindow: opts.connWindow, answerUpgrade: opts.answerUpgrade, goAwayAtOnce: opts.goAwayAtOnce}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -170,7 +174,10 @@ func (s *rawH2Server) serve(nc net.Conn) {
 		_ = nc.Close()
 		return
 	}
-	c := &rawH2Conn{srv: s, nc: nc, fr: fr, index: index}
+	if s.connWindow > 0 {
+		_ = fr.WriteWindowUpdate(0, s.connWindow)
+	}
+	c := &rawH2Conn{srv: s, nc: nc, fr: fr, index: index, resetIDs: map[uint32]bool{}}
 	c.enc = hpack.NewEncoder(&c.hbuf)
 	c.enc.SetMaxDynamicTableSizeLimit(0) // the client advertises SETTINGS_HEADER_TABLE_SIZE=0
 	dec := hpack.NewDecoder(4096, nil)
@@ -212,6 +219,9 @@ func (s *rawH2Server) serve(nc net.Conn) {
 			}
 		case *http2.DataFrame:
 			c.dataRecv += len(f.Data())
+			if c.resetIDs[f.StreamID] {
+				s.dataAfterReset.Add(int64(len(f.Data())))
+			}
 			if s.closeAfterData > 0 && c.dataRecv >= s.closeAfterData {
 				serverEnd()
 				return
@@ -315,8 +325,10 @@ func (c *rawH2Conn) tornData(streamID uint32, declared, sent int) {
 	_, _ = c.nc.Write(append(hdr, make([]byte, sent)...))
 }
 
-// reset ends a stream with RST_STREAM(code).
+// reset ends a stream with RST_STREAM(code). DATA the client sends on it
+// afterwards is counted in dataAfterReset.
 func (c *rawH2Conn) reset(streamID uint32, code http2.ErrCode) {
+	c.resetIDs[streamID] = true
 	_ = c.fr.WriteRSTStream(streamID, code)
 }
 
@@ -1421,56 +1433,67 @@ func TestH2RedialBacksOffOnlyWhenTheServerLooksDown(t *testing.T) {
 		}
 	})
 	t.Run("grows until a connection serves", func(t *testing.T) {
-		cl := newClient(t)
+		// Every connection is dialed by DoRequest (reconnectSlot), as in a
+		// run: while down, the server completes each handshake and drops the
+		// connection at its first request, unanswered; up, it answers.
+		var up atomic.Bool
+		flaky := startRawH2(t, func(c *rawH2Conn, sid uint32, path string) rawH2Action {
+			if up.Load() {
+				return respondOK(c, sid, path)
+			}
+			return rawClose
+		})
+		fh, fp := flaky.hostPort()
+		cl, err := newH2Client(fh, fp, "/", testH2Cfg("GET", nil, nil, 1, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cl.Close)
+		dials := countDials(cl, 0)
 		slot := cl.conns[0]
 		ctx := ctxFor(t, 5*time.Second)
 		for round := 1; round <= 3; round++ {
-			if round > 1 {
-				hc, err := cl.redial()
-				if err != nil {
-					t.Fatal(err)
-				}
-				slot.cur.Store(hc)
-			}
-			endConn(slot, "the server dropped the connection before it answered anything")
+			// The request on the slot's connection (from round 2 on, one
+			// DoRequest dialed after the round before): the server drops it.
 			if _, err := cl.DoRequest(ctx, 0); err == nil {
-				t.Fatalf("round %d: the request that found a connection which never answered succeeded (backoff.next=%v)", round, slot.backoff.next)
+				t.Fatalf("round %d: the request the server dropped unanswered succeeded", round)
+			}
+			// The next request finds a connection that never answered.
+			if _, err := cl.DoRequest(ctx, 0); !errors.Is(err, errH2NeverServed) {
+				t.Fatalf("round %d: the request that found a connection which never answered got %v, want errH2NeverServed", round, err)
 			}
 			want := min(reconnectBackoffMin<<round, reconnectBackoffMax)
-			t.Logf("round %d: backoff.next=%v", round, slot.backoff.next)
+			t.Logf("round %d: backoff.next=%v dials=%d", round, slot.backoff.next, dials.Load())
 			if slot.backoff.next != want {
 				t.Errorf("round %d: backoff.next=%v, want %v: while every connection ends before it answers, the pace must keep doubling, not restart at every dial that succeeds", round, slot.backoff.next, want)
 			}
 		}
-		// A connection that serves shows the server is up again: the next
-		// redial is at once, and the pace starts over.
-		hc, err := cl.redial()
-		if err != nil {
-			t.Fatal(err)
+		if n := dials.Load(); n != 2 {
+			t.Errorf("%d dials in 3 rounds, want 2: rounds 2 and 3 each dial once, through DoRequest", n)
 		}
-		slot.cur.Store(hc)
+		// The server is up again. The next request dials at once and is
+		// answered: that connection has served. When it ends, the request
+		// that finds it redials at once (the server drops that one again),
+		// and the pace starts over: the next failure sleeps 5-10 ms.
+		up.Store(true)
 		if _, err := cl.DoRequest(ctx, 0); err != nil {
-			t.Fatal(err)
+			t.Fatalf("the request after the server came back failed: %v", err)
 		}
+		up.Store(false)
 		slot.backoff.next = longBackoff
 		endConn(slot, "the server ended the connection")
-		if _, err := cl.DoRequest(ctx, 0); err != nil {
-			t.Fatalf("the redial after a connection that served failed: %v", err)
-		}
-		fresh, err := cl.redial()
-		if err != nil {
-			t.Fatal(err)
-		}
-		slot.cur.Swap(fresh).closeConn()
-		endConn(slot, "the server dropped the connection before it answered anything")
 		start := time.Now()
-		_, err = cl.DoRequest(ctx, 0)
-		t.Logf("first request to find a dropped connection after one served: %v, err=%v", time.Since(start), err)
-		if err == nil {
-			t.Fatal("the request that found a connection which never answered succeeded")
+		if _, err := cl.DoRequest(ctx, 0); err == nil {
+			t.Fatal("the request the server dropped unanswered succeeded")
 		}
-		if d := time.Since(start); d > time.Second {
-			t.Errorf("the first backoff after a connection served took %v: the pace was not reset (want 5-10 ms)", d)
+		_, err = cl.DoRequest(ctx, 0)
+		t.Logf("first request to find a dropped connection after one served: %v, err=%v, backoff.next=%v", time.Since(start), err, slot.backoff.next)
+		if !errors.Is(err, errH2NeverServed) {
+			t.Fatalf("got %v, want errH2NeverServed", err)
+		}
+		if d := time.Since(start); d > time.Second || slot.backoff.next != reconnectBackoffMin<<1 {
+			t.Errorf("the first backoff after a connection served took %v and left backoff.next=%v: the pace was not reset (want 5-10 ms and %v)",
+				d, slot.backoff.next, reconnectBackoffMin<<1)
 		}
 	})
 	t.Run("h2c: only the upgrade's own stream answered", func(t *testing.T) {
@@ -1841,7 +1864,10 @@ func TestH2CUpgradeServerThatAnswersOnlyTheUpgradeIsPaced(t *testing.T) {
 // as errors and a handful of connections. On e37777e the pace restarted at
 // every dial that succeeded (44 and 46 connections in two runs), and whether
 // a request was an error or retried silently depended on whether it was
-// written before the GOAWAY was read (43 and 24 errors).
+// written before the GOAWAY was read (43 and 24 errors). The server never
+// answers a request, so a client that ignored the GOAWAY would wait on its
+// first connection for the whole run: 1 connection and no error, which the
+// floor below fails (fixed code: 10 connections and 10-16 errors in 400 ms).
 func TestH2ServerThatDropsEveryConnectionShowsErrors(t *testing.T) {
 	srv := startRawH2With(t, rawH2Opts{goAwayAtOnce: true}, func(*rawH2Conn, uint32, string) rawH2Action {
 		return rawKeep
@@ -1850,6 +1876,10 @@ func TestH2ServerThatDropsEveryConnectionShowsErrors(t *testing.T) {
 		HTTP2: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: 4}})
 	accepted := srv.accepted.Load()
 	t.Logf("connections=%d requests=%d errors=%d connect_errors=%d", accepted, res.Requests, res.Errors, res.ConnectErrors)
+	if accepted < 3 || res.Errors == 0 {
+		t.Errorf("connections=%d errors=%d, want at least 3 and 1: the server drops every connection at once, so the client must keep redialing it and count the outage, not wait on one connection (#89)",
+			accepted, res.Errors)
+	}
 	if res.Errors < accepted-2 {
 		t.Errorf("errors=%d over %d connections that each ended before answering anything: the outage is not counted", res.Errors, accepted)
 	}
@@ -1991,28 +2021,268 @@ func TestH2ResponseWithOnlyAnInterimStatusIsNotASuccess(t *testing.T) {
 // priority fields is a frame size error on a frame that carries a field
 // block, so a connection error (RFC 9113 §4.2, §6.2), as a Pad Length that
 // does not fit is since round 1. On e37777e it was read as an empty block:
-// the stream failed with errH2NoStatus and the connection went on.
+// the stream failed with errH2NoStatus and the connection went on. The
+// boundary is exact: 4 bytes are too short, while 5 bytes are the priority
+// fields and an empty field block, which is only a response without a
+// :status (a stream error), and 6 carry :status 200.
 func TestH2HeadersTooShortForTheirPriorityFieldsEndTheConnection(t *testing.T) {
-	srv := startRawH2(t, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
-		// PRIORITY flagged, 1 byte of payload: :status 200 where the 5 priority bytes should be.
-		_ = c.fr.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream|http2.FlagHeadersPriority, sid, []byte{0x88})
+	priority := []byte{0, 0, 0, 0, 15} // stream dependency 0, weight 16
+	for _, tc := range []struct {
+		name      string
+		payload   []byte
+		connError bool // a connection error; else the connection goes on
+		success   bool
+	}{
+		{"1 byte: :status 200 where the priority fields should be", []byte{0x88}, true, false},
+		{"4 bytes", priority[:4], true, false},
+		{"5 bytes: the priority fields, an empty field block", priority, false, false},
+		{"6 bytes: the priority fields, :status 200", append(append([]byte{}, priority...), 0x88), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startRawH2(t, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+				_ = c.fr.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream|http2.FlagHeadersPriority, sid, tc.payload)
+				return rawKeep
+			})
+			host, port := srv.hostPort()
+			cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cl.Close()
+			hc := cl.conns[0].cur.Load()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err = cl.DoRequest(ctx, 0)
+			t.Logf("%d-byte payload: err=%v connection closed=%t", len(tc.payload), err, hc.closed.Load())
+			if tc.success != (err == nil) {
+				t.Errorf("err=%v, want a success=%t", err, tc.success)
+			}
+			if hc.closed.Load() != tc.connError {
+				t.Errorf("connection closed=%t after a HEADERS frame flagged PRIORITY with a %d-byte payload (err=%v), want %t: only fewer than 5 bytes are a connection error",
+					hc.closed.Load(), len(tc.payload), err, tc.connError)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review of the fixes, round 3 (at 147edb4)
+
+// TestH2BodyStopsAtTheServersReset: once the server resets a stream, the
+// client sends no more frames on it (RFC 9113 §6.4, §5.1 "closed"), however
+// much send window the body still has. The server grants 128 MiB of window,
+// resets a 32 MiB upload at its HEADERS and reads nothing for 300 ms, so the
+// client's writer can be ahead of the reset by no more than the socket
+// buffers. The second request's HEADERS reach the server after every DATA
+// frame the client wrote for the first stream: the server counts those at
+// that moment. On 147edb4 the writer checked for the reset only once the
+// window ran out, so it sent the whole body into a stream that no longer
+// existed (a Go server answers each such frame with RST_STREAM(STREAM_CLOSED)).
+func TestH2BodyStopsAtTheServersReset(t *testing.T) {
+	const body = 32 << 20
+	var afterFirst atomic.Int64 // DATA bytes of the first stream the server read before the second stream's HEADERS
+	srv := startRawH2With(t, rawH2Opts{
+		settings:   []http2.Setting{{ID: http2.SettingInitialWindowSize, Val: 128 << 20}},
+		connWindow: 128 << 20,
+	}, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+		if c.requests == 2 {
+			afterFirst.Store(c.srv.dataAfterReset.Load())
+		}
+		c.reset(sid, http2.ErrCodeRefusedStream)
+		if c.requests == 1 {
+			time.Sleep(300 * time.Millisecond) // let the client read the reset while its writer is still in the body
+		}
 		return rawKeep
 	})
 	host, port := srv.hostPort()
-	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 1))
+	cl, err := newH2Client(host, port, "/upload", testH2Cfg("POST", nil, make([]byte, body), 1, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for i := range 2 {
+		var re *HTTP2ResetError
+		if _, err := cl.DoRequest(ctx, 0); !errors.As(err, &re) {
+			t.Fatalf("request %d: got %v, want the server's RST_STREAM(REFUSED_STREAM)", i+1, err)
+		}
+	}
+	sent := afterFirst.Load()
+	t.Logf("DATA bytes the client sent on the first stream after the server reset it: %d of the %d-byte body; client RST_STREAM=%d connections=%d",
+		sent, body, srv.clientResets.Load(), srv.accepted.Load())
+	if sent >= body/2 {
+		t.Errorf("the client sent %d of the body's %d bytes on a stream the server had reset: after RST_STREAM it must send no more frames on it (RFC 9113 §6.4)", sent, body)
+	}
+	if n := srv.clientResets.Load(); n != 0 {
+		t.Errorf("the client sent %d RST_STREAM: never one for a stream the server reset (RFC 9113 §5.4.2)", n)
+	}
+	if n := srv.accepted.Load(); n != 1 {
+		t.Errorf("connections=%d, want 1: a stream the server reset is not a connection error", n)
+	}
+}
+
+// TestH2ConnectionOutOfStreamIDsIsFailedWhenItDies: a connection whose stream
+// IDs have run out takes no new request (closed), but its last streams are
+// still in flight. If the server then closes it, or a write to it fails, the
+// connection has died: its streams must fail and done must close, as on any
+// other connection. No request comes to redial it here (the requests are
+// handed to the writer directly), so nothing else closes it. On 147edb4
+// readLoop and writeFailed took closed for the client's own close and
+// returned without failing it: the stream in flight waited for the rest of
+// the run.
+func TestH2ConnectionOutOfStreamIDsIsFailedWhenItDies(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failWrites bool // a write fails; else the server closes the connection
+	}{
+		{"the server closes it", false},
+		{"a write to it fails", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.failWrites {
+				dial := dialTimeoutFunc
+				t.Cleanup(func() { dialTimeoutFunc = dial })
+				dialTimeoutFunc = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+					c, err := dial(network, addr, timeout)
+					if err != nil {
+						return nil, err
+					}
+					return &failWritesConn{Conn: c, okWrites: 4}, nil // the handshake's 3 writes and the last stream's HEADERS
+				}
+			}
+			held := make(chan *rawH2Conn, 1)
+			srv := startRawH2(t, func(c *rawH2Conn, _ uint32, _ string) rawH2Action {
+				held <- c // never answer
+				return rawKeep
+			})
+			host, port := srv.hostPort()
+			cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 4))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(cl.Close)
+			hc := cl.conns[0].cur.Load()
+			hc.nextStreamID.Store(0x7FFFFFFF) // the last stream ID a connection may use
+			last := make(chan h2Response, 1)
+			hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: cl.headerBlock, respCh: &last}
+			var sc *rawH2Conn
+			select {
+			case sc = <-held:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the stream with the last ID never reached the server")
+			}
+			next := make(chan h2Response, 1)
+			hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: cl.headerBlock, respCh: &next}
+			select {
+			case r := <-next:
+				if r.err != errH2NotSent {
+					t.Fatalf("the request after the last stream ID was answered %+v, want errH2NotSent", r)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the request after the last stream ID was never answered")
+			}
+			if !hc.closed.Load() {
+				t.Fatal("a connection out of stream IDs still takes new requests")
+			}
+			if tc.failWrites {
+				_ = sc.fr.WritePing(false, [8]byte{1}) // the client's PING ACK is its next write, which fails
+			} else {
+				_ = sc.nc.Close()
+			}
+			select {
+			case r := <-last:
+				t.Logf("the stream in flight was answered: %v", r.err)
+				if r.err == nil {
+					t.Errorf("the stream in flight on a connection that died was a success: %+v", r)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("the stream in flight was never answered after its connection died: a connection out of stream IDs was taken for one the client closed, and nothing failed it")
+			}
+			select {
+			case <-hc.done:
+			case <-time.After(time.Second):
+				t.Error("done never closed on a connection that died")
+			}
+		})
+	}
+}
+
+// heldReadConn holds each read, once armed, after the bytes are read from
+// the socket and before the reader gets them, until release is closed: the
+// reader then parses a response that had arrived before the connection
+// ended.
+type heldReadConn struct {
+	net.Conn
+	armed   atomic.Bool
+	holding chan struct{} // closed when an armed read holds bytes
+	once    sync.Once
+	release chan struct{}
+}
+
+func (c *heldReadConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.armed.Load() {
+		c.once.Do(func() { close(c.holding) })
+		<-c.release
+	}
+	return n, err
+}
+
+// TestH2RedialTakesTheResponseTheConnectionHadReceived: the writer ends a
+// connection (a failed write: failConn) just after the server's first
+// response reached the client, and before readLoop has parsed it. That
+// connection has served, so the request that finds it gone redials at once.
+// reconnectSlot must read served only once readLoop has returned, having
+// parsed what it had read. On 147edb4 it read served at once: the connection
+// looked as if it had never served, so the request failed (errH2NeverServed)
+// and slept the backoff, and nothing was dialed.
+func TestH2RedialTakesTheResponseTheConnectionHadReceived(t *testing.T) {
+	dial := dialTimeoutFunc
+	t.Cleanup(func() { dialTimeoutFunc = dial })
+	gate := &heldReadConn{holding: make(chan struct{}), release: make(chan struct{})}
+	var dialed atomic.Int64
+	dialTimeoutFunc = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		c, err := dial(network, addr, timeout)
+		if err != nil || dialed.Add(1) > 1 {
+			return c, err
+		}
+		gate.Conn = c
+		return gate, nil
+	}
+	srv := startRawH2(t, respondOK)
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
 	hc := cl.conns[0].cur.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	gate.armed.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err = cl.DoRequest(ctx, 0)
-	t.Logf("err=%v connection closed=%t", err, hc.closed.Load())
-	if err == nil {
-		t.Fatal("a HEADERS frame too short for its priority fields was a success")
+	first := make(chan error, 1)
+	go func() {
+		_, err := cl.DoRequest(ctx, 0)
+		first <- err
+	}()
+	select {
+	case <-gate.holding:
+	case <-time.After(3 * time.Second):
+		close(gate.release)
+		t.Fatal("the server's first response never reached the client")
 	}
-	if !hc.closed.Load() {
-		t.Errorf("the connection goes on after a HEADERS frame too short for its priority fields (err=%v): it is a connection error", err)
+	hc.failConn(errors.New("test: a write to the connection failed")) // as writeFailed does
+	t.Logf("the request whose response was still unparsed: %v", <-first)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(gate.release)
+	}()
+	dials := countDials(cl, 0)
+	start := time.Now()
+	_, err = cl.DoRequest(ctx, 0)
+	t.Logf("the request that found the connection gone: %v, err=%v, dials=%d, served=%t", time.Since(start), err, dials.Load(), hc.served.Load())
+	if err != nil || dials.Load() != 1 {
+		t.Errorf("err=%v dials=%d, want a success after 1 dial: the connection had received the answer to a request, so it served, and the request that finds it gone redials at once", err, dials.Load())
 	}
 }
