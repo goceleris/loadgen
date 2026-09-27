@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // scriptedReply is what scriptedH1Server does on a connection.
@@ -114,8 +115,18 @@ const scriptedOK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
 // header lines. MaxResponseSize bounds a 4xx/5xx body too: the client does
 // not read an error body over the limit (a huge or endless one would hold
 // the worker), so that connection is closed as well.
+//
+// The held-open cases declare a body of 1 GiB (Content-Length) or a 40 MB
+// chunk, send 4 bytes of it and keep the connection open, so a client that
+// reads an over-limit body before it gives up blocks until the test's bound
+// on request 1. The complete-body cases above them cannot tell: their
+// 100-byte body is read at once either way.
 func TestH1FaultDropsConnection(t *testing.T) {
 	over := "\r\n" + strings.Repeat("x", 98) // 100 bytes; starts with an empty "line"
+	const (
+		heldCL      = "Content-Length: 1073741824\r\n\r\nxxxx"            // 1 GiB declared, 4 bytes sent
+		heldChunked = "Transfer-Encoding: chunked\r\n\r\n2625a00\r\nxxxx" // a 40,000,000-byte chunk, 4 bytes sent
+	)
 	for _, tc := range []struct {
 		name    string
 		first   scriptedReply
@@ -130,6 +141,10 @@ func TestH1FaultDropsConnection(t *testing.T) {
 		{"MaxResponseSize/error-content-length", scriptedReply{resp: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\n" + over}, 16, "status 500"},
 		{"MaxResponseSize/error-chunked", scriptedReply{resp: "HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n" +
 			strings.Repeat("x", 100) + "\r\n0\r\n\r\n"}, 16, "status 503"},
+		{"MaxResponseSize/content-length/held-open", scriptedReply{resp: "HTTP/1.1 200 OK\r\n" + heldCL}, 16, "exceeds MaxResponseSize"},
+		{"MaxResponseSize/chunked/held-open", scriptedReply{resp: "HTTP/1.1 200 OK\r\n" + heldChunked}, 16, "exceeds MaxResponseSize"},
+		{"MaxResponseSize/error-content-length/held-open", scriptedReply{resp: "HTTP/1.1 500 Internal Server Error\r\n" + heldCL}, 16, "status 500"},
+		{"MaxResponseSize/error-chunked/held-open", scriptedReply{resp: "HTTP/1.1 503 Service Unavailable\r\n" + heldChunked}, 16, "status 503"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := startScriptedH1Server(t, func(conn, req int) scriptedReply {
@@ -146,14 +161,27 @@ func TestH1FaultDropsConnection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer client.Close()
+			defer client.Close() // also ends a request 1 still blocked in a read
 
-			if _, err := client.DoRequest(context.Background(), 0); err == nil {
-				t.Fatal("request 1: no error")
-			} else if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("request 1: %v, want an error containing %q", err, tc.wantErr)
-			} else {
-				t.Logf("request 1: %v", err)
+			// Request 1 runs under a bound: a client that reads the
+			// held-open body waits for bytes that never come.
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				_, err := client.DoRequest(context.Background(), 0)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("request 1: no error")
+				} else if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("request 1: %v, want an error containing %q", err, tc.wantErr)
+				} else {
+					t.Logf("request 1 (%v): %v", time.Since(start), err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("request 1 still reading after 5s: the client reads a body over MaxResponseSize (%d bytes) instead of giving up at the limit", tc.maxResp)
 			}
 			for i := 2; i <= 3; i++ {
 				if _, err := client.DoRequest(context.Background(), 0); err != nil {
