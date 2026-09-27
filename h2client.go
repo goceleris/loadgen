@@ -157,10 +157,11 @@ type h2Conn struct {
 	writeCh chan h2WriteReq
 
 	// Stream management — lock-free fixed-size slot array.
-	// Index = (streamID >> 1) % len(streamSlots). The semaphore limits
-	// concurrent streams, and stream IDs are assigned sequentially by
-	// writeLoop, so slots cycle predictably with no collisions.
-	// Sized at 2x effectiveStreams for headroom against wrap-around.
+	// Index = (streamID >> 1) % len(streamSlots), sized at 2x
+	// effectiveStreams. The semaphore limits concurrent streams, but a slow
+	// or abandoned stream can still hold its slot when the IDs come round
+	// to it again, so writeLoop skips an ID whose slot is held: no two
+	// pending streams share a slot.
 	nextStreamID atomic.Uint32
 	streamSlots  []h2StreamSlot
 
@@ -819,7 +820,23 @@ func (hc *h2Conn) flushWindowUpdate() {
 func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 	switch req.kind {
 	case h2WriteHeaders:
+		// Take the next stream ID whose slot is free. A slot still holds the
+		// channel of a stream that 2*MaxStreams-1 later streams have outlived
+		// (a slow response, or a request its worker abandoned); reusing it
+		// would hand that stream's response to this request and leave its
+		// worker waiting for the rest of the run. IDs may skip: a new
+		// stream's ID need only exceed every earlier one (RFC 9113 §5.1.1).
+		// At most MaxStreams slots are held by streams with a token, so a
+		// free slot comes within MaxStreams+1 IDs; the bound keeps a slot
+		// array held throughout (abandoned streams) from looping.
+		numSlots := uint32(len(hc.streamSlots))
 		streamID := hc.nextStreamID.Add(2) - 2
+		for range numSlots {
+			if hc.streamSlots[(streamID>>1)%numSlots].ch.Load() == nil {
+				break
+			}
+			streamID = hc.nextStreamID.Add(2) - 2
+		}
 		if streamID > 0x7FFFFFFF {
 			// The connection's stream IDs are used up, which a connection
 			// that lives as long as the server keeps it (#88) reaches after
@@ -835,7 +852,7 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 			return
 		}
 
-		slotIdx := (streamID >> 1) % uint32(len(hc.streamSlots))
+		slotIdx := (streamID >> 1) % numSlots
 		hc.streamSlots[slotIdx].ch.Store(req.respCh)
 
 		err := hc.framer.WriteHeaders(streamID, req.block, !req.hasBody)
