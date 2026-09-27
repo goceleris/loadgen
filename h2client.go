@@ -514,6 +514,13 @@ func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) (*h2Conn
 		case <-old.loopsDone:
 		case <-ctx.Done():
 		}
+		// Checked after the wait, not in its ctx case only: the run may have
+		// ended with the loops already returned, and select then takes
+		// either case.
+		if ctx.Err() != nil {
+			slot.mu.Unlock()
+			return nil, ctx.Err()
+		}
 		if old.served.Load() {
 			slot.backoff.reset() // the server was up: redial at once, and the pace starts over
 		} else {
