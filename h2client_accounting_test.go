@@ -2286,3 +2286,50 @@ func TestH2RedialTakesTheResponseTheConnectionHadReceived(t *testing.T) {
 		t.Errorf("err=%v dials=%d, want a success after 1 dial: the connection had received the answer to a request, so it served, and the request that finds it gone redials at once", err, dials.Load())
 	}
 }
+
+// TestH2AwaitAnswersEachQueuedRequestOnce: requests still queued for a
+// connection whose writer has returned are answered by whichever await runs
+// answerQueued first; several awaits on one dead connection drain the queue
+// together. An await that finds the queue empty and its own channel empty
+// must not decide that nobody answered it while another await has taken its
+// request off the queue and not yet answered it: that request never reached
+// the server, so it is errH2NotSent (retried), not "connection closing" (an
+// error). 8 awaits per dead connection, 20000 connections. On
+// 147edb4 a probe of this shape counted 913 of 160,000 such requests
+// answered as errors under -race, and 99-104 without.
+func TestH2AwaitAnswersEachQueuedRequestOnce(t *testing.T) {
+	const trials, waiters = 20000, 8
+	var miscounted, total int64
+	for range trials {
+		hc := &h2Conn{done: make(chan struct{}), loopsDone: make(chan struct{}), streamSem: make(chan struct{}, waiters),
+			writeCh: make(chan h2WriteReq, waiters)}
+		close(hc.done)
+		close(hc.loopsDone)
+		chans := make([]chan h2Response, waiters)
+		for i := range chans {
+			chans[i] = make(chan h2Response, 1)
+			hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: []byte{0x82}, respCh: &chans[i]}
+		}
+		var wg sync.WaitGroup
+		var bad atomic.Int64
+		start := make(chan struct{})
+		for i := range chans {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if _, err := hc.await(context.Background(), &chans[i], 0); err != errH2NotSent {
+					bad.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		miscounted += bad.Load()
+		total += waiters
+	}
+	t.Logf("requests never written, answered as errors: %d of %d", miscounted, total)
+	if miscounted != 0 {
+		t.Errorf("%d of %d requests that were never written were answered \"connection closing\": an await gave up while another await held its request, taken off the queue and not yet answered", miscounted, total)
+	}
+}
