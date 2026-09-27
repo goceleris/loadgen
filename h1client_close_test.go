@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -830,6 +831,57 @@ func TestBenchmarkerCloseModeCountsNoErrors(t *testing.T) {
 					h, res.Requests, d, workers)
 			}
 		})
+	}
+}
+
+// TestH1CustomConnectionHeaderIsDropped: the client writes the Connection
+// header from its mode, and decides reuse from that mode (nextAfter), so a
+// custom Connection header must be dropped in any letter case. A
+// "connection: close" key (the CLI's -H keeps the case it is given) used to
+// go out next to "Connection: keep-alive": a server that honours it closes
+// without echoing the header, and the client, still in keep-alive mode,
+// writes the next request into the closed connection, which is loadgen#87's
+// one EOF error per request again. The header names are case-insensitive
+// (RFC 9110 §5.1).
+func TestH1CustomConnectionHeaderIsDropped(t *testing.T) {
+	for _, tc := range []struct {
+		key       string
+		keepAlive bool
+	}{
+		{"Connection", true},
+		{"connection", true},
+		{"CONNECTION", true},
+		{"cOnNeCtIoN", true},
+		{"connection", false},
+		{"CONNECTION", false},
+	} {
+		custom, want := "close", "keep-alive"
+		if !tc.keepAlive {
+			custom, want = "keep-alive", "close"
+		}
+		req := string(buildH1Request("GET", "/", "127.0.0.1", "80",
+			map[string]string{tc.key: custom, "X-Probe": "1"}, nil, tc.keepAlive))
+		var got []string
+		probe := false
+		for _, line := range strings.Split(req, "\r\n") {
+			name, value, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(name, "Connection") {
+				got = append(got, strings.TrimSpace(value))
+			}
+			if name == "X-Probe" {
+				probe = true
+			}
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("keepAlive=%v, custom header %q: %q: request carries Connection %q, want exactly [%q]",
+				tc.keepAlive, tc.key, custom, got, want)
+		}
+		if !probe {
+			t.Errorf("keepAlive=%v, custom header %q: the other custom header (X-Probe) was dropped too", tc.keepAlive, tc.key)
+		}
 	}
 }
 
