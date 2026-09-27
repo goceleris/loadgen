@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -166,9 +167,11 @@ func buildH1Request(method, path, host, port string, headers map[string]string, 
 		buf = append(buf, "Connection: close\r\n"...)
 	}
 
-	// Custom headers (skip Connection if present — we already set it above)
+	// Custom headers. A Connection header, in any letter case (RFC 9110
+	// §5.1), is skipped: the one above follows the client's mode, and the
+	// mode decides whether the connection is reused (nextAfter).
 	for k, v := range headers {
-		if k == "Connection" {
+		if strings.EqualFold(k, "Connection") {
 			continue
 		}
 		buf = append(buf, k...)

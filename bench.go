@@ -48,7 +48,8 @@ type Config struct {
 
 	// Headers are custom HTTP headers added to every request.
 	// The Connection header is managed automatically based on
-	// DisableKeepAlive and should not be set here. For HTTP/2,
+	// DisableKeepAlive and should not be set here: the HTTP/1.1 client
+	// drops a Connection header given here, in any letter case. For HTTP/2,
 	// hop-by-hop headers (Connection, Keep-Alive, etc.) are
 	// automatically stripped per RFC 9113.
 	Headers map[string]string
