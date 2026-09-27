@@ -218,8 +218,9 @@ type h2Conn struct {
 	closed atomic.Bool
 	// served is set by readLoop once the connection carries a response
 	// frame for one of the run's requests (not the h2c upgrade's own stream
-	// 1). reconnectSlot backs off before it replaces a connection that never
-	// did: the server is down or drops every connection.
+	// 1). A connection that ended without one shows the server down or
+	// dropping every connection: reconnectSlot fails the request that finds
+	// it, after the slot's backoff.
 	served atomic.Bool
 }
 
@@ -465,48 +466,57 @@ func newH2ClientWithDialer(host, port, path string, cfg Config, upgrade bool) (*
 	}, nil
 }
 
-// reconnectSlot re-establishes a dead slot's connection, single-flighted under
-// the slot lock and, while the server looks down, paced by the slot's
-// backoff. Returns the live conn, or nil if the redial failed (caller
-// surfaces a connect error) or ctx ended. A concurrent caller that finds the
-// slot already healed returns immediately.
-func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) *h2Conn {
+// reconnectSlot replaces a slot's dead connection, single-flighted under the
+// slot lock: a caller that finds the slot already healed takes the new
+// connection. When the server looks down, it fails the request instead, as
+// h1client fails a request whose redial fails: the dial failed (a connect
+// error), or the connection being replaced ended before it answered a single
+// request (errH2NeverServed: the server completes handshakes and drops them,
+// and nothing is dialed for this request). That request then sleeps the
+// slot's backoff after it releases the lock, so the sleep paces the server,
+// lands in no recorded latency (a failed request records none) and holds up
+// none of the slot's other workers; the next request dials at once. The
+// backoff doubles while the server keeps looking down and starts over once a
+// connection has served. After the run's context ends it dials nothing.
+func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) (*h2Conn, error) {
 	slot.mu.Lock()
-	defer slot.mu.Unlock()
-
 	old := slot.cur.Load()
 	if old != nil && !old.closed.Load() {
-		return old // another worker already re-dialed this slot
-	}
-	if old != nil {
-		old.closeConn() // release fds/goroutines of the dead conn
-	}
-
-	// Back off only when the server looks down, as h1client does: the last
-	// redial failed (the slot is empty), or the connection ended before it
-	// carried a single response, so a server that accepts and drops every
-	// connection cannot be hot-redialled. A connection that served and then
-	// ended (the server closed it or sent GOAWAY, or its stream IDs ran out)
-	// is redialed at once: the sleep would be charged to the latency of the
-	// request that redials, where h1client sleeps only after a failed redial,
-	// inside a request it counts as an error.
-	if old == nil || !old.served.Load() {
-		if !slot.backoff.sleep(ctx, nil) {
-			return nil // ctx cancelled mid-backoff
-		}
+		slot.mu.Unlock()
+		return old, nil // another worker already re-dialed this slot
 	}
 	if ctx.Err() != nil {
-		return nil // the run is over (sleep may report its timer although ctx is done too)
+		slot.mu.Unlock()
+		return nil, ctx.Err() // Close, which runs after the cancel, would never close a connection dialed now
 	}
-	hc, err := c.redial()
-	if err != nil {
+
+	var err error
+	if old != nil {
+		old.closeConn() // release fds/goroutines of the dead conn
+		if old.served.Load() {
+			slot.backoff.reset() // the server was up: redial at once, and the pace starts over
+		} else {
+			err = errH2NeverServed
+		}
+	}
+	if err == nil {
+		hc, dialErr := c.redial()
+		if dialErr == nil {
+			slot.cur.Store(hc)
+			slot.mu.Unlock()
+			return hc, nil
+		}
 		recordConnectError()
-		slot.cur.Store(nil)
-		return nil
+		err = dialErr
 	}
-	slot.backoff.reset()
-	slot.cur.Store(hc)
-	return hc
+
+	// The server looks down. The next request dials at once; this one fails
+	// after the backoff, which it sleeps outside the lock.
+	slot.cur.Store(nil)
+	pause := slot.backoff.step()
+	slot.mu.Unlock()
+	sleepFor(ctx, nil, pause)
+	return nil, err
 }
 
 // h2HopByHopHeaders lists HTTP/1.1 connection-specific headers that are
@@ -1058,6 +1068,12 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 	return st
 }
 
+// errH2NeverServed is DoRequest's error for a request that found its
+// connection ended before the connection answered any request: the server
+// completes handshakes and drops the connections, or is shutting down. The
+// server looks down, so the request fails (see reconnectSlot).
+var errH2NeverServed = errors.New("h2client: the connection ended before it answered a request")
+
 // errH2NoStatus is DoRequest's error for a response without a :status the
 // client can read: no :status at all, or none that extractStatus decodes. It
 // is not a success, as h1client fails a response without a status line.
@@ -1081,16 +1097,20 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		hc := slot.cur.Load()
 
 		// A server that closed, reset or GOAWAYed this connection mid-cell
-		// leaves the slot dead (failConn); re-dial (paced) so the
-		// request gets a fresh conn instead of spinning closed-conn errors.
-		// backoff lives in reconnectSlot.
+		// leaves the slot dead (failConn); re-dial so the request gets a
+		// fresh conn instead of spinning closed-conn errors. While the
+		// server looks down, reconnectSlot fails the request instead, paced
+		// by the slot's backoff.
 		if hc == nil || hc.closed.Load() {
-			hc = c.reconnectSlot(ctx, slot)
-			if hc == nil {
-				if ctx.Err() != nil {
+			var err error
+			if hc, err = c.reconnectSlot(ctx, slot); err != nil {
+				switch {
+				case ctx.Err() != nil:
 					return 0, ctx.Err()
+				case err == errH2NeverServed:
+					return 0, fmt.Errorf("h2client: conn[%d]: %w", idx, err)
 				}
-				return 0, fmt.Errorf("h2client: conn[%d] reconnect failed", idx)
+				return 0, fmt.Errorf("h2client: conn[%d] reconnect failed: %w", idx, err)
 			}
 		}
 
@@ -1102,10 +1122,9 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		// waited for a stream, or before the connection's writer reached it
 		// (the connection died, or ran out of stream IDs). Each pass through
 		// here needs a connection to have ended, and reconnectSlot redials
-		// without its backoff only a connection that carried a response, so
-		// a server that keeps closing connections cannot make this loop
-		// spin: either it serves on each connection, or each redial is
-		// paced. ctx ends it.
+		// only a connection that answered a request: one that never did
+		// fails this request, so a server that keeps dropping connections
+		// cannot make this loop spin uncounted. ctx ends it too.
 	}
 }
 
