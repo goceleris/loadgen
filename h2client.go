@@ -247,7 +247,8 @@ var h2StaticStatus = [7]int{200, 204, 206, 304, 400, 404, 500}
 // extractStatus extracts the HTTP status code from an HPACK-encoded header block
 // without allocating. Handles indexed representations from the HPACK static table
 // (covers >99% of benchmark responses) and falls back to literal parsing.
-// Returns 0 for unparseable blocks (treated as success in benchmarks).
+// Returns 0 for a block without a :status it can read, which DoRequest counts
+// as an error (errH2NoStatus), never as a success.
 func extractStatus(headerBlock []byte) int {
 	if len(headerBlock) == 0 {
 		return 0
@@ -304,7 +305,30 @@ func extractStatus(headerBlock []byte) int {
 		return 0
 	}
 
-	if nameIdx < 8 || nameIdx > 14 || pos >= len(headerBlock) {
+	if nameIdx < 8 || nameIdx > 14 {
+		// Name index 0: the name is a string literal (RFC 7541 §6.2), legal
+		// if unusual for a name the static table holds. Accept ":status",
+		// plain or Huffman-coded, and go on as for a static :status name.
+		if nameIdx != 0 || pos >= len(headerBlock) {
+			return 0
+		}
+		nameByte := headerBlock[pos]
+		pos++
+		nameLen := int(nameByte & 0x7F)
+		if pos+nameLen > len(headerBlock) {
+			return 0
+		}
+		name := headerBlock[pos : pos+nameLen]
+		pos += nameLen
+		if nameByte&0x80 != 0 {
+			if string(name) != h2HuffmanStatusName {
+				return 0
+			}
+		} else if string(name) != ":status" {
+			return 0
+		}
+	}
+	if pos >= len(headerBlock) {
 		return 0
 	}
 
@@ -330,6 +354,9 @@ func extractStatus(headerBlock []byte) int {
 	}
 	return parseStatusCode(value)
 }
+
+// h2HuffmanStatusName is the HPACK Huffman encoding of the name ":status".
+var h2HuffmanStatusName = string(hpack.AppendHuffmanString(nil, ":status"))
 
 // h2HuffmanStatus maps the HPACK Huffman encoding of every status code
 // 100-599 to the code, so extractStatus decodes a Huffman-coded :status with
@@ -855,6 +882,15 @@ func (hc *h2Conn) readLoop() {
 			return
 		}
 
+		// A HEADERS or DATA frame whose padding does not fit it is a
+		// connection error (RFC 9113 §6.1, §6.2): nothing in it can be read,
+		// so the connection ends as a dead one does.
+		if frame.badPadding() {
+			hc.failConn(fmt.Errorf("h2client: PROTOCOL_ERROR: frame type %d on stream %d: its Pad Length does not fit its %d-byte payload",
+				frame.Type, frame.StreamID, frame.Length))
+			return
+		}
+
 		switch frame.Type {
 		case frameHeaders:
 			// The status is the final response's :status, whatever ends the
@@ -956,6 +992,11 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 	}
 	return st
 }
+
+// errH2NoStatus is DoRequest's error for a response without a :status the
+// client can read: no :status at all, or none that extractStatus decodes. It
+// is not a success, as h1client fails a response without a status line.
+var errH2NoStatus = errors.New("h2client: response without a readable :status")
 
 // errH2NotSent reports a request that never reached the server: the
 // connection died before the request was handed to it (roundTrip), or ran
@@ -1082,12 +1123,16 @@ func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (i
 }
 
 // finish returns the stream's channel and token and turns its answer into
-// DoRequest's result: a status >= 400 is an error, as h1client counts it.
+// DoRequest's result: a status >= 400 is an error, as h1client counts it, and
+// so is a response whose :status could not be read.
 func (hc *h2Conn) finish(chPtr *chan h2Response, resp h2Response) (int, error) {
 	hc.chanPool.Put(chPtr)
 	hc.streamSem <- struct{}{}
 	if resp.err != nil {
 		return 0, resp.err
+	}
+	if resp.status < 100 {
+		return resp.bytesRead, errH2NoStatus
 	}
 	if resp.status >= 400 {
 		return resp.bytesRead, statusError(resp.status)

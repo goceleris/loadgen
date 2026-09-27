@@ -80,6 +80,14 @@ func (f *h2Frame) unpadded() []byte {
 	return p[1 : len(p)-int(p[0])]
 }
 
+// badPadding reports a DATA or HEADERS frame whose Pad Length does not fit
+// its payload: a connection error of type PROTOCOL_ERROR (RFC 9113 §6.1,
+// §6.2). Nothing in such a frame can be read (unpadded returns nil).
+func (f *h2Frame) badPadding() bool {
+	return (f.Type == frameData || f.Type == frameHeaders) && f.Flags&flagPadded != 0 &&
+		(len(f.payload) == 0 || int(f.payload[0]) >= len(f.payload))
+}
+
 // Data returns the data of a DATA frame, without its padding. Flow control
 // counts the whole payload, padding included (RFC 9113 §6.9.1): use Length.
 func (f *h2Frame) Data() []byte { return f.unpadded() }
