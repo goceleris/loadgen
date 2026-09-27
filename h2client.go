@@ -776,8 +776,16 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 	case h2WriteHeaders:
 		streamID := hc.nextStreamID.Add(2) - 2
 		if streamID > 0x7FFFFFFF {
+			// The connection's stream IDs are used up, which a connection
+			// that lives as long as the server keeps it (#88) reaches after
+			// 2^30 requests. RFC 9113 §5.1.1: open a new connection. Marked
+			// closed, it takes no new request, and DoRequest redials it and
+			// closes it; this request never reached the server, so it goes
+			// to the new connection (errH2NotSent), as does every request
+			// still queued here.
+			hc.closed.Store(true)
 			if req.respCh != nil {
-				*req.respCh <- h2Response{err: fmt.Errorf("h2client: stream ID exhausted")}
+				*req.respCh <- h2Response{err: errH2NotSent}
 			}
 			return
 		}
@@ -927,8 +935,9 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 	return st
 }
 
-// errH2NotSent is roundTrip's report that the connection died before the
-// request was handed to it. Nothing reached the server, so it is not a
+// errH2NotSent reports a request that never reached the server: the
+// connection died before the request was handed to it (roundTrip), or ran
+// out of stream IDs before it was written (processWriteReq). It is not a
 // failed request: DoRequest takes the request to the redialed connection.
 // Never returned to DoRequest's caller.
 var errH2NotSent = errors.New("h2client: connection gone before the request was sent")
