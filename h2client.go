@@ -201,6 +201,14 @@ type h2Conn struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// loopsDone is closed once readLoop and writeLoop have both returned
+	// (loopsLeft counts them down), which they do soon after done closes:
+	// closeConn closes the socket too. Each has sent by then every answer it
+	// will ever send, so await waits for it before it decides that a request
+	// on a closed connection got no answer.
+	loopsDone chan struct{}
+	loopsLeft atomic.Int32
+
 	addr string
 	// closed marks a connection that takes no new request: DoRequest
 	// redials the slot instead. Set before done is closed.
@@ -724,6 +732,7 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		serverInitWindow: serverInitWin,
 		streamSem:        make(chan struct{}, effectiveStreams),
 		done:             make(chan struct{}),
+		loopsDone:        make(chan struct{}),
 		addr:             addr,
 		chanPool: sync.Pool{
 			New: func() any {
@@ -741,6 +750,7 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 		hc.streamSem <- struct{}{}
 	}
 
+	hc.loopsLeft.Store(2)
 	go hc.writeLoop()
 	go hc.readLoop()
 
@@ -753,6 +763,7 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 // It flushes pending connection-level WINDOW_UPDATE (accumulated by readLoop
 // via atomic counter) both when processing requests AND periodically when idle.
 func (hc *h2Conn) writeLoop() {
+	defer hc.loopExited()
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -785,18 +796,34 @@ func (hc *h2Conn) writeLoop() {
 			hc.writeFailed(hc.bufWriter.Flush())
 
 		case <-hc.done:
-			// Drain pending requests — send errors to respCh so workers unblock.
-			for {
-				select {
-				case req := <-hc.writeCh:
-					if req.respCh != nil {
-						*req.respCh <- h2Response{err: fmt.Errorf("connection closing")}
-					}
-				default:
-					return
-				}
-			}
+			hc.answerQueued()
+			return
 		}
+	}
+}
+
+// answerQueued answers every request still queued for a closed connection's
+// writer. None of them was written, so none reached the server: each goes
+// to the redialed connection (errH2NotSent), as a request still waiting for
+// a stream does, instead of counting as an error.
+func (hc *h2Conn) answerQueued() {
+	for {
+		select {
+		case req := <-hc.writeCh:
+			if req.respCh != nil {
+				*req.respCh <- h2Response{err: errH2NotSent}
+			}
+		default:
+			return
+		}
+	}
+}
+
+// loopExited is deferred by readLoop and writeLoop: the second to return
+// closes loopsDone.
+func (hc *h2Conn) loopExited() {
+	if hc.loopsLeft.Add(-1) == 0 {
+		close(hc.loopsDone)
 	}
 }
 
@@ -820,6 +847,18 @@ func (hc *h2Conn) flushWindowUpdate() {
 func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 	switch req.kind {
 	case h2WriteHeaders:
+		// A connection that takes no new request (it died, the client closed
+		// it, or its stream IDs ran out) never writes this one: it goes to
+		// the redialed connection, as a request still waiting for a stream
+		// does. Written, it would fail on bufio's sticky error, or wait for a
+		// response nobody reads, and count as an error.
+		if hc.closed.Load() {
+			if req.respCh != nil {
+				*req.respCh <- h2Response{err: errH2NotSent}
+			}
+			return
+		}
+
 		// Take the next stream ID whose slot is free. A slot still holds the
 		// channel of a stream that 2*MaxStreams-1 later streams have outlived
 		// (a slow response, or a request its worker abandoned); reusing it
@@ -884,6 +923,7 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 // is full of worker requests — readLoop blocks, can't read responses, server's
 // flow control windows exhaust, everything stalls.
 func (hc *h2Conn) readLoop() {
+	defer hc.loopExited()
 	numSlots := uint32(len(hc.streamSlots))
 
 	for {
@@ -1016,10 +1056,11 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 var errH2NoStatus = errors.New("h2client: response without a readable :status")
 
 // errH2NotSent reports a request that never reached the server: the
-// connection died before the request was handed to it (roundTrip), or ran
-// out of stream IDs before it was written (processWriteReq). It is not a
-// failed request: DoRequest takes the request to the redialed connection.
-// Never returned to DoRequest's caller.
+// connection died before the request was handed to it (roundTrip), or took
+// no new request (it died, was closed, or ran out of stream IDs) before its
+// writer wrote it (processWriteReq, answerQueued). It is not a failed
+// request: DoRequest takes the request to the redialed connection. Never
+// returned to DoRequest's caller.
 var errH2NotSent = errors.New("h2client: connection gone before the request was sent")
 
 // DoRequest sends an HTTP/2 request and waits for the response.
@@ -1049,17 +1090,20 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 		if err != errH2NotSent { // the sentinel itself, never wrapped
 			return n, err
 		}
-		// The connection died while this request waited for a stream, or
-		// ran out of stream IDs before writing it. Each pass through here
-		// needs a connection to have ended, and reconnectSlot redials without
-		// its backoff only a connection that carried a response, so a server
-		// that keeps closing connections cannot make this loop spin: either
-		// it serves on each connection, or each redial is paced. ctx ends it.
+		// The connection ended before this request was written: while it
+		// waited for a stream, or before the connection's writer reached it
+		// (the connection died, or ran out of stream IDs). Each pass through
+		// here needs a connection to have ended, and reconnectSlot redials
+		// without its backoff only a connection that carried a response, so
+		// a server that keeps closing connections cannot make this loop
+		// spin: either it serves on each connection, or each redial is
+		// paced. ctx ends it.
 	}
 }
 
 // roundTrip sends one request on hc and waits for its response. It returns
-// errH2NotSent if hc died before the request was handed to its writer.
+// errH2NotSent if hc ended before the request was written: before it was
+// handed to the writer, or before the writer reached it.
 func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, error) {
 	// Acquire a stream. When the connection dies, the workers queued here
 	// wake through done, or through the tokens its failed streams return.
@@ -1107,11 +1151,11 @@ func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, err
 	return hc.await(ctx, chPtr, idx)
 }
 
-// await waits for the answer to a request in flight on hc: a response (from
-// readLoop) or an error (from writeLoop, or failStreams). If the connection
-// dies, exactly one of failStreams, writeLoop (a write error, or its drain of
-// writeCh) and done below answers the request, so it is one error, never
-// zero or two.
+// await waits for the answer to a request handed to hc: a response (from
+// readLoop), an error (from writeLoop, or failStreams), or errH2NotSent (from
+// writeLoop, for a request it never wrote). Exactly one of them answers each
+// request, and done below only when none did, so a request is one outcome,
+// never zero or two.
 func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (int, error) {
 	select {
 	case resp := <-*chPtr:
@@ -1124,11 +1168,22 @@ func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (i
 		hc.streamSem <- struct{}{}
 		return 0, ctx.Err()
 	case <-hc.done:
-		// readLoop answers a stream before it fails the connection, so a
-		// response may be waiting here too. A worker parked in this select
-		// gets it by direct handoff before done closes, but one that reaches
-		// the select after both finds both ready, and select picks at random:
-		// a request the server answered must not become an error.
+		// The connection is closing, and this request's answer may still
+		// be on its way: readLoop may be delivering a response it took
+		// before the close, and writeLoop answers every request it never
+		// wrote with errH2NotSent. Both loops return soon after done closes,
+		// having sent every answer they will send, so wait for them (or the
+		// answer), then take the answer if there is one. Deciding at once
+		// turned both into errors: a response the server sent, and a request
+		// that never reached it.
+		select {
+		case resp := <-*chPtr:
+			return hc.finish(chPtr, resp)
+		case <-hc.loopsDone:
+		case <-ctx.Done():
+			hc.streamSem <- struct{}{}
+			return 0, ctx.Err()
+		}
 		select {
 		case resp := <-*chPtr:
 			return hc.finish(chPtr, resp)

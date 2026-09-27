@@ -915,12 +915,14 @@ func TestH2ReadErrorMidStreamFailsEachInFlightStreamOnce(t *testing.T) {
 
 // TestH2ResponseWinsOverConnectionClose: a worker that reaches its wait
 // after readLoop has both answered its stream and failed the connection finds
-// the response and the closed connection ready at once. The response is the
-// request's outcome; select alone would pick at random. (Found in review of
-// the #89 fix, which makes a close right after a response common.)
+// the response and the closed connection ready at once, and, since round 1,
+// both loops already returned (loopsDone). The response is the request's
+// outcome; select alone would pick at random. (Found in review of the #89
+// fix, which makes a close right after a response common.)
 func TestH2ResponseWinsOverConnectionClose(t *testing.T) {
-	hc := &h2Conn{done: make(chan struct{}), streamSem: make(chan struct{}, 1)}
+	hc := &h2Conn{done: make(chan struct{}), loopsDone: make(chan struct{}), streamSem: make(chan struct{}, 1)}
 	close(hc.done)
+	close(hc.loopsDone)
 	for i := range 200 {
 		ch := make(chan h2Response, 1)
 		ch <- h2Response{status: 200, bytesRead: 2}
@@ -1437,5 +1439,116 @@ func TestH2RequestsTheConnectionNeverWroteAreRetried(t *testing.T) {
 	if res.Errors > killed {
 		t.Errorf("errors=%d over %d connections the server closed with one body in flight each: requests the connection never wrote were charged as errors",
 			res.Errors, killed)
+	}
+}
+
+// TestH2ClosedConnectionWritesNoNewRequest: once a connection takes no new
+// request, its writer writes none of those it still holds: the one it takes
+// next, and the ones still queued when it stops. Each is answered
+// errH2NotSent, so DoRequest takes it to the redialed connection.
+func TestH2ClosedConnectionWritesNoNewRequest(t *testing.T) {
+	var wire bytes.Buffer
+	bw := bufio.NewWriter(&wire)
+	hc := &h2Conn{bufWriter: bw, framer: newH2Framer(bw, nil), writeCh: make(chan h2WriteReq, 4), streamSlots: make([]h2StreamSlot, 4)}
+	hc.nextStreamID.Store(1)
+	hc.closed.Store(true)
+
+	chans := make([]chan h2Response, 4)
+	for i := range chans {
+		chans[i] = make(chan h2Response, 1)
+	}
+	hc.processWriteReq(h2WriteReq{kind: h2WriteHeaders, block: []byte{0x82}, respCh: &chans[0]}) // the one it takes next
+	for i := 1; i < len(chans); i++ {
+		hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: []byte{0x82}, respCh: &chans[i]} // still queued
+	}
+	hc.answerQueued()
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for i, ch := range chans {
+		select {
+		case r := <-ch:
+			if r.err != errH2NotSent {
+				t.Errorf("request %d on a closed connection was answered %+v, want errH2NotSent", i, r)
+			}
+		default:
+			t.Errorf("request %d on a closed connection was never answered", i)
+		}
+	}
+	if wire.Len() != 0 {
+		t.Errorf("the writer wrote %d bytes for requests on a closed connection, want 0", wire.Len())
+	}
+}
+
+// TestH2AwaitTakesAnAnswerThatArrivesAfterTheClose: a worker that sees its
+// connection close may still be owed an answer: a response readLoop took
+// before the close and is delivering, or writeLoop's errH2NotSent for a
+// request it never wrote. await waits until both loops have returned
+// (loopsDone), and only a request no loop answered is "connection closing".
+// Deciding at once made the response an error (N1) and the unsent request
+// an error instead of a retry (N2).
+func TestH2AwaitTakesAnAnswerThatArrivesAfterTheClose(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer *h2Response // nil: no loop answers
+	}{
+		{"response in delivery", &h2Response{status: 200, bytesRead: 2}},
+		{"request never written", &h2Response{err: errH2NotSent}},
+		{"no answer", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hc := &h2Conn{done: make(chan struct{}), loopsDone: make(chan struct{}), streamSem: make(chan struct{}, 1)}
+			close(hc.done)
+			ch := make(chan h2Response, 1)
+			go func() {
+				time.Sleep(20 * time.Millisecond) // the loops are still at work when the worker sees done
+				if tc.answer != nil {
+					ch <- *tc.answer
+				}
+				close(hc.loopsDone)
+			}()
+			n, err := hc.await(context.Background(), &ch, 0)
+			<-hc.streamSem // the token await returned
+			t.Logf("await returned (%d, %v)", n, err)
+			switch {
+			case tc.answer == nil:
+				if err == nil || errors.Is(err, errH2NotSent) {
+					t.Errorf("no loop answered, await returned (%d, %v), want a connection-closing error", n, err)
+				}
+			case tc.answer.err != nil:
+				if err != errH2NotSent {
+					t.Errorf("writeLoop answered errH2NotSent after the close, await returned (%d, %v)", n, err)
+				}
+			default:
+				if err != nil || n != 2 {
+					t.Errorf("readLoop delivered a 200 after the close, await returned (%d, %v), want (2, nil)", n, err)
+				}
+			}
+		})
+	}
+}
+
+// TestH2ConnectionLoopsEndAfterClose: await relies on readLoop and writeLoop
+// returning soon after a connection closes, and on loopsDone saying so. Close
+// a live connection and require loopsDone within 2 s.
+func TestH2ConnectionLoopsEndAfterClose(t *testing.T) {
+	srv := startRawH2(t, respondOK)
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := cl.DoRequest(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	hc := cl.conns[0].cur.Load()
+	hc.closeConn()
+	select {
+	case <-hc.loopsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("2 s after the connection closed, its readLoop and writeLoop had not both returned: a worker waiting in await for them would wait until its context ends")
 	}
 }
