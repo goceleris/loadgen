@@ -368,9 +368,10 @@ func (c *h1Client) readResponse(r *bufio.Reader, connIdx int) (int, h1Next, erro
 	}
 
 	if statusCode >= 400 {
-		// Discard the error body (no MaxResponseSize limit) so a
-		// keep-alive connection stays in sync for the next request.
-		n, derr := discardH1Body(r, contentLength, chunked)
+		// Discard the error body so a keep-alive connection stays in sync
+		// for the next request. MaxResponseSize bounds it as it bounds a
+		// success: a larger body is not read, and the connection closes.
+		n, derr := discardH1Body(r, contentLength, chunked, c.maxResponseSize)
 		next := c.nextAfter(peerCloses)
 		if derr != nil {
 			next = h1Close
@@ -546,14 +547,19 @@ func readChunkedWithLimit(r *bufio.Reader, maxSize int64) (int, error) {
 // discardH1Body reads and discards a response body whose headers have
 // been read. It returns the body length (the declared Content-Length, or
 // the chunked total) and any read error. A body with neither framing is
-// taken as empty.
-func discardH1Body(r *bufio.Reader, contentLength int, chunked bool) (int, error) {
+// taken as empty. With maxSize > 0, a body larger than maxSize is an error:
+// a Content-Length body is then not read at all, and a chunked one stops
+// at the chunk that crosses the limit.
+func discardH1Body(r *bufio.Reader, contentLength int, chunked bool, maxSize int64) (int, error) {
 	if contentLength > 0 {
+		if maxSize > 0 && int64(contentLength) > maxSize {
+			return 0, fmt.Errorf("response body %d bytes exceeds MaxResponseSize %d", contentLength, maxSize)
+		}
 		_, err := r.Discard(contentLength)
 		return contentLength, err
 	}
 	if chunked {
-		return readChunkedWithLimit(r, -1)
+		return readChunkedWithLimit(r, maxSize)
 	}
 	return 0, nil
 }
