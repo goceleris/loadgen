@@ -205,12 +205,14 @@ func startRawH1Server(t *testing.T, reply func(conn, req int) h1Reply) *rawH1Ser
 }
 
 // clientGone records that the client ended a connection; err is the
-// server's read error (io.EOF for a FIN, ECONNRESET for an RST).
+// server's read error (io.EOF for a FIN, ECONNRESET for an RST). The reset
+// is counted before the close, so a test that has waited for clientClosed
+// to reach n reads every reset among those n.
 func (s *rawH1Server) clientGone(err error) {
-	s.clientClosed.Add(1)
 	if errors.Is(err, syscall.ECONNRESET) {
 		s.clientReset.Add(1)
 	}
+	s.clientClosed.Add(1)
 }
 
 // readH1RequestErr is readH1Request returning the read error, so the
