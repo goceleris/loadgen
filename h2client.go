@@ -191,7 +191,8 @@ type h2Conn struct {
 	// 64KiB body (post-64k-h2 = 65536 B) exceeds the 65535 window by one byte
 	// and the request hangs until the run ends. curStreamReset is the ID of
 	// that stream once the server has reset it (RST_STREAM): the body writer
-	// then stops, and sends no RST_STREAM of its own (RFC 9113 §5.4.2).
+	// then stops before its next DATA frame, whatever window is left (RFC
+	// 9113 §6.4), and sends no RST_STREAM of its own (§5.4.2).
 	connSendWindow   atomic.Int64
 	curStreamID      atomic.Uint32
 	curStreamWindow  atomic.Int64
@@ -1287,7 +1288,7 @@ var errH2BodyAbandoned = errors.New("h2client: request body abandoned: the serve
 // the connection is closed (done), which Close does at the end of a run and
 // failConn when the connection dies, or when the server has ended the stream
 // (st no longer holds respCh): the backstops against a peer that never grants
-// window.
+// window. A stream the server has reset gets no further DATA frame at all.
 //
 // Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
 // (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
@@ -1336,6 +1337,12 @@ func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, st *h2StreamSlot, res
 			}
 			time.Sleep(50 * time.Microsecond)
 			continue
+		}
+		// The server has reset the stream: send no more frames on it (RFC
+		// 9113 §6.4), however much window is left. readLoop records the
+		// reset before it answers the stream's worker.
+		if hc.curStreamReset.Load() == streamID {
+			return errH2BodyAbandoned
 		}
 		if avail > len(data) {
 			avail = len(data)
