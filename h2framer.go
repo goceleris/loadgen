@@ -93,6 +93,14 @@ func (f *h2Frame) badPadding() bool {
 		(len(f.payload) == 0 || int(f.payload[0]) >= len(f.payload))
 }
 
+// badPriority reports a HEADERS frame flagged PRIORITY whose payload, without
+// its padding, is shorter than the 5 bytes of priority fields: a frame size
+// error on a frame that carries a field block, so a connection error (RFC 9113
+// §4.2, §6.2). Check badPadding first.
+func (f *h2Frame) badPriority() bool {
+	return f.Type == frameHeaders && f.Flags&flagPriority != 0 && len(f.unpadded()) < 5
+}
+
 // Data returns the data of a DATA frame, without its padding. Flow control
 // counts the whole payload, padding included (RFC 9113 §6.9.1): use Length.
 func (f *h2Frame) Data() []byte { return f.unpadded() }

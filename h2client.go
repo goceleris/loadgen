@@ -975,6 +975,14 @@ func (hc *h2Conn) readLoop() {
 				frame.Type, frame.StreamID, frame.Length))
 			return
 		}
+		// So is a HEADERS frame too short for the priority fields its
+		// PRIORITY flag announces: a frame size error on a frame that
+		// carries a field block (RFC 9113 §4.2).
+		if frame.badPriority() {
+			hc.failConn(fmt.Errorf("h2client: FRAME_SIZE_ERROR: HEADERS on stream %d: its %d-byte payload has no room for its priority fields",
+				frame.StreamID, frame.Length))
+			return
+		}
 
 		switch frame.Type {
 		case frameHeaders:
@@ -1090,10 +1098,11 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 // server looks down, so the request fails (see reconnectSlot).
 var errH2NeverServed = errors.New("h2client: the connection ended before it answered a request")
 
-// errH2NoStatus is DoRequest's error for a response without a :status the
-// client can read: no :status at all, or none that extractStatus decodes. It
-// is not a success, as h1client fails a response without a status line.
-var errH2NoStatus = errors.New("h2client: response without a readable :status")
+// errH2NoStatus is DoRequest's error for a response without a final :status
+// the client can read: no :status at all, none that extractStatus decodes, or
+// only an interim 1xx. It is not a success, as h1client fails a response
+// without a status line.
+var errH2NoStatus = errors.New("h2client: response without a final :status")
 
 // errH2NotSent reports a request that never reached the server: the
 // connection died before the request was handed to it (roundTrip), or took
@@ -1245,14 +1254,15 @@ func (hc *h2Conn) await(ctx context.Context, chPtr *chan h2Response, idx int) (i
 
 // finish returns the stream's channel and token and turns its answer into
 // DoRequest's result: a status >= 400 is an error, as h1client counts it, and
-// so is a response whose :status could not be read.
+// so is a response with no final :status: none that could be read, or only an
+// interim 1xx, which RFC 9113 §8.1 makes a malformed response.
 func (hc *h2Conn) finish(chPtr *chan h2Response, resp h2Response) (int, error) {
 	hc.chanPool.Put(chPtr)
 	hc.streamSem <- struct{}{}
 	if resp.err != nil {
 		return 0, resp.err
 	}
-	if resp.status < 100 {
+	if resp.status < 200 {
 		return resp.bytesRead, errH2NoStatus
 	}
 	if resp.status >= 400 {
