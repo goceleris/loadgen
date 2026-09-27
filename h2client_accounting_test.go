@@ -61,6 +61,8 @@ type rawH2Server struct {
 	killAfter      time.Duration   // > 0: the server closes each connection (no GOAWAY) this long after accepting it
 	closeAfterData int             // > 0: the server closes a connection (no GOAWAY) once it has read this many DATA bytes on it
 	settings       []http2.Setting // the server's SETTINGS (none: every default)
+	answerUpgrade  bool            // answer the h2c upgrade request on stream 1, as celeris does (see rawH2Handshake)
+	goAwayAtOnce   bool            // send GOAWAY as soon as the client's SETTINGS are acked, before any request
 
 	accepted     atomic.Int64 // connections accepted
 	killed       atomic.Int64 // connections the server ended (rawClose or killAfter)
@@ -68,6 +70,8 @@ type rawH2Server struct {
 	dataSent     atomic.Int64 // DATA frame payload bytes written, padding included
 	windowCredit atomic.Int64 // connection WINDOW_UPDATE increments received, minus each handshake's own
 	answeredLate atomic.Int64 // requests answered on a connection other than the first one
+	clientResets atomic.Int64 // RST_STREAM frames received from the client
+	clientCancel atomic.Int64 // of which with error code CANCEL
 
 	mu    sync.Mutex
 	conns []net.Conn
@@ -92,6 +96,8 @@ type rawH2Opts struct {
 	killAfter      time.Duration
 	closeAfterData int
 	settings       []http2.Setting
+	answerUpgrade  bool
+	goAwayAtOnce   bool
 }
 
 func startRawH2(t *testing.T, h rawH2Handler) *rawH2Server {
@@ -104,7 +110,8 @@ func startRawH2With(t *testing.T, opts rawH2Opts, h rawH2Handler) *rawH2Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &rawH2Server{ln: ln, handler: h, killAfter: opts.killAfter, closeAfterData: opts.closeAfterData, settings: opts.settings}
+	s := &rawH2Server{ln: ln, handler: h, killAfter: opts.killAfter, closeAfterData: opts.closeAfterData, settings: opts.settings,
+		answerUpgrade: opts.answerUpgrade, goAwayAtOnce: opts.goAwayAtOnce}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -159,7 +166,7 @@ func (s *rawH2Server) serve(nc net.Conn) {
 
 	br := bufio.NewReader(nc)
 	fr := http2.NewFramer(nc, br)
-	if !rawH2Handshake(nc, br, fr, s.settings...) {
+	if !rawH2Handshake(nc, br, fr, s.answerUpgrade, s.settings...) {
 		_ = nc.Close()
 		return
 	}
@@ -182,6 +189,14 @@ func (s *rawH2Server) serve(nc net.Conn) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
 				_ = fr.WriteSettingsAck()
+				if s.goAwayAtOnce {
+					_ = fr.WriteGoAway(0, http2.ErrCodeNo, nil) // the handshake is done, and no request will be served
+				}
+			}
+		case *http2.RSTStreamFrame:
+			s.clientResets.Add(1)
+			if f.ErrCode == http2.ErrCodeCancel {
+				s.clientCancel.Add(1)
 			}
 		case *http2.PingFrame:
 			if !f.IsAck() {
@@ -224,8 +239,12 @@ func (s *rawH2Server) serve(nc net.Conn) {
 
 // rawH2Handshake reads the client connection preface, performing the h2c
 // upgrade first when the connection starts with an HTTP/1.1 request, and
-// sends the server's SETTINGS.
-func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer, settings ...http2.Setting) bool {
+// sends the server's SETTINGS. With answerUpgrade, the upgrade request is
+// answered on stream 1, as RFC 7540 §3.2 requires, in the order celeris
+// writes it (internal/conn/h2.go NewH2StateFromUpgrade): SETTINGS, a SETTINGS
+// ACK for the client's HTTP2-Settings, then the response, before the client
+// preface is read.
+func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer, answerUpgrade bool, settings ...http2.Setting) bool {
 	head, err := br.Peek(len(http2.ClientPreface))
 	if err != nil {
 		return false
@@ -243,6 +262,11 @@ func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer, settings ..
 		}
 		if err := fr.WriteSettings(settings...); err != nil {
 			return false
+		}
+		if answerUpgrade {
+			_ = fr.WriteSettingsAck()
+			_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: []byte{0x88}, EndHeaders: true}) // :status 200
+			_ = fr.WriteData(1, true, []byte(rawOKBody))
 		}
 		if head, err = br.Peek(len(http2.ClientPreface)); err != nil || string(head) != http2.ClientPreface {
 			return false
@@ -289,6 +313,11 @@ func (c *rawH2Conn) tornData(streamID uint32, declared, sent int) {
 	hdr := []byte{byte(declared >> 16), byte(declared >> 8), byte(declared), 0x0 /* DATA */, 0, 0, 0, 0, 0}
 	binary.BigEndian.PutUint32(hdr[5:], streamID)
 	_, _ = c.nc.Write(append(hdr, make([]byte, sent)...))
+}
+
+// reset ends a stream with RST_STREAM(code).
+func (c *rawH2Conn) reset(streamID uint32, code http2.ErrCode) {
+	_ = c.fr.WriteRSTStream(streamID, code)
 }
 
 // ok answers a stream with 200 and the 2-byte body "OK", in one DATA frame.
@@ -1218,15 +1247,19 @@ func TestH2WindowCreditSentWhileBodyWaitsForWindow(t *testing.T) {
 	}
 }
 
-// TestH2RedialBacksOffOnlyWhenTheServerLooksDown: h1client redials a
-// connection the server ended at once, and backs off only when the redial
-// fails (h1client.go DoRequest). HTTP/2 must record a redial the same way. A
-// connection that answered a request and then ended is redialed without the
-// backoff sleep, which would otherwise be charged to the latency of the
-// request that redials; a connection that ended before it answered anything
-// is paced, so a server that accepts and drops every connection is not
-// redialed in a loop. The backoff is set far beyond each context, so a sleep
-// shows as a failed redial.
+// TestH2RedialBacksOffOnlyWhenTheServerLooksDown: how a slot redials, matched
+// to h1client (h1client.go DoRequest). h1client redials a connection the
+// server ended at once, and when the redial fails it counts a connect error
+// and sleeps its backoff inside the request it returns as an error, so the
+// sleep reaches no recorded latency; the next request dials at once.
+//
+// HTTP/2 does the same, and treats a connection that ended before it carried
+// a response to any request as the server looking down too: the request that
+// finds it fails and sleeps, and nothing is dialed for it, so a server that
+// completes each handshake and then drops the connection is paced and shows
+// as errors. The pace doubles while the server keeps looking down, and is
+// reset once a connection has served. Every subtest drives DoRequest; the
+// backoff is set far beyond each context where a sleep must not happen.
 func TestH2RedialBacksOffOnlyWhenTheServerLooksDown(t *testing.T) {
 	srv := startRawH2(t, respondOK)
 	host, port := srv.hostPort()
@@ -1239,37 +1272,239 @@ func TestH2RedialBacksOffOnlyWhenTheServerLooksDown(t *testing.T) {
 		return cl
 	}
 	const longBackoff = 20 * time.Second // sleep() jitters it to 10-20 s
+	// endConn ends the slot's connection as a server that closes it does.
+	endConn := func(slot *h2ConnSlot, why string) {
+		slot.cur.Load().failConn(errors.New("test: " + why))
+	}
+	// emptySlot leaves the slot as a failed redial leaves it.
+	emptySlot := func(slot *h2ConnSlot) {
+		slot.cur.Load().closeConn()
+		slot.cur.Store(nil)
+	}
+	ctxFor := func(t *testing.T, d time.Duration) context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		t.Cleanup(cancel)
+		return ctx
+	}
 
 	t.Run("answered", func(t *testing.T) {
 		cl := newClient(t)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
+		dials := countDials(cl, 0)
+		ctx := ctxFor(t, 3*time.Second)
 		if _, err := cl.DoRequest(ctx, 0); err != nil {
 			t.Fatal(err)
 		}
 		slot := cl.conns[0]
-		slot.cur.Load().failConn(errors.New("test: the server ended the connection"))
+		endConn(slot, "the server ended the connection")
 		slot.backoff.next = longBackoff
 		start := time.Now()
-		hc := cl.reconnectSlot(ctx, slot)
-		t.Logf("redial after a connection that answered: %v, connection=%t", time.Since(start), hc != nil)
-		if hc == nil {
-			t.Fatalf("no connection after %v: the redial slept the backoff although the connection it replaces had answered; h1client redials such a connection at once",
-				time.Since(start))
+		_, err := cl.DoRequest(ctx, 0)
+		t.Logf("request after a connection that answered: %v, err=%v, dials=%d", time.Since(start), err, dials.Load())
+		if err != nil {
+			t.Fatalf("the request that redials a connection which had answered failed after %v (%v): h1client redials such a connection at once, without its backoff",
+				time.Since(start), err)
 		}
 	})
 	t.Run("never answered", func(t *testing.T) {
 		cl := newClient(t)
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-		defer cancel()
+		dials := countDials(cl, 0)
 		slot := cl.conns[0]
-		slot.cur.Load().failConn(errors.New("test: the server dropped the connection before answering"))
+		endConn(slot, "the server dropped the connection before it answered anything")
+		slot.backoff.next = 200 * time.Millisecond // sleep() jitters it to 100-200 ms
+		start := time.Now()
+		_, err := cl.DoRequest(ctxFor(t, 3*time.Second), 0)
+		elapsed := time.Since(start)
+		t.Logf("request that found a connection which never answered: %v, err=%v, dials=%d", elapsed, err, dials.Load())
+		if err == nil {
+			t.Fatalf("the request that found a connection which ended before it answered anything succeeded, after %v and %d dial(s): the server looks down, so it must fail, sleep the backoff inside that failure and dial nothing, or the sleep lands in a recorded latency and the outage shows no error",
+				elapsed, dials.Load())
+		}
+		if n := dials.Load(); n != 0 {
+			t.Errorf("%d dial(s) for the request that found a connection which never answered: it fails, and the next request dials", n)
+		}
+		if elapsed < 100*time.Millisecond {
+			t.Errorf("the request returned after %v: it did not sleep the backoff (100-200 ms), so a server that drops every connection is redialed in a loop", elapsed)
+		}
+	})
+	t.Run("after a failed redial", func(t *testing.T) {
+		cl := newClient(t)
+		slot := cl.conns[0]
+		emptySlot(slot)
 		slot.backoff.next = longBackoff
 		start := time.Now()
-		hc := cl.reconnectSlot(ctx, slot)
-		t.Logf("redial after a connection that never answered: %v, connection=%t", time.Since(start), hc != nil)
-		if hc != nil {
-			t.Fatal("a connection that never answered was redialed without the backoff: a server that drops every connection would be redialed in a loop")
+		_, err := cl.DoRequest(ctxFor(t, 3*time.Second), 0)
+		t.Logf("request after a failed redial: %v, err=%v", time.Since(start), err)
+		if err != nil {
+			t.Fatalf("the request after a failed redial failed after %v (%v): it slept the backoff before it dialed, so the sleep lands in its latency when the dial succeeds; h1client sleeps only inside the request whose redial failed",
+				time.Since(start), err)
+		}
+	})
+	t.Run("a failed redial", func(t *testing.T) {
+		cl := newClient(t)
+		ctx := ctxFor(t, 3*time.Second)
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		dials := countDials(cl, 1)
+		slot := cl.conns[0]
+		endConn(slot, "the server ended the connection")
+		start := time.Now()
+		_, err := cl.DoRequest(ctx, 0)
+		elapsed := time.Since(start)
+		t.Logf("request whose redial failed: %v, err=%v, dials=%d", elapsed, err, dials.Load())
+		if err == nil || dials.Load() != 1 {
+			t.Fatalf("err=%v dials=%d, want an error after 1 failed dial", err, dials.Load())
+		}
+		// The connection it replaces had served, so the pace starts over:
+		// the first step sleeps 5-10 ms.
+		if elapsed < reconnectBackoffMin/2 {
+			t.Errorf("the request whose redial failed returned after %v without sleeping the backoff (at least %v): as in h1client it paces the server that looks down inside the request it fails",
+				elapsed, reconnectBackoffMin/2)
+		}
+	})
+	t.Run("the sleep holds no lock", func(t *testing.T) {
+		cl := newClient(t)
+		slot := cl.conns[0]
+		emptySlot(slot)
+		slot.backoff.next = longBackoff
+		failed := make(chan struct{})
+		var n atomic.Int64
+		redial := cl.redial
+		cl.redial = func() (*h2Conn, error) {
+			if n.Add(1) == 1 {
+				close(failed)
+				return nil, errors.New("test: connection refused")
+			}
+			return redial()
+		}
+		ctxA, cancelA := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelA()
+		aDone := make(chan error, 1)
+		go func() {
+			_, err := cl.DoRequest(ctxA, 0)
+			aDone <- err
+		}()
+		select {
+		case <-failed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the request on an empty slot did not dial within 3 s: it slept the backoff before it dialed")
+		}
+		// A's redial failed and A sleeps 10-20 s. B, on the same slot, must
+		// not wait for that sleep: it dials at once.
+		ctxB, cancelB := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancelB()
+		bDone := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			_, err := cl.DoRequest(ctxB, 1)
+			bDone <- err
+		}()
+		select {
+		case err := <-bDone:
+			t.Logf("second request while the first sleeps its backoff: %v, err=%v", time.Since(start), err)
+			if err != nil {
+				t.Fatalf("the second request failed (%v): it waited for the backoff sleep of the request whose redial failed", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the second request did not return within 5 s: the request whose redial failed sleeps its backoff holding the slot lock, and every worker of the slot waits for it")
+		}
+		aReturned := false
+		select {
+		case err := <-aDone:
+			aReturned = true
+			t.Errorf("the request whose redial failed returned (%v) before its backoff ended", err)
+		default:
+		}
+		cancelA()
+		if !aReturned {
+			<-aDone
+		}
+	})
+	t.Run("grows until a connection serves", func(t *testing.T) {
+		cl := newClient(t)
+		slot := cl.conns[0]
+		ctx := ctxFor(t, 5*time.Second)
+		for round := 1; round <= 3; round++ {
+			if round > 1 {
+				hc, err := cl.redial()
+				if err != nil {
+					t.Fatal(err)
+				}
+				slot.cur.Store(hc)
+			}
+			endConn(slot, "the server dropped the connection before it answered anything")
+			if _, err := cl.DoRequest(ctx, 0); err == nil {
+				t.Fatalf("round %d: the request that found a connection which never answered succeeded (backoff.next=%v)", round, slot.backoff.next)
+			}
+			want := min(reconnectBackoffMin<<round, reconnectBackoffMax)
+			t.Logf("round %d: backoff.next=%v", round, slot.backoff.next)
+			if slot.backoff.next != want {
+				t.Errorf("round %d: backoff.next=%v, want %v: while every connection ends before it answers, the pace must keep doubling, not restart at every dial that succeeds", round, slot.backoff.next, want)
+			}
+		}
+		// A connection that serves shows the server is up again: the next
+		// redial is at once, and the pace starts over.
+		hc, err := cl.redial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		slot.cur.Store(hc)
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		slot.backoff.next = longBackoff
+		endConn(slot, "the server ended the connection")
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatalf("the redial after a connection that served failed: %v", err)
+		}
+		fresh, err := cl.redial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		slot.cur.Swap(fresh).closeConn()
+		endConn(slot, "the server dropped the connection before it answered anything")
+		start := time.Now()
+		_, err = cl.DoRequest(ctx, 0)
+		t.Logf("first request to find a dropped connection after one served: %v, err=%v", time.Since(start), err)
+		if err == nil {
+			t.Fatal("the request that found a connection which never answered succeeded")
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Errorf("the first backoff after a connection served took %v: the pace was not reset (want 5-10 ms)", d)
+		}
+	})
+	t.Run("h2c: only the upgrade's own stream answered", func(t *testing.T) {
+		// The server answers the upgrade request on stream 1 (RFC 7540 §3.2;
+		// celeris writes it before it reads the preface) and refuses every
+		// request of the run. The upgrade's response is a handshake artefact,
+		// not an answer to a request: the connection has served nothing.
+		up := startRawH2With(t, rawH2Opts{answerUpgrade: true}, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+			c.reset(sid, http2.ErrCodeRefusedStream)
+			return rawKeep
+		})
+		uh, uport := up.hostPort()
+		cl, err := newH2CUpgradeClient(uh, uport, "/", testH2Cfg("GET", nil, nil, 1, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cl.Close)
+		dials := countDials(cl, 0)
+		slot := cl.conns[0]
+		// The refusal arrives after the stream-1 response, which readLoop has
+		// therefore read.
+		var re *HTTP2ResetError
+		if _, err := cl.DoRequest(ctxFor(t, 3*time.Second), 0); !errors.As(err, &re) || re.Code != uint32(http2.ErrCodeRefusedStream) {
+			t.Fatalf("got %v, want the REFUSED_STREAM reset", err)
+		}
+		if slot.cur.Load().served.Load() {
+			t.Error("the h2c upgrade's own stream-1 response marked the connection served, though no request of the run was answered on it")
+		}
+		endConn(slot, "the server dropped the connection")
+		slot.backoff.next = longBackoff
+		_, err = cl.DoRequest(ctxFor(t, 300*time.Millisecond), 0)
+		t.Logf("request after an upgraded connection that answered only stream 1: err=%v, dials=%d", err, dials.Load())
+		if n := dials.Load(); n != 0 {
+			t.Errorf("the connection that answered only the upgrade's stream 1 was redialed at once (%d dial(s)): a server that answers the upgrade and then drops every connection is redialed in a loop", n)
 		}
 	})
 	// Guard: with no sleep in the way, the redial must still not outlive
@@ -1281,13 +1516,27 @@ func TestH2RedialBacksOffOnlyWhenTheServerLooksDown(t *testing.T) {
 		if _, err := cl.DoRequest(ctx, 0); err != nil {
 			t.Fatal(err)
 		}
-		slot := cl.conns[0]
-		slot.cur.Load().failConn(errors.New("test: the server ended the connection"))
+		dials := countDials(cl, 0)
+		endConn(cl.conns[0], "the server ended the connection")
 		cancel()
-		if hc := cl.reconnectSlot(ctx, slot); hc != nil {
-			t.Fatal("a connection was dialed after the run's context ended: Close, which runs after the cancel, never closes it")
+		if _, err := cl.DoRequest(ctx, 0); err == nil || dials.Load() != 0 {
+			t.Fatalf("err=%v dials=%d after the run's context ended: a connection dialed now is one Close, which runs after the cancel, never closes", err, dials.Load())
 		}
 	})
+}
+
+// countDials routes the client's redials through a counter and fails the
+// first failFirst of them, as a refused connection would.
+func countDials(cl *h2Client, failFirst int64) *atomic.Int64 {
+	var n atomic.Int64
+	redial := cl.redial
+	cl.redial = func() (*h2Conn, error) {
+		if n.Add(1) <= failFirst {
+			return nil, errors.New("test: connection refused")
+		}
+		return redial()
+	}
+	return &n
 }
 
 // TestH2ResponseWithoutAReadableStatusIsNotASuccess: a response counts as a
@@ -1415,17 +1664,21 @@ func TestH2StreamOutlivedByLaterStreamsGetsItsResponse(t *testing.T) {
 }
 
 // TestH2RequestsTheConnectionNeverWroteAreRetried: 4 workers share one
-// connection with 4 streams and POST 100 KiB bodies; the server reads the
-// 65,535 bytes the connection window allows and closes the connection. The
-// first request's body was being written, so it is in flight and is one
-// error. The other three were still queued for the writer: they never
-// reached the server, so, like a request still waiting for a stream, they go
-// to the redialed connection and are not errors. Before the fix their workers
-// woke on the closed connection and gave up before the writer answered, and
-// the writer failed the ones it reached: 4 errors per connection.
+// connection with 4 streams and POST 100 KiB bodies; the server starts each
+// response, reads the 65,535 bytes the connection window allows and closes
+// the connection. The first request's body was being written, so it is in
+// flight and is one error. The other three were still queued for the writer:
+// they never reached the server, so, like a request still waiting for a
+// stream, they go to the redialed connection and are not errors. Before the
+// fix their workers woke on the closed connection and gave up before the
+// writer answered, and the writer failed the ones it reached: 4 errors per
+// connection. (The server starts each response so that its connections have
+// served: since round 2 a connection that ends before it answered anything
+// costs the request that finds it, which is TestH2RedialBacksOff...'s case.)
 func TestH2RequestsTheConnectionNeverWroteAreRetried(t *testing.T) {
-	srv := startRawH2With(t, rawH2Opts{closeAfterData: 65535}, func(*rawH2Conn, uint32, string) rawH2Action {
-		return rawKeep // take the request and its body, never answer
+	srv := startRawH2With(t, rawH2Opts{closeAfterData: 65535}, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+		c.headers(sid, false, ":status", "200") // start the response, never end it
+		return rawKeep
 	})
 	const streams = 4
 	res := runBench(t, Config{URL: srv.url("/upload"), Method: "POST", Body: make([]byte, 100<<10), Duration: 400 * time.Millisecond,
@@ -1550,5 +1803,216 @@ func TestH2ConnectionLoopsEndAfterClose(t *testing.T) {
 	case <-hc.loopsDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("2 s after the connection closed, its readLoop and writeLoop had not both returned: a worker waiting in await for them would wait until its context ends")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review of the fixes, round 2
+
+// TestH2CUpgradeServerThatAnswersOnlyTheUpgradeIsPaced: an h2c server that
+// answers the upgrade request on stream 1, as RFC 7540 §3.2 requires, and
+// then closes each connection when the first request of the run arrives,
+// without answering it. The stream-1 response must not count as the
+// connection having served: every connection ends before it answered a
+// request, so the server looks down, and the redials are paced. On e37777e
+// the stream-1 response marked each connection served, so each was redialed
+// at once: a dial storm, as on a dead port before the backoff existed.
+func TestH2CUpgradeServerThatAnswersOnlyTheUpgradeIsPaced(t *testing.T) {
+	srv := startRawH2With(t, rawH2Opts{answerUpgrade: true}, func(*rawH2Conn, uint32, string) rawH2Action {
+		return rawClose
+	})
+	res := runBench(t, Config{URL: srv.url("/"), Duration: 300 * time.Millisecond, Workers: 1,
+		H2CUpgrade: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: 4}})
+	accepted := srv.accepted.Load()
+	t.Logf("connections=%d requests=%d errors=%d connect_errors=%d", accepted, res.Requests, res.Errors, res.ConnectErrors)
+	if accepted > 60 {
+		t.Errorf("%d connections in %v to a server that answered no request: they were redialed without backoff", accepted, 300*time.Millisecond)
+	}
+	if res.Requests != 0 || res.Errors == 0 {
+		t.Errorf("requests=%d errors=%d, want 0 and at least 1: the server answered nothing", res.Requests, res.Errors)
+	}
+}
+
+// TestH2ServerThatDropsEveryConnectionShowsErrors: the server completes each
+// handshake, then sends GOAWAY before any request. No request reaches it, so
+// none is in flight when a connection ends; each still costs the request that
+// finds the connection gone, as h1client charges each request to a server
+// that drops its connections, and the pace grows, so the run shows the outage
+// as errors and a handful of connections. On e37777e the pace restarted at
+// every dial that succeeded (44 and 46 connections in two runs), and whether
+// a request was an error or retried silently depended on whether it was
+// written before the GOAWAY was read (43 and 24 errors).
+func TestH2ServerThatDropsEveryConnectionShowsErrors(t *testing.T) {
+	srv := startRawH2With(t, rawH2Opts{goAwayAtOnce: true}, func(*rawH2Conn, uint32, string) rawH2Action {
+		return rawKeep
+	})
+	res := runBench(t, Config{URL: srv.url("/"), Duration: 400 * time.Millisecond, Workers: 1,
+		HTTP2: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: 4}})
+	accepted := srv.accepted.Load()
+	t.Logf("connections=%d requests=%d errors=%d connect_errors=%d", accepted, res.Requests, res.Errors, res.ConnectErrors)
+	if res.Errors < accepted-2 {
+		t.Errorf("errors=%d over %d connections that each ended before answering anything: the outage is not counted", res.Errors, accepted)
+	}
+	if accepted > 25 {
+		t.Errorf("%d connections in %v to a server that drops every one: the backoff does not grow while the server looks down", accepted, 400*time.Millisecond)
+	}
+}
+
+// TestH2BodyWaitEndsWhenTheServerEndsTheStream: a POST body larger than the
+// server's stream window waits for a WINDOW_UPDATE; the server ends the
+// stream first and never grants more. RFC 9113 §8.1 lets a server answer
+// before the body is complete and then RST_STREAM(NO_ERROR) (x/net's server
+// does so when its handler returns without reading the body); a server may
+// also refuse the stream. It sends no window for a stream it has ended, so
+// the wait must end there, without failing the connection: the later requests
+// of the connection are queued behind the writer. A response that ends
+// without a reset leaves the client's half of the stream open, which the
+// client closes with RST_STREAM(CANCEL); after a reset it sends none (§5.4.2).
+// On e37777e the writer polled for window until the run ended, and every
+// later request of the connection hung, uncounted.
+func TestH2BodyWaitEndsWhenTheServerEndsTheStream(t *testing.T) {
+	const requests = 3
+	for _, tc := range []struct {
+		name       string
+		answer     func(c *rawH2Conn, sid uint32)
+		success    bool  // the request is a success (else the reset)
+		minCancels int64 // RST_STREAM(CANCEL) the client must send, at least
+		maxResets  int64 // RST_STREAM the client may send, at most
+	}{
+		{"response then RST_STREAM(NO_ERROR)", func(c *rawH2Conn, sid uint32) { c.ok(sid); c.reset(sid, http2.ErrCodeNo) }, true, 0, requests},
+		{"response only", func(c *rawH2Conn, sid uint32) { c.ok(sid) }, true, requests, requests},
+		{"RST_STREAM(REFUSED_STREAM)", func(c *rawH2Conn, sid uint32) { c.reset(sid, http2.ErrCodeRefusedStream) }, false, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startRawH2With(t, rawH2Opts{settings: uploadWindow}, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+				tc.answer(c, sid)
+				return rawKeep // never grant window
+			})
+			host, port := srv.hostPort()
+			cl, err := newH2Client(host, port, "/upload", testH2Cfg("POST", nil, make([]byte, 2000), 1, 4))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cl.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			for i := range requests {
+				_, err := cl.DoRequest(ctx, 0)
+				var re *HTTP2ResetError
+				if tc.success && err != nil || !tc.success && !errors.As(err, &re) {
+					t.Fatalf("request %d: %v (connections=%d): the server ended each stream at once, but the connection's writer still waits for window for a body the server will never take",
+						i+1, err, srv.accepted.Load())
+				}
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for srv.clientCancel.Load() < tc.minCancels && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+			time.Sleep(50 * time.Millisecond) // a reset the client should not send would be flushed by now
+			t.Logf("connections=%d client RST_STREAM=%d (CANCEL %d)", srv.accepted.Load(), srv.clientResets.Load(), srv.clientCancel.Load())
+			if n := srv.accepted.Load(); n != 1 {
+				t.Errorf("connections=%d, want 1: a stream the server ended is not a connection error", n)
+			}
+			if got := srv.clientCancel.Load(); got < tc.minCancels {
+				t.Errorf("the client sent %d RST_STREAM(CANCEL), want %d: a body it stops sending leaves its half of the stream open on the server", got, tc.minCancels)
+			}
+			if got := srv.clientResets.Load(); got > tc.maxResets {
+				t.Errorf("the client sent %d RST_STREAM, want at most %d: never one for a stream the server reset", got, tc.maxResets)
+			}
+		})
+	}
+}
+
+// TestH2AwaitAnswersARequestQueuedAfterTheWriterReturned: a worker's hand-off
+// to writeCh and the connection's done can be ready together, and select
+// picks either, so a request can be queued after writeLoop's final drain
+// (answerQueued). Nobody wrote it, so it never reached the server: await,
+// once both loops have returned, answers it errH2NotSent (DoRequest takes it
+// to the redialed connection) instead of "connection closing", an error. On
+// e37777e it was an error.
+func TestH2AwaitAnswersARequestQueuedAfterTheWriterReturned(t *testing.T) {
+	hc := &h2Conn{done: make(chan struct{}), loopsDone: make(chan struct{}), streamSem: make(chan struct{}, 1), writeCh: make(chan h2WriteReq, 4)}
+	close(hc.done)
+	close(hc.loopsDone)
+	ch := make(chan h2Response, 1)
+	hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: []byte{0x82}, respCh: &ch} // queued after the writer returned
+	n, err := hc.await(context.Background(), &ch, 0)
+	<-hc.streamSem // the token await returned
+	t.Logf("await returned (%d, %v)", n, err)
+	if err != errH2NotSent {
+		t.Errorf("a request still queued for a writer that has returned was answered (%d, %v), want errH2NotSent: it was never written", n, err)
+	}
+	if len(hc.writeCh) != 0 {
+		t.Errorf("%d request(s) left in writeCh after await", len(hc.writeCh))
+	}
+}
+
+// TestH2ResponseWithOnlyAnInterimStatusIsNotASuccess: a stream that ends
+// while its only :status is an interim 1xx has no final response, which RFC
+// 9113 §8.1 makes malformed: an error (errH2NoStatus), not a success. On
+// e37777e both shapes were a success with a 1xx status.
+func TestH2ResponseWithOnlyAnInterimStatusIsNotASuccess(t *testing.T) {
+	srv := startRawH2(t, func(c *rawH2Conn, sid uint32, path string) rawH2Action {
+		switch path {
+		case "/interim-ends-stream": // HEADERS 103 with END_STREAM
+			c.headers(sid, true, ":status", "103")
+		case "/interim-then-data": // HEADERS 100, then the stream ends on DATA
+			c.headers(sid, false, ":status", "100")
+			c.data(sid, true, len(rawOKBody), 0)
+		case "/interim-then-final": // HEADERS 103, then the final 200: a success
+			c.headers(sid, false, ":status", "103")
+			c.ok(sid)
+		default:
+			c.ok(sid)
+		}
+		return rawKeep
+	})
+	host, port := srv.hostPort()
+	for _, tc := range []struct {
+		path   string
+		status int // 0: a success; -1: an error other than a status
+	}{
+		{"/interim-ends-stream", -1},
+		{"/interim-then-data", -1},
+		{"/interim-then-final", 0},
+		{"/ok", 0},
+	} {
+		n, err := h2Once(t, host, port, tc.path)
+		t.Logf("%-22s status=%d bytes=%d err=%v", tc.path, h2Status(err), n, err)
+		if got := h2Status(err); got != tc.status {
+			t.Errorf("%s: recorded status %d (err=%v), want %d (0: success, -1: an error): a response with no final status is not a success",
+				tc.path, got, err, tc.status)
+		}
+	}
+}
+
+// TestH2HeadersTooShortForTheirPriorityFieldsEndTheConnection: a HEADERS
+// frame flagged PRIORITY whose payload has no room for the 5 bytes of
+// priority fields is a frame size error on a frame that carries a field
+// block, so a connection error (RFC 9113 §4.2, §6.2), as a Pad Length that
+// does not fit is since round 1. On e37777e it was read as an empty block:
+// the stream failed with errH2NoStatus and the connection went on.
+func TestH2HeadersTooShortForTheirPriorityFieldsEndTheConnection(t *testing.T) {
+	srv := startRawH2(t, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+		// PRIORITY flagged, 1 byte of payload: :status 200 where the 5 priority bytes should be.
+		_ = c.fr.WriteRawFrame(http2.FrameHeaders, http2.FlagHeadersEndHeaders|http2.FlagHeadersEndStream|http2.FlagHeadersPriority, sid, []byte{0x88})
+		return rawKeep
+	})
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	hc := cl.conns[0].cur.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = cl.DoRequest(ctx, 0)
+	t.Logf("err=%v connection closed=%t", err, hc.closed.Load())
+	if err == nil {
+		t.Fatal("a HEADERS frame too short for its priority fields was a success")
+	}
+	if !hc.closed.Load() {
+		t.Errorf("the connection goes on after a HEADERS frame too short for its priority fields (err=%v): it is a connection error", err)
 	}
 }
