@@ -499,6 +499,14 @@ func (c *h2Client) reconnectSlot(ctx context.Context, slot *h2ConnSlot) (*h2Conn
 	var err error
 	if old != nil {
 		old.closeConn() // release fds/goroutines of the dead conn
+		// served is final once readLoop has returned: when the writer ended
+		// the connection, readLoop may still be parsing frames it had read,
+		// the connection's first response among them. Both loops return soon
+		// after the close.
+		select {
+		case <-old.loopsDone:
+		case <-ctx.Done():
+		}
 		if old.served.Load() {
 			slot.backoff.reset() // the server was up: redial at once, and the pace starts over
 		} else {
