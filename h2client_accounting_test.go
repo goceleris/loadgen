@@ -1411,3 +1411,31 @@ func TestH2StreamOutlivedByLaterStreamsGetsItsResponse(t *testing.T) {
 		t.Errorf("the server answered the held stream, but its worker got bytes=%d err=%v: a later stream took its slot and its response", r.n, r.err)
 	}
 }
+
+// TestH2RequestsTheConnectionNeverWroteAreRetried: 4 workers share one
+// connection with 4 streams and POST 100 KiB bodies; the server reads the
+// 65,535 bytes the connection window allows and closes the connection. The
+// first request's body was being written, so it is in flight and is one
+// error. The other three were still queued for the writer: they never
+// reached the server, so, like a request still waiting for a stream, they go
+// to the redialed connection and are not errors. Before the fix their workers
+// woke on the closed connection and gave up before the writer answered, and
+// the writer failed the ones it reached: 4 errors per connection.
+func TestH2RequestsTheConnectionNeverWroteAreRetried(t *testing.T) {
+	srv := startRawH2With(t, rawH2Opts{closeAfterData: 65535}, func(*rawH2Conn, uint32, string) rawH2Action {
+		return rawKeep // take the request and its body, never answer
+	})
+	const streams = 4
+	res := runBench(t, Config{URL: srv.url("/upload"), Method: "POST", Body: make([]byte, 100<<10), Duration: 400 * time.Millisecond,
+		Workers: streams, HTTP2: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: streams}})
+	killed := srv.killed.Load()
+	t.Logf("connections=%d closed by the server=%d requests=%d errors=%d errors per closed connection=%.2f",
+		srv.accepted.Load(), killed, res.Requests, res.Errors, float64(res.Errors)/float64(max(killed, 1)))
+	if killed < 3 {
+		t.Fatalf("the server closed %d connection(s): the client did not keep redialing", killed)
+	}
+	if res.Errors > killed {
+		t.Errorf("errors=%d over %d connections the server closed with one body in flight each: requests the connection never wrote were charged as errors",
+			res.Errors, killed)
+	}
+}
