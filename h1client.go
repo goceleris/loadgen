@@ -262,10 +262,12 @@ const (
 // request, once.
 //
 // Two limits. A keep-alive connection the server closes without notice is
-// seen only by the request written into it, which fails; it is not
-// retried, since the server may have received it. And "read completely"
-// is only as good as readResponse's framing, which knows Content-Length
-// and chunked; the cases it misreads are loadgen#93.
+// seen only by the request written into it, which fails. It is not
+// retried, although RFC 9112 §9.3.1 allows a retry of an idempotent method
+// on a new connection when the old one closed before any response byte:
+// loadgen#94. And "read completely" is only as good as readResponse's
+// framing, which knows Content-Length and chunked; the cases it misreads
+// are loadgen#93.
 func (c *h1Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	var connIdx int
 	if c.connsPerWorker == 1 {
@@ -605,7 +607,8 @@ func (hc *h1Conn) finish() {
 // complete. The slot is free at once; the next request on it dials a fresh
 // connection.
 //
-// The goroutine waits for the server's FIN, at most hc.peerCloseWait:
+// The goroutine waits for the server's TCP FIN, at most hc.peerCloseWait
+// (see serverClosed):
 //   - The FIN arrives (the server closes, as Connection: close asks): the
 //     client closes after it, so the server holds the TIME_WAIT.
 //   - Anything else, normally the bound expiring on a server that keeps
@@ -625,8 +628,7 @@ func (hc *h1Conn) closeAfterPeer() {
 	wait := hc.peerCloseWait
 	go func() {
 		_ = conn.SetReadDeadline(time.Now().Add(wait))
-		var b [1]byte
-		if _, err := conn.Read(b[:]); !errors.Is(err, io.EOF) {
+		if !serverClosed(conn) {
 			abortClose(conn)
 			return
 		}
@@ -634,9 +636,32 @@ func (hc *h1Conn) closeAfterPeer() {
 	}()
 }
 
+// serverClosed reads conn until the server's TCP FIN and reports whether
+// it arrived before conn's read deadline; anything else (the deadline, a
+// byte, a reset) is false. Over TLS, Read returns io.EOF at the server's
+// close_notify alert whether or not its FIN has arrived: a server doing a
+// bidirectional shutdown waits for the client's close_notify before it
+// closes, and one whose FIN travels in a later segment would see the
+// client close first. So after the TLS EOF the raw TCP connection is read
+// until its own EOF, under the same deadline.
+func serverClosed(conn net.Conn) bool {
+	var b [1]byte
+	if _, err := conn.Read(b[:]); !errors.Is(err, io.EOF) {
+		return false
+	}
+	if tc, ok := conn.(*tls.Conn); ok {
+		if _, err := tc.NetConn().Read(b[:]); !errors.Is(err, io.EOF) {
+			return false
+		}
+	}
+	return true
+}
+
 // abortClose closes conn with an RST instead of a FIN (SO_LINGER 0), so
-// the client keeps no TIME_WAIT for it. Over TLS the close_notify alert is
-// still written first.
+// the client keeps no TIME_WAIT for it. Over TLS, Close writes a
+// close_notify alert into the socket first, but the linger-0 close then
+// discards whatever of it is still unsent, so the alert may never reach
+// the wire.
 func abortClose(conn net.Conn) {
 	raw := conn
 	if tc, ok := conn.(*tls.Conn); ok {

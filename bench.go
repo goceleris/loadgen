@@ -84,11 +84,13 @@ type Config struct {
 	// When true, every HTTP/1.1 request carries Connection: close and
 	// travels on a connection of its own: after the response the client
 	// lets the server close the connection, off the measured latency (a
-	// server that has not closed it within 50ms gets a reset, so the
-	// loadgen host keeps no TIME_WAIT), and the next request dials a
-	// fresh one. The dial is part of that request, so it
-	// is inside its measured latency. The close is expected and is never
-	// counted as an error; a refused dial, a reset or a truncated body is.
+	// server whose TCP FIN has not arrived within 50ms, TLS close_notify
+	// or not, gets a reset, so the loadgen host keeps no TIME_WAIT), and
+	// the next request dials a fresh one. The dial is part of that
+	// request, so it is inside its measured latency, including any SYN
+	// retransmission (1s or more) when the server's accept queue is full.
+	// The close is expected and is never counted as an error; a refused
+	// dial, a reset or a truncated body is.
 	// Default: false (keep-alive on).
 	DisableKeepAlive bool
 
