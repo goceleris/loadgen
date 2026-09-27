@@ -58,8 +58,9 @@ type rawH2Handler func(c *rawH2Conn, streamID uint32, path string) rawH2Action
 type rawH2Server struct {
 	ln             net.Listener
 	handler        rawH2Handler
-	killAfter      time.Duration // > 0: the server closes each connection (no GOAWAY) this long after accepting it
-	closeAfterData int           // > 0: the server closes a connection (no GOAWAY) once it has read this many DATA bytes on it
+	killAfter      time.Duration   // > 0: the server closes each connection (no GOAWAY) this long after accepting it
+	closeAfterData int             // > 0: the server closes a connection (no GOAWAY) once it has read this many DATA bytes on it
+	settings       []http2.Setting // the server's SETTINGS (none: every default)
 
 	accepted     atomic.Int64 // connections accepted
 	killed       atomic.Int64 // connections the server ended (rawClose or killAfter)
@@ -90,6 +91,7 @@ type rawH2Conn struct {
 type rawH2Opts struct {
 	killAfter      time.Duration
 	closeAfterData int
+	settings       []http2.Setting
 }
 
 func startRawH2(t *testing.T, h rawH2Handler) *rawH2Server {
@@ -102,7 +104,7 @@ func startRawH2With(t *testing.T, opts rawH2Opts, h rawH2Handler) *rawH2Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &rawH2Server{ln: ln, handler: h, killAfter: opts.killAfter, closeAfterData: opts.closeAfterData}
+	s := &rawH2Server{ln: ln, handler: h, killAfter: opts.killAfter, closeAfterData: opts.closeAfterData, settings: opts.settings}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -157,7 +159,7 @@ func (s *rawH2Server) serve(nc net.Conn) {
 
 	br := bufio.NewReader(nc)
 	fr := http2.NewFramer(nc, br)
-	if !rawH2Handshake(nc, br, fr) {
+	if !rawH2Handshake(nc, br, fr, s.settings...) {
 		_ = nc.Close()
 		return
 	}
@@ -223,7 +225,7 @@ func (s *rawH2Server) serve(nc net.Conn) {
 // rawH2Handshake reads the client connection preface, performing the h2c
 // upgrade first when the connection starts with an HTTP/1.1 request, and
 // sends the server's SETTINGS.
-func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer) bool {
+func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer, settings ...http2.Setting) bool {
 	head, err := br.Peek(len(http2.ClientPreface))
 	if err != nil {
 		return false
@@ -239,7 +241,7 @@ func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer) bool {
 		if _, err := io.WriteString(nc, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n"); err != nil {
 			return false
 		}
-		if err := fr.WriteSettings(); err != nil {
+		if err := fr.WriteSettings(settings...); err != nil {
 			return false
 		}
 		if head, err = br.Peek(len(http2.ClientPreface)); err != nil || string(head) != http2.ClientPreface {
@@ -251,7 +253,7 @@ func rawH2Handshake(nc net.Conn, br *bufio.Reader, fr *http2.Framer) bool {
 	if _, err := br.Discard(len(http2.ClientPreface)); err != nil {
 		return false
 	}
-	return fr.WriteSettings() == nil
+	return fr.WriteSettings(settings...) == nil
 }
 
 // headers writes one HEADERS frame carrying fields, given as name, value pairs.
@@ -407,21 +409,29 @@ const (
 	warpFactor    = 1500
 )
 
-// warpConn applies the deadline warp and counts the deadlines it warped.
+// warpCounts is what the deadline warp saw: every deadline armed on a warped
+// connection (seen) and the long ones it warped (armed).
+type warpCounts struct {
+	seen  atomic.Int64 // deadlines armed through the warp, of any length
+	armed atomic.Int64 // deadlines more than warpThreshold ahead, warped
+}
+
+// warpConn applies the deadline warp and counts the deadlines it saw.
 type warpConn struct {
 	net.Conn
-	armed *atomic.Int64
+	counts *warpCounts
 }
 
 func (c warpConn) warp(t time.Time) time.Time {
 	if t.IsZero() {
 		return t
 	}
+	c.counts.seen.Add(1)
 	d := time.Until(t)
 	if d <= warpThreshold {
 		return t
 	}
-	c.armed.Add(1)
+	c.counts.armed.Add(1)
 	return time.Now().Add(d / warpFactor)
 }
 
@@ -430,10 +440,10 @@ func (c warpConn) SetReadDeadline(t time.Time) error  { return c.Conn.SetReadDea
 func (c warpConn) SetWriteDeadline(t time.Time) error { return c.Conn.SetWriteDeadline(c.warp(t)) }
 
 // warpLongDeadlines routes every loadgen dial through warpConn for the rest
-// of the test and returns the count of warped (long) deadlines armed.
-func warpLongDeadlines(t *testing.T) *atomic.Int64 {
+// of the test and returns what the warp saw.
+func warpLongDeadlines(t *testing.T) *warpCounts {
 	t.Helper()
-	armed := new(atomic.Int64)
+	counts := new(warpCounts)
 	dial := dialTimeoutFunc
 	t.Cleanup(func() { dialTimeoutFunc = dial })
 	dialTimeoutFunc = func(network, addr string, timeout time.Duration) (net.Conn, error) {
@@ -441,9 +451,22 @@ func warpLongDeadlines(t *testing.T) *atomic.Int64 {
 		if err != nil {
 			return nil, err
 		}
-		return warpConn{Conn: c, armed: armed}, nil
+		return warpConn{Conn: c, counts: counts}, nil
 	}
-	return armed
+	return counts
+}
+
+// requireWarped fails the test unless every connection the server accepted
+// armed a deadline through the warp: the handshake's 10 s read deadline, at
+// least. armed == 0 proves no lifetime deadline only for a connection the
+// warp wraps; one dialed around the dialTimeoutFunc hook would carry a real
+// 5-minute deadline that no sub-second test can see fire.
+func requireWarped(t *testing.T, w *warpCounts, accepted int64) {
+	t.Helper()
+	if seen := w.seen.Load(); seen < accepted {
+		t.Fatalf("the warp saw %d deadline(s) for %d connection(s): the connections were not dialed through dialTimeoutFunc, so armed=%d proves nothing",
+			seen, accepted, w.armed.Load())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -797,13 +820,14 @@ func TestH2ThroughputCountsEveryDATAFrame(t *testing.T) {
 // HTTP/1.1, which sets no deadline, the connection must keep serving: no
 // errors, no second connection.
 func TestH2ConnectionHasNoLifetimeDeadline(t *testing.T) {
-	armed := warpLongDeadlines(t)
+	warp := warpLongDeadlines(t)
 	srv := startRawH2(t, respondOK)
 	res := runBench(t, Config{URL: srv.url("/"), Duration: 600 * time.Millisecond, Workers: 1, MaxRPS: 400,
 		HTTP2: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: 4}})
-	t.Logf("long deadlines armed=%d requests=%d errors=%d connect_errors=%d connections=%d",
-		armed.Load(), res.Requests, res.Errors, res.ConnectErrors, srv.accepted.Load())
-	if n := armed.Load(); n != 0 {
+	t.Logf("deadlines seen=%d long deadlines armed=%d requests=%d errors=%d connect_errors=%d connections=%d",
+		warp.seen.Load(), warp.armed.Load(), res.Requests, res.Errors, res.ConnectErrors, srv.accepted.Load())
+	requireWarped(t, warp, srv.accepted.Load())
+	if n := warp.armed.Load(); n != 0 {
 		t.Errorf("%d deadline(s) more than %v ahead were armed on the connection: an H2 connection must not carry a lifetime deadline", n, warpThreshold)
 	}
 	if res.Errors != 0 || res.ConnectErrors != 0 || srv.accepted.Load() != 1 {
@@ -1034,15 +1058,16 @@ func TestH2GOAWAYConnectionIsReleased(t *testing.T) {
 // every connection, without GOAWAY, 300 ms after accepting it; the lifetime
 // bound would have fired at 200 ms.
 func TestH2ServerEndedConnectionIsRedialedWithoutLifetimeDeadline(t *testing.T) {
-	armed := warpLongDeadlines(t)
+	warp := warpLongDeadlines(t)
 	srv := startRawH2With(t, rawH2Opts{killAfter: 300 * time.Millisecond}, respondOK)
 	const streams = 4
 	res := runBench(t, Config{URL: srv.url("/"), Duration: 800 * time.Millisecond, Workers: 1, MaxRPS: 400,
 		HTTP2: true, HTTP2Options: HTTP2Options{Connections: 1, MaxStreams: streams}})
 	killed := srv.killed.Load()
-	t.Logf("long deadlines armed=%d connections=%d server closes=%d answered after a redial=%d closed by the client=%d requests=%d errors=%d connect_errors=%d",
-		armed.Load(), srv.accepted.Load(), killed, srv.answeredLate.Load(), srv.clientClosed.Load(), res.Requests, res.Errors, res.ConnectErrors)
-	if n := armed.Load(); n != 0 {
+	t.Logf("deadlines seen=%d long deadlines armed=%d connections=%d server closes=%d answered after a redial=%d closed by the client=%d requests=%d errors=%d connect_errors=%d",
+		warp.seen.Load(), warp.armed.Load(), srv.accepted.Load(), killed, srv.answeredLate.Load(), srv.clientClosed.Load(), res.Requests, res.Errors, res.ConnectErrors)
+	requireWarped(t, warp, srv.accepted.Load())
+	if n := warp.armed.Load(); n != 0 {
 		t.Errorf("%d deadline(s) more than %v ahead were armed: the connection still has a lifetime deadline", n, warpThreshold)
 	}
 	if killed == 0 || srv.accepted.Load() < 2 || srv.answeredLate.Load() == 0 {
@@ -1054,5 +1079,272 @@ func TestH2ServerEndedConnectionIsRedialedWithoutLifetimeDeadline(t *testing.T) 
 	}
 	if srv.clientClosed.Load() > 1 { // the one Close at the end of the run
 		t.Errorf("the client ended %d connections itself before the server did", srv.clientClosed.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review of the #85-#89 fixes (PR #91, round 1)
+
+// TestH2StreamIDExhaustionRedials: with no lifetime deadline (#88) a
+// connection lives as long as the server keeps it, so a long run can use up
+// its 2^30 client stream IDs. RFC 9113 §5.1.1: a client that cannot open a
+// new stream opens a new connection. The request that finds the IDs used up
+// never reached the server, so it goes to a redialed connection and does not
+// fail, and the used-up connection is closed. On 2930ded every request from
+// then on failed at once on a connection nothing retired.
+func TestH2StreamIDExhaustionRedials(t *testing.T) {
+	srv := startRawH2(t, respondOK)
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	// Three stream IDs left on the first connection: 2^31-5, 2^31-3, 2^31-1.
+	cl.conns[0].cur.Load().nextStreamID.Store(0x7FFFFFFB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := range 8 {
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatalf("request %d: %v (connections=%d): a request that finds the stream IDs used up must go to a new connection, not fail",
+				i+1, err, srv.accepted.Load())
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.clientClosed.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Logf("8 requests: connections=%d closed by the client=%d", srv.accepted.Load(), srv.clientClosed.Load())
+	if n := srv.accepted.Load(); n != 2 {
+		t.Errorf("connections=%d, want 2: one redial when the first connection's stream IDs ran out", n)
+	}
+	if srv.clientClosed.Load() < 1 {
+		t.Error("the client never closed the connection whose stream IDs ran out")
+	}
+}
+
+// uploadWindow is the SETTINGS_INITIAL_WINDOW_SIZE of the servers below: a
+// request body of 2,000 bytes sends 1,000 and then waits for window that the
+// server never grants.
+var uploadWindow = []http2.Setting{{ID: http2.SettingInitialWindowSize, Val: 1000}}
+
+// sendUpload hands one POST with a 2,000-byte body to the client's first
+// connection, as DoRequest does, with a response channel the test owns.
+func sendUpload(t *testing.T, srv *rawH2Server) (*h2Conn, chan h2Response) {
+	t.Helper()
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/upload", testH2Cfg("POST", nil, make([]byte, 2000), 1, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cl.Close)
+	hc := cl.conns[0].cur.Load()
+	ch := make(chan h2Response, 1)
+	hc.writeCh <- h2WriteReq{kind: h2WriteHeaders, block: cl.headerBlock, data: cl.dataPayload, hasBody: true, respCh: &ch}
+	return hc, ch
+}
+
+// TestH2WriteErrorWhileBodyWaitsForWindow: a POST body waits for send window,
+// and the flush it makes while waiting is the connection's first write to
+// fail. The server stays silent and keeps the connection open, so no read
+// fails. The failed flush must end the connection and answer the stream,
+// once, as a failed write anywhere else does (#89). On 2930ded the wait
+// discarded the flush error and polled for window until the run ended, with
+// every worker of the connection stuck behind it.
+func TestH2WriteErrorWhileBodyWaitsForWindow(t *testing.T) {
+	dial := dialTimeoutFunc
+	t.Cleanup(func() { dialTimeoutFunc = dial })
+	dialTimeoutFunc = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+		c, err := dial(network, addr, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return &failWritesConn{Conn: c, okWrites: 3}, nil // the handshake's 3 writes succeed, every later one fails
+	}
+	srv := startRawH2With(t, rawH2Opts{settings: uploadWindow}, func(*rawH2Conn, uint32, string) rawH2Action {
+		return rawKeep // never answer, never grant window
+	})
+	hc, ch := sendUpload(t, srv)
+
+	select {
+	case <-hc.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the flush made while the body waited for window failed, and the client never ended the connection: its writer still polls for window on a connection it cannot write to")
+	}
+	var first h2Response
+	select {
+	case first = <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream whose body could not be written was never answered")
+	}
+	if first.err == nil {
+		t.Fatalf("the stream whose body could not be written was answered with success: %+v", first)
+	}
+	select {
+	case second := <-ch:
+		t.Errorf("the stream was answered twice: %v, then %v", first.err, second.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	t.Logf("answered once: %v", first.err)
+}
+
+// TestH2WindowCreditSentWhileBodyWaitsForWindow: while a POST body waits for
+// send window, the client must still return receive window to the server.
+// The server answers the POST at once with 10,000 bytes of a body it does not
+// end, and never grants window for the upload. The client must credit those
+// bytes to the connection window although its writer is parked in the
+// flow-control wait: a server that waits for that credit before it reads or
+// grants more deadlocks with the client otherwise. On 2930ded the credit was
+// sent only once the wait ended, which it never did.
+func TestH2WindowCreditSentWhileBodyWaitsForWindow(t *testing.T) {
+	const respBody = 10000
+	srv := startRawH2With(t, rawH2Opts{settings: uploadWindow}, func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+		c.headers(sid, false, ":status", "200")
+		c.data(sid, false, respBody, 0)
+		return rawKeep // never end the response, never grant window
+	})
+	sendUpload(t, srv)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.windowCredit.Load() < respBody && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Logf("response bytes received by the client=%d, connection window credited=%d", srv.dataSent.Load(), srv.windowCredit.Load())
+	if got := srv.windowCredit.Load(); got < respBody {
+		t.Errorf("the client credited %d of the %d response bytes it received while its request body waited for window: the writer must send WINDOW_UPDATE while it waits", got, respBody)
+	}
+}
+
+// TestH2RedialBacksOffOnlyWhenTheServerLooksDown: h1client redials a
+// connection the server ended at once, and backs off only when the redial
+// fails (h1client.go DoRequest). HTTP/2 must record a redial the same way. A
+// connection that answered a request and then ended is redialed without the
+// backoff sleep, which would otherwise be charged to the latency of the
+// request that redials; a connection that ended before it answered anything
+// is paced, so a server that accepts and drops every connection is not
+// redialed in a loop. The backoff is set far beyond each context, so a sleep
+// shows as a failed redial.
+func TestH2RedialBacksOffOnlyWhenTheServerLooksDown(t *testing.T) {
+	srv := startRawH2(t, respondOK)
+	host, port := srv.hostPort()
+	newClient := func(t *testing.T) *h2Client {
+		cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cl.Close)
+		return cl
+	}
+	const longBackoff = 20 * time.Second // sleep() jitters it to 10-20 s
+
+	t.Run("answered", func(t *testing.T) {
+		cl := newClient(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		slot := cl.conns[0]
+		slot.cur.Load().failConn(errors.New("test: the server ended the connection"))
+		slot.backoff.next = longBackoff
+		start := time.Now()
+		hc := cl.reconnectSlot(ctx, slot)
+		t.Logf("redial after a connection that answered: %v, connection=%t", time.Since(start), hc != nil)
+		if hc == nil {
+			t.Fatalf("no connection after %v: the redial slept the backoff although the connection it replaces had answered; h1client redials such a connection at once",
+				time.Since(start))
+		}
+	})
+	t.Run("never answered", func(t *testing.T) {
+		cl := newClient(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		slot := cl.conns[0]
+		slot.cur.Load().failConn(errors.New("test: the server dropped the connection before answering"))
+		slot.backoff.next = longBackoff
+		start := time.Now()
+		hc := cl.reconnectSlot(ctx, slot)
+		t.Logf("redial after a connection that never answered: %v, connection=%t", time.Since(start), hc != nil)
+		if hc != nil {
+			t.Fatal("a connection that never answered was redialed without the backoff: a server that drops every connection would be redialed in a loop")
+		}
+	})
+	// Guard: with no sleep in the way, the redial must still not outlive
+	// the run. Benchmarker.Run cancels the context before it calls Close, so
+	// a connection dialed after that would be one Close never sees.
+	t.Run("run over", func(t *testing.T) {
+		cl := newClient(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := cl.DoRequest(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		slot := cl.conns[0]
+		slot.cur.Load().failConn(errors.New("test: the server ended the connection"))
+		cancel()
+		if hc := cl.reconnectSlot(ctx, slot); hc != nil {
+			t.Fatal("a connection was dialed after the run's context ended: Close, which runs after the cancel, never closes it")
+		}
+	})
+}
+
+// TestH2ResponseWithoutAReadableStatusIsNotASuccess: a response counts as a
+// success only when its :status says so, as an HTTP/1.1 response does only
+// with a status line (h1client: "short status line" is an error). A :status
+// sent as a literal with a literal name (RFC 7541 §6.2, name index 0) is a
+// status like any other; a response with no :status, or a HEADERS or DATA
+// frame whose pad length does not fit its payload (RFC 9113 §6.1, §6.2: a
+// connection error), is an error. On 2930ded each of these was a success.
+func TestH2ResponseWithoutAReadableStatusIsNotASuccess(t *testing.T) {
+	literalName := func(first byte, name []byte, huffman bool, value string) []byte {
+		n := byte(len(name))
+		if huffman {
+			n |= 0x80
+		}
+		b := append([]byte{first, n}, name...)
+		return append(append(b, byte(len(value))), value...)
+	}
+	plain, huff := []byte(":status"), hpack.AppendHuffmanString(nil, ":status")
+	srv := startRawH2(t, func(c *rawH2Conn, sid uint32, path string) rawH2Action {
+		endAll := http2.FlagHeadersEndHeaders | http2.FlagHeadersEndStream
+		switch path {
+		case "/literal-name-404": // without indexing, literal name
+			_ = c.fr.WriteRawFrame(http2.FrameHeaders, endAll, sid, literalName(0x00, plain, false, "404"))
+		case "/literal-name-huffman-503": // never indexed, Huffman-coded literal name
+			_ = c.fr.WriteRawFrame(http2.FrameHeaders, endAll, sid, literalName(0x10, huff, true, "503"))
+		case "/literal-name-indexed-502": // incremental indexing, literal name
+			_ = c.fr.WriteRawFrame(http2.FrameHeaders, endAll, sid, literalName(0x40, plain, false, "502"))
+		case "/no-status": // a field block without :status
+			c.headers(sid, true, "content-type", "text/plain")
+		case "/headers-bad-padding": // Pad Length 200 in a 2-byte payload, then :status 200
+			_ = c.fr.WriteRawFrame(http2.FrameHeaders, endAll|http2.FlagHeadersPadded, sid, []byte{200, 0x88})
+		case "/data-bad-padding": // :status 200, then DATA whose Pad Length 50 exceeds its 11-byte payload
+			c.headers(sid, false, ":status", "200")
+			_ = c.fr.WriteRawFrame(http2.FrameData, http2.FlagDataEndStream|http2.FlagDataPadded, sid, append([]byte{50}, make([]byte, 10)...))
+		default:
+			c.ok(sid)
+		}
+		return rawKeep
+	})
+	host, port := srv.hostPort()
+
+	for _, tc := range []struct {
+		path   string
+		status int // 0: a success; -1: an error other than a status
+	}{
+		{"/literal-name-404", 404},
+		{"/literal-name-huffman-503", 503},
+		{"/literal-name-indexed-502", 502},
+		{"/no-status", -1},
+		{"/headers-bad-padding", -1},
+		{"/data-bad-padding", -1},
+		{"/ok", 0},
+	} {
+		n, err := h2Once(t, host, port, tc.path)
+		t.Logf("%-26s status=%d bytes=%d err=%v", tc.path, h2Status(err), n, err)
+		if got := h2Status(err); got != tc.status {
+			t.Errorf("%s: recorded status %d (err=%v), want %d (0: success, -1: an error): a response is a success only when its :status says so",
+				tc.path, got, err, tc.status)
+		}
 	}
 }
