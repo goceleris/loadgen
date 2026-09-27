@@ -1867,7 +1867,8 @@ func TestH2CUpgradeServerThatAnswersOnlyTheUpgradeIsPaced(t *testing.T) {
 // written before the GOAWAY was read (43 and 24 errors). The server never
 // answers a request, so a client that ignored the GOAWAY would wait on its
 // first connection for the whole run: 1 connection and no error, which the
-// floor below fails (fixed code: 10 connections and 10-16 errors in 400 ms).
+// floor below fails. Fixed code, 42 runs: 10-11 connections and 10-17 errors
+// in 400 ms.
 func TestH2ServerThatDropsEveryConnectionShowsErrors(t *testing.T) {
 	srv := startRawH2With(t, rawH2Opts{goAwayAtOnce: true}, func(*rawH2Conn, uint32, string) rawH2Action {
 		return rawKeep
