@@ -164,6 +164,9 @@ type h2Conn struct {
 	// pending streams share a slot.
 	nextStreamID atomic.Uint32
 	streamSlots  []h2StreamSlot
+	// firstStreamID is the connection's first request stream: 1, or 3 on an
+	// h2c-upgraded connection, whose stream 1 is the upgrade request itself.
+	firstStreamID uint32
 
 	// Channel pool — pools *chan h2Response (heap-allocated pointers).
 	// The pointer in the slot remains valid even after the goroutine exits.
@@ -214,8 +217,9 @@ type h2Conn struct {
 	// redials the slot instead. Set before done is closed.
 	closed atomic.Bool
 	// served is set by readLoop once the connection carries a response
-	// frame. reconnectSlot backs off before it replaces a connection that
-	// never did: the server is down or drops every connection.
+	// frame for one of the run's requests (not the h2c upgrade's own stream
+	// 1). reconnectSlot backs off before it replaces a connection that never
+	// did: the server is down or drops every connection.
 	served atomic.Bool
 }
 
@@ -722,11 +726,12 @@ func completeH2Handshake(conn net.Conn, br *bufio.Reader, addr string, maxStream
 	numSlots := 2 * effectiveStreams
 
 	hc := &h2Conn{
-		conn:        conn,
-		framer:      framer,
-		bufWriter:   bw,
-		writeCh:     make(chan h2WriteReq, 4096),
-		streamSlots: make([]h2StreamSlot, numSlots),
+		conn:          conn,
+		framer:        framer,
+		bufWriter:     bw,
+		writeCh:       make(chan h2WriteReq, 4096),
+		streamSlots:   make([]h2StreamSlot, numSlots),
+		firstStreamID: initialStreamID,
 		// DATA-send split = the SERVER's max frame size (not our 64KiB receive cap).
 		maxFrameSize:     serverMaxFrame,
 		serverInitWindow: serverInitWin,
@@ -1034,8 +1039,11 @@ func (hc *h2Conn) readLoop() {
 }
 
 // stream returns the slot of streamID with its response state reset if the
-// slot last held another stream, and marks the connection served. readLoop
-// only.
+// slot last held another stream, and marks the connection served when the
+// stream is one of the run's requests. The h2c upgrade's own stream 1 is not:
+// the server answers it on every upgraded connection (celeris before it even
+// reads the client preface), so it shows nothing about whether the server
+// serves the run. readLoop only.
 func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 	st := &hc.streamSlots[(streamID>>1)%uint32(len(hc.streamSlots))]
 	if st.streamID != streamID {
@@ -1043,7 +1051,7 @@ func (hc *h2Conn) stream(streamID uint32) *h2StreamSlot {
 		st.status = 0
 		st.final = false
 		st.bytes = 0
-		if !hc.served.Load() {
+		if streamID >= hc.firstStreamID && !hc.served.Load() {
 			hc.served.Store(true)
 		}
 	}
