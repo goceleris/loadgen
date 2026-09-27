@@ -391,7 +391,7 @@ empty (`omitempty`).
 | `errors` | int64 | Errors during the measurement window. |
 | `duration` | duration (ns) | Wall-clock measurement duration (post-warmup). |
 | `requests_per_sec` | float64 | `requests / duration.Seconds()`. |
-| `throughput_bps` | float64 | Response-body bytes per second. Accurate for H1; the H2 client currently counts only the last DATA frame of each response, so multi-frame H2 bodies are undercounted. |
+| `throughput_bps` | float64 | Response-body bytes per second, over successful responses: the Content-Length or the chunk sizes for H1, the data of every DATA frame for H2 (padding excluded, as chunk framing is for H1). |
 | `latency` | object | `{avg, min, max, p50, p75, p90, p99, p99_9, p99_99}`, each a duration in ns. |
 | `loadgen_version` | string | loadgen build that produced the run. *(optional)* |
 | `mode` | string | `"saturation"` or `"rated"`. *(optional)* |

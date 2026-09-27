@@ -46,13 +46,25 @@ type connectBackoff struct {
 // cancelled or abort is closed, so Close() and run shutdown are never stuck
 // behind a sleep. A nil abort channel is valid and never fires.
 func (b *connectBackoff) sleep(ctx context.Context, abort <-chan struct{}) bool {
+	return sleepFor(ctx, abort, b.step())
+}
+
+// step returns the current backoff interval, jittered uniformly down to half,
+// and doubles the interval for the following call, capped at
+// reconnectBackoffMax, without sleeping: a caller that owns the backoff under
+// a lock takes the interval there and sleeps it after releasing the lock.
+func (b *connectBackoff) step() time.Duration {
 	d := b.next
 	if d <= 0 {
 		d = reconnectBackoffMin
 	}
 	b.next = min(d*2, reconnectBackoffMax)
+	return d/2 + rand.N(d/2+1) // uniform in [d/2, d]
+}
 
-	d = d/2 + rand.N(d/2+1) // uniform in [d/2, d]
+// sleepFor blocks for d. It returns early — reporting false — when ctx is
+// cancelled or abort is closed. A nil abort channel is valid and never fires.
+func sleepFor(ctx context.Context, abort <-chan struct{}, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

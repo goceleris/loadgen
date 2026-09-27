@@ -22,6 +22,13 @@ const (
 	flagEndStream  = 0x1
 	flagACK        = 0x1
 	flagEndHeaders = 0x4
+	flagPadded     = 0x8  // DATA, HEADERS: Pad Length byte first, that many padding bytes last
+	flagPriority   = 0x20 // HEADERS: 5 bytes of stream dependency and weight before the block
+)
+
+// H2 error codes (RFC 9113 §7) the client sends.
+const (
+	h2ErrCodeCancel = 0x8
 )
 
 // H2 settings IDs.
@@ -51,11 +58,52 @@ func (f *h2Frame) StreamEnded() bool { return f.Flags&flagEndStream != 0 }
 // IsAck reports whether the ACK flag is set (for SETTINGS and PING).
 func (f *h2Frame) IsAck() bool { return f.Flags&flagACK != 0 }
 
-// HeaderBlockFragment returns the header block fragment from a HEADERS frame.
-func (f *h2Frame) HeaderBlockFragment() []byte { return f.payload }
+// HeaderBlockFragment returns the header block fragment from a HEADERS frame,
+// without the padding and priority fields a server may add (RFC 9113 §6.2).
+func (f *h2Frame) HeaderBlockFragment() []byte {
+	p := f.unpadded()
+	if f.Flags&flagPriority != 0 {
+		if len(p) < 5 {
+			return nil
+		}
+		p = p[5:]
+	}
+	return p
+}
 
-// Data returns the data payload from a DATA frame.
-func (f *h2Frame) Data() []byte { return f.payload }
+// unpadded returns the payload of a DATA or HEADERS frame without its Pad
+// Length field and padding. A pad length that does not fit the payload is a
+// PROTOCOL_ERROR (RFC 9113 §6.1); nothing in such a payload is usable.
+func (f *h2Frame) unpadded() []byte {
+	p := f.payload
+	if f.Flags&flagPadded == 0 {
+		return p
+	}
+	if len(p) == 0 || int(p[0]) >= len(p) {
+		return nil
+	}
+	return p[1 : len(p)-int(p[0])]
+}
+
+// badPadding reports a DATA or HEADERS frame whose Pad Length does not fit
+// its payload: a connection error of type PROTOCOL_ERROR (RFC 9113 §6.1,
+// §6.2). Nothing in such a frame can be read (unpadded returns nil).
+func (f *h2Frame) badPadding() bool {
+	return (f.Type == frameData || f.Type == frameHeaders) && f.Flags&flagPadded != 0 &&
+		(len(f.payload) == 0 || int(f.payload[0]) >= len(f.payload))
+}
+
+// badPriority reports a HEADERS frame flagged PRIORITY whose payload, without
+// its padding, is shorter than the 5 bytes of priority fields: a frame size
+// error on a frame that carries a field block, so a connection error (RFC 9113
+// §4.2, §6.2). Check badPadding first.
+func (f *h2Frame) badPriority() bool {
+	return f.Type == frameHeaders && f.Flags&flagPriority != 0 && len(f.unpadded()) < 5
+}
+
+// Data returns the data of a DATA frame, without its padding. Flow control
+// counts the whole payload, padding included (RFC 9113 §6.9.1): use Length.
+func (f *h2Frame) Data() []byte { return f.unpadded() }
 
 // ErrCode returns the error code from a RST_STREAM frame (payload[0:4]).
 func (f *h2Frame) ErrCode() uint32 {
@@ -255,6 +303,19 @@ func (fr *h2Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	fr.wbuf[4] = 0
 	binary.BigEndian.PutUint32(fr.wbuf[5:9], streamID)
 	binary.BigEndian.PutUint32(fr.wbuf[9:13], incr)
+	_, err := fr.bw.Write(fr.wbuf[:13])
+	return err
+}
+
+// WriteRSTStream writes a RST_STREAM frame. Single 13-byte write via wbuf.
+func (fr *h2Framer) WriteRSTStream(streamID, errCode uint32) error {
+	fr.wbuf[0] = 0 // length = 4
+	fr.wbuf[1] = 0
+	fr.wbuf[2] = 4
+	fr.wbuf[3] = frameRSTStream
+	fr.wbuf[4] = 0
+	binary.BigEndian.PutUint32(fr.wbuf[5:9], streamID)
+	binary.BigEndian.PutUint32(fr.wbuf[9:13], errCode)
 	_, err := fr.bw.Write(fr.wbuf[:13])
 	return err
 }
