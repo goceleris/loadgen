@@ -189,10 +189,13 @@ type h2Conn struct {
 	// currently-writing stream's window lives in curStreamWindow keyed by
 	// curStreamID; readLoop replenishes both on WINDOW_UPDATE. Without this a
 	// 64KiB body (post-64k-h2 = 65536 B) exceeds the 65535 window by one byte
-	// and the request hangs until the run ends.
+	// and the request hangs until the run ends. curStreamReset is the ID of
+	// that stream once the server has reset it (RST_STREAM): the body writer
+	// then stops, and sends no RST_STREAM of its own (RFC 9113 §5.4.2).
 	connSendWindow   atomic.Int64
 	curStreamID      atomic.Uint32
 	curStreamWindow  atomic.Int64
+	curStreamReset   atomic.Uint32
 	serverInitWindow uint32
 
 	// Concurrency limit
@@ -908,10 +911,20 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 
 		slotIdx := (streamID >> 1) % numSlots
 		hc.streamSlots[slotIdx].ch.Store(req.respCh)
+		if req.hasBody {
+			// Key the send window to this stream before its HEADERS can reach
+			// the server, which may grant window for it or reset it as soon
+			// as they do.
+			hc.curStreamWindow.Store(int64(hc.serverInitWindow))
+			hc.curStreamID.Store(streamID)
+		}
 
 		err := hc.framer.WriteHeaders(streamID, req.block, !req.hasBody)
 		if err == nil && req.hasBody {
-			err = hc.writeBodyFlowControlled(streamID, req.data)
+			err = hc.writeBodyFlowControlled(streamID, &hc.streamSlots[slotIdx], req.respCh, req.data)
+			if err == errH2BodyAbandoned {
+				return // the server ended the stream, and its worker has the answer; the connection is fine
+			}
 		}
 		// Whoever takes respCh out of the slot answers it, exactly once:
 		// readLoop may have taken it first (a response, a reset, or
@@ -1005,6 +1018,9 @@ func (hc *h2Conn) readLoop() {
 			}
 
 		case frameRSTStream:
+			if frame.StreamID == hc.curStreamID.Load() {
+				hc.curStreamReset.Store(frame.StreamID) // before the answer: the body writer reads them in the other order
+			}
 			idx := (frame.StreamID >> 1) % numSlots
 			chPtr := hc.streamSlots[idx].ch.Swap(nil)
 			if chPtr != nil {
@@ -1239,23 +1255,27 @@ func (hc *h2Conn) finish(chPtr *chan h2Response, resp h2Response) (int, error) {
 	return resp.bytesRead, nil
 }
 
+// errH2BodyAbandoned is writeBodyFlowControlled's report of a body it stopped
+// because the server ended the stream first. Not an error: the stream's worker
+// already has its answer, and the connection is fine.
+var errH2BodyAbandoned = errors.New("h2client: request body abandoned: the server ended the stream")
+
 // writeBodyFlowControlled sends a request body as DATA frames, respecting BOTH
 // the server's SETTINGS_MAX_FRAME_SIZE and its connection + per-stream send
 // windows (RFC 7540 §6.9). The writer goroutine is sequential (one body at a
 // time), so the active stream's window lives in hc.curStreamWindow keyed by
-// hc.curStreamID; readLoop replenishes connSendWindow/curStreamWindow on
-// WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
-// server can consume + replenish) and poll — no extra goroutine/channel. The
-// wait ends when that flush fails, or when the connection is closed (done),
-// which Close does at the end of a run and failConn when the connection dies:
-// that is the backstop against a peer that never grants window.
+// hc.curStreamID (processWriteReq keys them); readLoop replenishes
+// connSendWindow/curStreamWindow on WINDOW_UPDATE. When a window is exhausted
+// we flush the buffered frames (so the server can consume + replenish) and
+// poll — no extra goroutine/channel. The wait ends when that flush fails, when
+// the connection is closed (done), which Close does at the end of a run and
+// failConn when the connection dies, or when the server has ended the stream
+// (st no longer holds respCh): the backstops against a peer that never grants
+// window.
 //
 // Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
 // (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
-func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
-	hc.curStreamWindow.Store(int64(hc.serverInitWindow))
-	hc.curStreamID.Store(streamID)
-
+func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, st *h2StreamSlot, respCh *chan h2Response, data []byte) error {
 	maxFrame := int(hc.maxFrameSize)
 	if maxFrame < 16384 {
 		maxFrame = 16384
@@ -1269,6 +1289,24 @@ func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
 			avail = sw
 		}
 		if avail <= 0 {
+			select {
+			case <-hc.done:
+				return fmt.Errorf("h2client: conn closed mid-body (flow-control wait)")
+			default:
+			}
+			// The server has answered or reset the stream (readLoop took its
+			// channel out of the slot): RFC 9113 §8.1 lets it answer before
+			// the body is complete. It grants no more window for a stream it
+			// has ended, so stop the body here instead of waiting for the run
+			// to end with every later request of the connection queued
+			// behind this one. A response that ended without a reset leaves
+			// our half of the stream open: close it with RST_STREAM(CANCEL).
+			if respCh != nil && st.ch.Load() != respCh {
+				if hc.curStreamReset.Load() != streamID {
+					_ = hc.framer.WriteRSTStream(streamID, h2ErrCodeCancel)
+				}
+				return errH2BodyAbandoned
+			}
 			// Window exhausted: flush so the peer receives what we've sent and
 			// can send WINDOW_UPDATE, then wait for readLoop to replenish.
 			// The flush carries the receive window readLoop has credited
@@ -1279,11 +1317,6 @@ func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
 			hc.flushWindowUpdate()
 			if err := hc.bufWriter.Flush(); err != nil {
 				return err
-			}
-			select {
-			case <-hc.done:
-				return fmt.Errorf("h2client: conn closed mid-body (flow-control wait)")
-			default:
 			}
 			time.Sleep(50 * time.Microsecond)
 			continue

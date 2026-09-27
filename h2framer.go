@@ -26,6 +26,11 @@ const (
 	flagPriority   = 0x20 // HEADERS: 5 bytes of stream dependency and weight before the block
 )
 
+// H2 error codes (RFC 9113 §7) the client sends.
+const (
+	h2ErrCodeCancel = 0x8
+)
+
 // H2 settings IDs.
 const (
 	settingHeaderTableSize      = 0x1
@@ -290,6 +295,19 @@ func (fr *h2Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	fr.wbuf[4] = 0
 	binary.BigEndian.PutUint32(fr.wbuf[5:9], streamID)
 	binary.BigEndian.PutUint32(fr.wbuf[9:13], incr)
+	_, err := fr.bw.Write(fr.wbuf[:13])
+	return err
+}
+
+// WriteRSTStream writes a RST_STREAM frame. Single 13-byte write via wbuf.
+func (fr *h2Framer) WriteRSTStream(streamID, errCode uint32) error {
+	fr.wbuf[0] = 0 // length = 4
+	fr.wbuf[1] = 0
+	fr.wbuf[2] = 4
+	fr.wbuf[3] = frameRSTStream
+	fr.wbuf[4] = 0
+	binary.BigEndian.PutUint32(fr.wbuf[5:9], streamID)
+	binary.BigEndian.PutUint32(fr.wbuf[9:13], errCode)
 	_, err := fr.bw.Write(fr.wbuf[:13])
 	return err
 }
