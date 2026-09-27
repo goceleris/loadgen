@@ -48,7 +48,8 @@ type Config struct {
 
 	// Headers are custom HTTP headers added to every request.
 	// The Connection header is managed automatically based on
-	// DisableKeepAlive and should not be set here. For HTTP/2,
+	// DisableKeepAlive and should not be set here: the HTTP/1.1 client
+	// drops a Connection header given here, in any letter case. For HTTP/2,
 	// hop-by-hop headers (Connection, Keep-Alive, etc.) are
 	// automatically stripped per RFC 9113.
 	Headers map[string]string
@@ -59,7 +60,8 @@ type Config struct {
 
 	// Connections is the number of TCP connections for HTTP/1.1 mode.
 	// Each worker owns one connection in keep-alive mode. In close mode,
-	// each worker owns PoolSize connections and round-robins through them.
+	// each worker owns PoolSize connection slots and every request travels
+	// on a connection of its own (see DisableKeepAlive).
 	// Must be >= 1 when HTTP2 is false. Default: 256.
 	Connections int
 
@@ -80,9 +82,18 @@ type Config struct {
 	Warmup time.Duration
 
 	// DisableKeepAlive disables HTTP keep-alive (Connection: close mode).
-	// When true, the server closes connections after each response and
-	// the client round-robins through a pool of PoolSize connections per
-	// worker to hide reconnection latency. Default: false (keep-alive on).
+	// When true, every HTTP/1.1 request carries Connection: close and
+	// travels on a connection of its own: after the response the client
+	// lets the server close the connection, off the measured latency
+	// (over TLS it answers the server's close_notify with its own; a
+	// server whose TCP FIN has not arrived within 50ms gets a reset, so
+	// the loadgen host keeps no TIME_WAIT), and
+	// the next request dials a fresh one. The dial is part of that
+	// request, so it is inside its measured latency, including any SYN
+	// retransmission (1s or more) when the server's accept queue is full.
+	// The close is expected and is never counted as an error; a refused
+	// dial, a reset or a truncated body is.
+	// Default: false (keep-alive on).
 	DisableKeepAlive bool
 
 	// HTTP2 enables HTTP/2 over cleartext (h2c) mode.
@@ -129,8 +140,10 @@ type Config struct {
 	// Default: 256KB for HTTP/1.1, 2MB for HTTP/2. Must be non-negative.
 	WriteBufferSize int
 
-	// PoolSize is the number of connections per worker in Connection: close mode.
-	// Workers round-robin through the pool so reconnection latency is hidden.
+	// PoolSize is the number of connection slots per worker in
+	// Connection: close mode. New dials every slot up front, and the first
+	// request on each slot uses that connection; after it, each request
+	// dials a fresh connection, so the pool does not hide the dial.
 	// Only used when DisableKeepAlive is true. Default: 16.
 	PoolSize int
 
@@ -637,6 +650,10 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	if b.config.Warmup > 0 {
 		b.warmupRec = b.latencies.Load()
 		b.errorsBase = b.errors.Load()
+		// Result.CloseAborts covers the measured window only.
+		if a := h1CloseAborts(b.raw); a != nil {
+			a.Store(0)
+		}
 		b.warmupStats = &WarmupStats{
 			Errors:        b.errorsBase,
 			ConnectErrors: snapshotConnectErrors(),
@@ -1051,6 +1068,20 @@ func (b *Benchmarker) worker(ctx context.Context, workerID int) {
 	}
 }
 
+// h1CloseAborts returns the close-abort counter of c's HTTP/1.1 client (c
+// itself, or a -mix run's h1 sub-client), or nil when c has none.
+func h1CloseAborts(c Client) *atomic.Uint64 {
+	switch c := c.(type) {
+	case *h1Client:
+		return c.closeAborts
+	case *mixClient:
+		if h1c, ok := c.h1.(*h1Client); ok {
+			return h1c.closeAborts
+		}
+	}
+	return nil
+}
+
 func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	rec := b.latencies.Load()
 	reqs, bytesRead := rec.Totals()
@@ -1072,6 +1103,9 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 		DialRetries:    snapshotDialRetries(),
 		ConnectErrors:  snapshotConnectErrors(),
 		Warmup:         b.warmupStats,
+	}
+	if a := h1CloseAborts(b.raw); a != nil {
+		res.CloseAborts = a.Load()
 	}
 
 	if hist, err := rec.EncodeHistogram(); err == nil {

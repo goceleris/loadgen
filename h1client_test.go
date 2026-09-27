@@ -116,8 +116,10 @@ func TestH1KeepAlive(t *testing.T) {
 }
 
 func TestH1ConnectionClose(t *testing.T) {
+	var accepted atomic.Int64
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()
+		accepted.Add(1)
 		reader := bufio.NewReader(conn)
 		if !readH1Request(reader) {
 			return
@@ -136,15 +138,22 @@ func TestH1ConnectionClose(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
-	// Send multiple requests; client should reconnect via round-robin pool
-	for i := range 5 {
+	// Three full cycles of the worker's pool plus one, so every slot is
+	// reused: a slot whose connection the server closed must dial a fresh
+	// one for its next request (loadgen#87). With fewer requests than
+	// PoolSize no slot is reused and the test cannot fail.
+	numRequests := 3*cfg.PoolSize + 1
+	for i := range numRequests {
 		n, err := client.DoRequest(ctx, 0)
 		if err != nil {
-			t.Fatalf("request %d: %v", i, err)
+			t.Fatalf("request %d of %d: %v", i+1, numRequests, err)
 		}
 		if n != 2 {
-			t.Fatalf("request %d: bytesRead=%d, want 2", i, n)
+			t.Fatalf("request %d: bytesRead=%d, want 2", i+1, n)
 		}
+	}
+	if a := accepted.Load(); a != int64(numRequests) {
+		t.Errorf("server accepted %d connections for %d close-mode requests, want one per request", a, numRequests)
 	}
 }
 
@@ -217,9 +226,11 @@ func TestH1Chunked(t *testing.T) {
 
 func TestH1Reconnect(t *testing.T) {
 	// Test reconnect via Connection: close mode. The server closes each
-	// connection after responding. The client's round-robin pool ensures
-	// that when Write() hits a broken pipe on a closed slot, it reconnects
-	// and retries successfully. Multiple requests prove the pool recovers.
+	// connection after responding. Every slot of the worker's pool is
+	// reused (3 full cycles plus one), so a request lands on a slot whose
+	// previous connection the server has closed; it must succeed on a
+	// fresh connection. With fewer requests than PoolSize no slot is
+	// reused and reconnect is never exercised (loadgen#87).
 	var requestCount atomic.Int64
 
 	host, port, cleanup := startH1Server(t, func(conn net.Conn) {
@@ -244,7 +255,7 @@ func TestH1Reconnect(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
-	const numRequests = 10
+	numRequests := 3*cfg.PoolSize + 1
 	for i := range numRequests {
 		n, err := client.DoRequest(ctx, 0)
 		if err != nil {
@@ -641,6 +652,12 @@ func TestH1ReconnectBackoffCtxAbort(t *testing.T) {
 	}
 	kill()
 
+	// The first request after the kill reads the EOF of the connection the
+	// server closed; the redial happens on the next request.
+	if _, err := client.DoRequest(context.Background(), 0); err == nil {
+		t.Fatal("expected an error on the connection the dead server closed")
+	}
+
 	// Force the next failure onto a long backoff sleep, then cancel.
 	client.conns[0].backoff.next = 2 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -654,5 +671,8 @@ func TestH1ReconnectBackoffCtxAbort(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Errorf("DoRequest took %v — ctx cancellation did not abort the backoff sleep", elapsed)
+	}
+	if ctx.Err() == nil {
+		t.Errorf("DoRequest returned after %v, before ctx expired: the backoff sleep was never entered", elapsed)
 	}
 }

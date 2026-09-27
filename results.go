@@ -63,6 +63,19 @@ type Result struct {
 	// Errors unchanged.
 	ConnectErrors uint64 `json:"connect_errors,omitempty"`
 
+	// CloseAborts counts the HTTP/1.1 connections that were done (close
+	// mode, or a response carrying Connection: close) and that the client
+	// reset because the server's TCP FIN had not arrived 50ms after the
+	// response: about one per request for a server that ignores
+	// Connection: close, and otherwise a server that closes late or resets
+	// first. Zero for a server that closes as asked. It explains client
+	// resets seen on the server side; no request is counted differently
+	// for it. Counted when the 50ms wait ends: connections still waiting
+	// when Run builds the Result (the last 50ms of the run) are not
+	// included, and those of the warmup's last 50ms can be. Measured window
+	// only; H1 client (and a -mix run's H1 share) only.
+	CloseAborts uint64 `json:"close_aborts,omitempty"`
+
 	// Warmup, when non-nil, summarises the warmup phase, whose counters
 	// are otherwise reset away before the measured run begins. A warmup
 	// with zero requests and nonzero errors means the target was never

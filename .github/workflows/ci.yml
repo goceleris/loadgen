@@ -46,8 +46,11 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
+      # -v prints every test's verdict, so a job log shows which tests ran
+      # rather than one line per package. The root package takes ~110 s
+      # under -race on a hosted runner; 300 s leaves room for a slow one.
       - name: Run tests
-        run: go test -race -count=1 -timeout 120s ./...
+        run: go test -race -count=1 -timeout 300s -v ./...
 
   # govulncheck reports a known vulnerability only when this code can reach
   # the vulnerable symbol, and exits non-zero (3) when it finds one. It runs

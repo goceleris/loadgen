@@ -187,7 +187,7 @@ streaming drivers (`-mode`) are mutually exclusive: a run is one or the other.
 
 | Mode | Flag | What it measures |
 | --- | --- | --- |
-| **HTTP/1.1** (default) | *(none)* | Baseline request/response throughput. One persistent TCP connection per worker, pre-formatted request bytes written with a single write call. For `Connection: close` workloads (`-close`), each worker round-robins a pool of `PoolSize` (16) connections and redials a closed one in line. |
+| **HTTP/1.1** (default) | *(none)* | Baseline request/response throughput. One persistent TCP connection per worker, pre-formatted request bytes written with a single write call. With `-close`, every request carries `Connection: close` and travels on a connection of its own: after the response the server closes the connection (over TLS the client answers the server's `close_notify` with its own; a server that still keeps the TCP connection open is reset by the client after 50 ms, so the loadgen host keeps no `TIME_WAIT`), and the next request dials a fresh one, a dial that counts in that request's latency, including any SYN retransmission (1 s or more) when the server's accept queue is full. The expected close is never counted as an error. |
 | **HTTP/2** | `-h2` | Multiplexed throughput. Prior-knowledge h2c, or h2 over TLS (ALPN offers `h2`): workers share connections and dispatch streams lock-free, with pre-encoded HPACK headers and batched `WINDOW_UPDATE`. |
 | **h2c upgrade** | `-h2c-upgrade` | The RFC 7540 §3.2 cleartext upgrade path. Each connection starts as HTTP/1.1 carrying `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c`, reads `101 Switching Protocols`, then switches to HTTP/2 on the same socket. Exercises the handshake that `-h2` skips. Cleartext only: TLS servers negotiate H2 via ALPN. |
 | **Protocol mix** | `-mix h1:h2:upgrade=N:N:N` | A traffic blend. Each worker is assigned a protocol by a weighted draw (seeded from the weights, so repeated runs assign the same way) and keeps it for the whole run. |
@@ -403,6 +403,7 @@ empty (`omitempty`).
 | `recvq_high` | bool | True when the receive-queue probe latched (loadgen-side backpressure). *(optional)* |
 | `dial_retries` | uint64 | TCP SYN retries after an RST (listener-replacement / engine-switch window). *(optional)* |
 | `connect_errors` | uint64 | Dial/handshake failures (TCP, TLS, WS/SSE upgrade, H1 reconnect). *(optional)* |
+| `close_aborts` | uint64 | H1 connections that were done (`-close`, or a response with `Connection: close`) and that the client reset because the server's FIN had not come 50 ms after the response: about one per request for a server that ignores `Connection: close`. *(optional)* |
 | `timeseries` | array | 1-second snapshots: `{t, rps, p99_ms, errors, connect_errors}`. *(optional)* |
 | `warmup` | object | Warmup-phase `{requests, errors, connect_errors}`; a zero-request, nonzero-error warmup means the target was never healthy. *(optional)* |
 | `upgrade` | object | h2c-upgrade handshake tally (`-h2c-upgrade`). *(optional)* |
@@ -470,9 +471,10 @@ attestation and will fail verification.
 
 ### H1 worker model
 
-Each worker owns a dedicated TCP connection (keep-alive) or a round-robin pool (`Connection: close`,
-`PoolSize` = 16). The request bytes are built once and written with a single write call. There is no
-synchronization between workers.
+Each worker owns a dedicated TCP connection (keep-alive). With `Connection: close`, each worker owns
+`PoolSize` (16) connection slots, dialed up front, and every request travels on a connection of its own.
+A connection the server closes, or announces it will close, never carries another request. The request bytes are
+built once and written with a single write call. There is no synchronization between workers.
 
 ### H2 multiplexed model
 
@@ -545,7 +547,7 @@ Beyond the flags above, the library `Config` exposes knobs the CLI leaves at the
 | --- | --- | --- |
 | `DialTimeout` | `10s` | TCP connect / reconnect timeout. |
 | `ReadBufferSize` / `WriteBufferSize` | 256 KB (H1), 2 MB (H2) | Kernel socket buffer sizes (`SO_RCVBUF` / `SO_SNDBUF`) for the H1 and H2 clients. |
-| `PoolSize` | `16` | Connections per worker in `Connection: close` mode. |
+| `PoolSize` | `16` | Connection slots per worker in `Connection: close` mode, dialed up front. After a slot's first request, each request dials a fresh connection, so the pool does not hide the dial. |
 | `MaxResponseSize` | 10 MB | Cap on response-body bytes read by the H1 client (a larger response is an error); `-1` for unlimited. |
 | `TLSConfig` | | Client certs, custom CA pool, or cipher suites for the H1 and H2 clients over HTTPS (the WebSocket and SSE drivers do not use it). |
 
