@@ -111,7 +111,9 @@ const scriptedOK = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
 // request read the rest of the broken response as its own. On main the
 // short status line and both MaxResponseSize cases left the connection in
 // the slot, and for a Content-Length body drainH1Response read the body as
-// header lines.
+// header lines. MaxResponseSize bounds a 4xx/5xx body too: the client does
+// not read an error body over the limit (a huge or endless one would hold
+// the worker), so that connection is closed as well.
 func TestH1FaultDropsConnection(t *testing.T) {
 	over := "\r\n" + strings.Repeat("x", 98) // 100 bytes; starts with an empty "line"
 	for _, tc := range []struct {
@@ -125,6 +127,9 @@ func TestH1FaultDropsConnection(t *testing.T) {
 		{"MaxResponseSize/content-length", scriptedReply{resp: "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + over}, 16, "exceeds MaxResponseSize"},
 		{"MaxResponseSize/chunked", scriptedReply{resp: "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n" +
 			strings.Repeat("x", 100) + "\r\n0\r\n\r\n"}, 16, "exceeds MaxResponseSize"},
+		{"MaxResponseSize/error-content-length", scriptedReply{resp: "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\n" + over}, 16, "status 500"},
+		{"MaxResponseSize/error-chunked", scriptedReply{resp: "HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n" +
+			strings.Repeat("x", 100) + "\r\n0\r\n\r\n"}, 16, "status 503"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := startScriptedH1Server(t, func(conn, req int) scriptedReply {
@@ -156,7 +161,7 @@ func TestH1FaultDropsConnection(t *testing.T) {
 				}
 			}
 			if a := srv.accepted.Load(); a != 2 {
-				t.Errorf("server accepted %d connections, want 2 (the broken response's connection closed, the next one reused)", a)
+				t.Errorf("server accepted %d connections, want 2: the first response's connection must be closed, not reused", a)
 			}
 			if h := srv.handled.Load(); h != 3 {
 				t.Errorf("server handled %d of 3 requests", h)
