@@ -616,7 +616,14 @@ func (hc *h1Conn) finish() {
 // The goroutine waits for the server's TCP FIN, at most hc.peerCloseWait
 // (see serverClosed):
 //   - The FIN arrives (the server closes, as Connection: close asks): the
-//     client closes after it, so the server holds the TIME_WAIT.
+//     client closes after it, so the client keeps no TIME_WAIT; over plain
+//     TCP the server holds it. Over TLS, a server that close()s its socket
+//     right behind its close_notify (crypto/tls Conn.Close does) is no
+//     longer reading when the client's close_notify arrives, so its kernel
+//     answers that close_notify with an RST (Linux counts it in
+//     TCPAbortOnData) and neither side keeps a TIME_WAIT. The close_notify
+//     is still sent: RFC 5246 §7.2.1 and RFC 8446 §6.1 require it, and a
+//     server doing a bidirectional shutdown waits for it (serverClosed).
 //   - Anything else, normally the bound expiring on a server that keeps
 //     the connection open: the client resets the connection (abortClose),
 //     so neither side keeps a TIME_WAIT. A FIN from the client first would
@@ -645,17 +652,20 @@ func (hc *h1Conn) closeAfterPeer() {
 // serverClosed reads conn until the server's TCP FIN and reports whether
 // it arrived before conn's read deadline; anything else (the deadline, a
 // byte, a reset) is false. Over TLS, Read returns io.EOF at the server's
-// close_notify alert whether or not its FIN has arrived: a server doing a
-// bidirectional shutdown waits for the client's close_notify before it
-// closes, and one whose FIN travels in a later segment would see the
-// client close first. So after the TLS EOF the raw TCP connection is read
-// until its own EOF, under the same deadline.
+// close_notify alert whether or not its FIN has arrived, and one whose FIN
+// travels in a later segment would see the client close first. So after
+// the TLS EOF the client sends its own close_notify (CloseWrite: the alert
+// only, no TCP FIN), as RFC 5246 §7.2.1 and RFC 8446 §6.1 require, and then
+// reads the raw TCP connection until its own EOF, under the same deadline.
+// A server doing a bidirectional shutdown closes TCP only once that
+// close_notify arrives; without it, its FIN would never come.
 func serverClosed(conn net.Conn) bool {
 	var b [1]byte
 	if _, err := conn.Read(b[:]); !errors.Is(err, io.EOF) {
 		return false
 	}
 	if tc, ok := conn.(*tls.Conn); ok {
+		_ = tc.CloseWrite()
 		if _, err := tc.NetConn().Read(b[:]); !errors.Is(err, io.EOF) {
 			return false
 		}
@@ -665,9 +675,9 @@ func serverClosed(conn net.Conn) bool {
 
 // abortClose closes conn with an RST instead of a FIN (SO_LINGER 0), so
 // the client keeps no TIME_WAIT for it. Over TLS, Close writes a
-// close_notify alert into the socket first, but the linger-0 close then
-// discards whatever of it is still unsent, so the alert may never reach
-// the wire.
+// close_notify alert into the socket first (unless serverClosed already
+// sent one), but the linger-0 close then discards whatever of it is still
+// unsent, so the alert may never reach the wire.
 func abortClose(conn net.Conn) {
 	raw := conn
 	if tc, ok := conn.(*tls.Conn); ok {

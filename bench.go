@@ -83,9 +83,10 @@ type Config struct {
 	// DisableKeepAlive disables HTTP keep-alive (Connection: close mode).
 	// When true, every HTTP/1.1 request carries Connection: close and
 	// travels on a connection of its own: after the response the client
-	// lets the server close the connection, off the measured latency (a
-	// server whose TCP FIN has not arrived within 50ms, TLS close_notify
-	// or not, gets a reset, so the loadgen host keeps no TIME_WAIT), and
+	// lets the server close the connection, off the measured latency
+	// (over TLS it answers the server's close_notify with its own; a
+	// server whose TCP FIN has not arrived within 50ms gets a reset, so
+	// the loadgen host keeps no TIME_WAIT), and
 	// the next request dials a fresh one. The dial is part of that
 	// request, so it is inside its measured latency, including any SYN
 	// retransmission (1s or more) when the server's accept queue is full.
