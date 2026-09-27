@@ -415,7 +415,7 @@ empty (`omitempty`).
 GitHub Releases ship platform tarballs that orchestrators can fetch directly:
 
 ```bash
-TAG=v1.4.13
+TAG=v1.4.14
 OS=linux
 ARCH=amd64
 curl -fsSL "https://github.com/goceleris/loadgen/releases/download/${TAG}/loadgen_${OS}_${ARCH}.tar.gz" \
