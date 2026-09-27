@@ -1070,9 +1070,9 @@ func (hc *h2Conn) finish(chPtr *chan h2Response, resp h2Response) (int, error) {
 // hc.curStreamID; readLoop replenishes connSendWindow/curStreamWindow on
 // WINDOW_UPDATE. When a window is exhausted we flush the buffered frames (so the
 // server can consume + replenish) and poll — no extra goroutine/channel. The
-// wait ends when the connection is closed (done), which Close does at the end
-// of a run and failConn when the connection dies: that is the backstop
-// against a peer that never grants window.
+// wait ends when that flush fails, or when the connection is closed (done),
+// which Close does at the end of a run and failConn when the connection dies:
+// that is the backstop against a peer that never grants window.
 //
 // Without this, a 64KiB body (post-64k-h2 = 65536 B) either trips FRAME_SIZE_ERROR
 // (64KiB DATA frame vs a 16384-default server) or overruns the 65535 window.
@@ -1095,7 +1095,15 @@ func (hc *h2Conn) writeBodyFlowControlled(streamID uint32, data []byte) error {
 		if avail <= 0 {
 			// Window exhausted: flush so the peer receives what we've sent and
 			// can send WINDOW_UPDATE, then wait for readLoop to replenish.
-			_ = hc.bufWriter.Flush()
+			// The flush carries the receive window readLoop has credited
+			// meanwhile, as writeLoop's own flushes do: a peer that waits for
+			// that credit before it grants ours would otherwise deadlock with
+			// this wait. A failed flush ends the wait and, through the
+			// caller's writeFailed, the connection (#89).
+			hc.flushWindowUpdate()
+			if err := hc.bufWriter.Flush(); err != nil {
+				return err
+			}
 			select {
 			case <-hc.done:
 				return fmt.Errorf("h2client: conn closed mid-body (flow-control wait)")
