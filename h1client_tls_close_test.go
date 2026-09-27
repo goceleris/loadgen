@@ -1,12 +1,15 @@
 package loadgen
 
-// The close of a done connection over TLS (loadgen#87, PR #90 review round
-// 3). Over TLS, the client's Read returns io.EOF when the server's
+// The close of a done connection over TLS (loadgen#87, PR #90 review rounds
+// 3 and 4). Over TLS, the client's Read returns io.EOF when the server's
 // close_notify alert arrives, whether or not its TCP FIN has. A client that
 // takes that EOF for the FIN closes first: it keeps the TIME_WAIT, or holds
 // its port in FIN_WAIT_2 until the server closes. So the client must wait
 // for the TCP FIN itself, and reset a connection whose FIN does not come,
-// as it does over plain TCP.
+// as it does over plain TCP. And it must answer the server's close_notify
+// with its own (RFC 5246 §7.2.1, RFC 8446 §6.1) while it waits, without a
+// TCP FIN: a server doing a bidirectional shutdown closes TCP only once
+// that close_notify arrives.
 
 import (
 	"bufio"
@@ -32,17 +35,26 @@ import (
 type tlsTeardown int
 
 const (
-	// tlsNotifyThenFIN sends close_notify, waits up to lateCloseDelay for
-	// the client to send or close anything, then closes TCP. Which side
-	// acted first is recorded in clientClosedFirst / serverClosedFirst.
+	// tlsNotifyThenFIN sends close_notify, then reads for lateCloseDelay
+	// before it closes TCP. The client's close_notify (data) may arrive in
+	// that time; a TCP close from the client (a FIN or a reset) before the
+	// server's means the client closed first. Which side closed TCP first
+	// is recorded in clientClosedFirst / serverClosedFirst.
 	tlsNotifyThenFIN tlsTeardown = iota
 	// tlsNotifyAndFIN sends close_notify and a TCP FIN (half-close) at
 	// once, then reads until the client closes.
 	tlsNotifyAndFIN
-	// tlsNotifyKeepTCP sends close_notify and keeps TCP open, reading until
-	// the client closes: a bidirectional shutdown (SSL_shutdown waiting for
-	// the peer's close_notify) never closes first.
+	// tlsNotifyKeepTCP sends close_notify and keeps TCP open, reading (and
+	// ignoring the client's close_notify) until the client closes TCP: a
+	// server that never closes the connection.
 	tlsNotifyKeepTCP
+	// tlsBidirectional sends close_notify, reads until the client's
+	// close_notify, and only then closes TCP (a half-close, so it can go on
+	// reading to see how the client ends the connection): a bidirectional
+	// shutdown, SSL_shutdown called again to wait for the peer's
+	// close_notify. A client that sends no close_notify of its own never
+	// sees this server's FIN.
+	tlsBidirectional
 	// tlsKeepOpen sends nothing after the response and keeps the
 	// connection open, answering any further request on it, until the
 	// client closes: a server that ignores Connection: close.
@@ -60,8 +72,9 @@ type tlsCloseServer struct {
 	handled           atomic.Int64
 	clientClosed      atomic.Int64 // the client ended the connection (FIN or RST) while the server read
 	clientReset       atomic.Int64 // ... with an RST
-	clientClosedFirst atomic.Int64 // tlsNotifyThenFIN: the client sent or closed before the server's FIN
+	clientClosedFirst atomic.Int64 // tlsNotifyThenFIN: the client closed TCP before the server's FIN
 	serverClosedFirst atomic.Int64 // tlsNotifyThenFIN: the server's FIN went first
+	notifyReceived    atomic.Int64 // tlsBidirectional: the client's close_notify arrived
 }
 
 // testTLSConfig is a server config with a fresh self-signed certificate for
@@ -131,13 +144,29 @@ func startTLSCloseServer(t *testing.T, mode tlsTeardown, resp string) *tlsCloseS
 		_ = tc.CloseWrite() // close_notify only; the TCP connection stays open
 		switch mode {
 		case tlsNotifyThenFIN:
+			// Only the deadline ends the read with the client's TCP
+			// connection still open; drainRaw consumes its close_notify,
+			// so the server's close is a FIN, not a reset for unread data.
 			_ = raw.SetReadDeadline(time.Now().Add(lateCloseDelay))
-			var b [1]byte
-			if _, err := raw.Read(b[:]); errors.Is(err, os.ErrDeadlineExceeded) {
+			if err := drainRaw(raw); errors.Is(err, os.ErrDeadlineExceeded) {
 				s.serverClosedFirst.Add(1)
 			} else {
 				s.clientClosedFirst.Add(1)
 			}
+		case tlsBidirectional:
+			// The deadline only stops a client that never answers from
+			// holding this goroutine; the client's own bound is 50ms.
+			_ = raw.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.Copy(io.Discard, tc); err != nil {
+				s.clientGone(err) // TCP ended (a reset) without a close_notify
+				return
+			}
+			s.notifyReceived.Add(1)
+			_ = raw.SetReadDeadline(time.Time{})
+			if tcp, ok := raw.(*net.TCPConn); ok {
+				_ = tcp.CloseWrite()
+			}
+			s.clientGone(drainRaw(raw))
 		case tlsNotifyAndFIN:
 			if tcp, ok := raw.(*net.TCPConn); ok {
 				_ = tcp.CloseWrite()
@@ -224,7 +253,13 @@ func TestH1TLSServerClosesFirst(t *testing.T) {
 // a done TLS connection, by what the server does after its response.
 //   - close_notify and FIN together: the client closes after the FIN, with
 //     no reset (the server keeps the TIME_WAIT).
-//   - close_notify, TCP kept open (bidirectional shutdown): the client
+//   - bidirectional shutdown (close_notify, then TCP closed once the
+//     client's close_notify arrives): the client answers with its own
+//     close_notify, the server closes TCP first, and the client closes
+//     after it, with no reset. On PR #90's round-3 code the client sent no
+//     close_notify until it closed, so it reset every such connection after
+//     the bound.
+//   - close_notify, TCP kept open whatever the client sends: the client
 //     resets once the bound passes. A FIN would put the TIME_WAIT on the
 //     loadgen host.
 //   - nothing, connection kept open (Connection: close ignored): the client
@@ -236,6 +271,7 @@ func TestH1TLSCloseTeardown(t *testing.T) {
 		wantReset bool
 	}{
 		{"close_notify+FIN", tlsNotifyAndFIN, false},
+		{"bidirectional", tlsBidirectional, false},
 		{"close_notify,TCP-kept-open", tlsNotifyKeepTCP, true},
 		{"kept-open", tlsKeepOpen, true},
 	} {
@@ -256,6 +292,12 @@ func TestH1TLSCloseTeardown(t *testing.T) {
 			}
 			r := srv.clientReset.Load()
 			t.Logf("client ended %d connections, %d of them with a reset", srv.clientClosed.Load(), r)
+			if tc.mode == tlsBidirectional {
+				// Not asserted: a client that resets also writes its
+				// close_notify just before the reset, so the count cannot
+				// tell the two apart; the reset count above does.
+				t.Logf("the client's close_notify reached the server on %d of %d connections", srv.notifyReceived.Load(), n)
+			}
 			if tc.wantReset && r != n {
 				t.Errorf("client reset %d of %d connections the server kept open; the rest it closed with a FIN, "+
 					"which leaves a TIME_WAIT on the loadgen host", r, n)
@@ -264,9 +306,10 @@ func TestH1TLSCloseTeardown(t *testing.T) {
 			// goroutine descheduled for longer than the bound between
 			// its close_notify and its FIN on a loaded runner.
 			if !tc.wantReset && r > 1 {
-				t.Errorf("client reset %d of %d connections whose server sent close_notify and FIN together: "+
-					"it did not wait for the TCP FIN", r, n)
+				t.Errorf("client reset %d of %d connections whose server closes TCP (%s): "+
+					"it did not wait for the TCP FIN, or never sent the close_notify the server waits for", r, n, tc.name)
 			}
+
 		})
 	}
 }
