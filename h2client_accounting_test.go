@@ -2287,6 +2287,138 @@ func TestH2RedialTakesTheResponseTheConnectionHadReceived(t *testing.T) {
 	}
 }
 
+// endsAfterFirstCheck is a context that ends as its first Err returns: the
+// run's context ending just after a check of it. That first Err closes Done
+// and returns nil; every later Err returns context.Canceled.
+type endsAfterFirstCheck struct {
+	context.Context
+	done    chan struct{}
+	checked atomic.Bool
+}
+
+func newEndsAfterFirstCheck() *endsAfterFirstCheck {
+	return &endsAfterFirstCheck{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *endsAfterFirstCheck) Done() <-chan struct{} { return c.done }
+
+func (c *endsAfterFirstCheck) Err() error {
+	if c.checked.CompareAndSwap(false, true) {
+		close(c.done)
+		return nil
+	}
+	return context.Canceled
+}
+
+// TestH2RedialDialsNothingOnceTheRunHasEnded: once the run's context has
+// ended, reconnectSlot dials nothing, as its doc says. Close runs after the
+// cancel and would not close a connection dialed then, and a dial that fails
+// then is a connect error in the Result of a run that had already ended
+// (bench.go takes snapshotConnectErrors after the workers return). The
+// context can end while reconnectSlot waits for the old connection's loops
+// (readLoop still parsing what it had read), or after reconnectSlot's first
+// check and before that wait, when the loops may already have returned: the
+// wait's two cases are then both ready and select takes either. On 0af01b3
+// the wait fell through on the cancel and dialed: 1 dial, and 1 connect error
+// when the server was down.
+func TestH2RedialDialsNothingOnceTheRunHasEnded(t *testing.T) {
+	for _, down := range []bool{false, true} {
+		name := "the run ends during the wait for the loops, server up"
+		if down {
+			name = "the run ends during the wait for the loops, server down"
+		}
+		t.Run(name, func(t *testing.T) {
+			dial := dialTimeoutFunc
+			t.Cleanup(func() { dialTimeoutFunc = dial })
+			gate := &heldReadConn{holding: make(chan struct{}), release: make(chan struct{})}
+			var dialed atomic.Int64
+			dialTimeoutFunc = func(network, addr string, timeout time.Duration) (net.Conn, error) {
+				c, err := dial(network, addr, timeout)
+				if err != nil || dialed.Add(1) > 1 {
+					return c, err
+				}
+				gate.Conn = c
+				return gate, nil
+			}
+			srv := startRawH2(t, respondOK)
+			host, port := srv.hostPort()
+			cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 4))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cl.Close()
+			var released sync.Once
+			release := func() { released.Do(func() { close(gate.release) }) }
+			defer release()
+			live, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stop()
+			hc := cl.conns[0].cur.Load()
+			if _, err := cl.DoRequest(live, 0); err != nil || !hc.served.Load() {
+				t.Fatalf("first request: err=%v served=%t, want a success", err, hc.served.Load())
+			}
+			// readLoop holds the second response's bytes until release, so
+			// the connection's loops outlast its end.
+			gate.armed.Store(true)
+			go func() { _, _ = cl.DoRequest(live, 1) }()
+			select {
+			case <-gate.holding:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the server's second response never reached the client")
+			}
+			hc.failConn(errors.New("test: a write to the connection failed")) // as writeFailed does
+			if down {
+				_ = srv.ln.Close()
+			}
+			dials := countDials(cl, 0)
+			before := connectErrorsCounter.Swap(0)
+			defer connectErrorsCounter.Add(before)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			time.AfterFunc(50*time.Millisecond, cancel) // the run ends
+			_, err = cl.DoRequest(ctx, 0)
+			connectErrors := connectErrorsCounter.Swap(0)
+			t.Logf("the request that found the connection gone as the run ended: err=%v dials=%d connect_errors=%d", err, dials.Load(), connectErrors)
+			if !errors.Is(err, context.Canceled) || dials.Load() != 0 || connectErrors != 0 {
+				t.Errorf("err=%v dials=%d connect_errors=%d, want context.Canceled, 0 and 0: the run ended while reconnectSlot waited for the old connection's loops, and a slot dials nothing after the run's end",
+					err, dials.Load(), connectErrors)
+			}
+		})
+	}
+
+	t.Run("the run ends just before the wait, the loops already returned", func(t *testing.T) {
+		srv := startRawH2(t, respondOK)
+		host, port := srv.hostPort()
+		cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 4))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cl.Close()
+		live, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		slot := cl.conns[0]
+		hc := slot.cur.Load()
+		if _, err := cl.DoRequest(live, 0); err != nil || !hc.served.Load() {
+			t.Fatalf("first request: err=%v served=%t, want a success", err, hc.served.Load())
+		}
+		hc.failConn(errors.New("test: a write to the connection failed"))
+		select {
+		case <-hc.loopsDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the connection's loops never returned after it ended")
+		}
+		dials := countDials(cl, 0)
+		// Both of the wait's cases are ready and select takes either at
+		// random, so a check made in only one of them dials half the time.
+		const attempts = 64
+		for i := range attempts {
+			if _, err := cl.reconnectSlot(newEndsAfterFirstCheck(), slot); !errors.Is(err, context.Canceled) || dials.Load() != 0 {
+				t.Fatalf("attempt %d of %d: err=%v dials=%d, want context.Canceled and no dial: the run ended after reconnectSlot's first check of it, and a slot dials nothing after the run's end",
+					i+1, attempts, err, dials.Load())
+			}
+		}
+	})
+}
+
 // TestH2AwaitAnswersEachQueuedRequestOnce: requests still queued for a
 // connection whose writer has returned are answered by whichever await runs
 // answerQueued first; several awaits on one dead connection drain the queue
