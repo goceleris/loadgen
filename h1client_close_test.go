@@ -14,6 +14,7 @@ package loadgen
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -832,6 +833,111 @@ func TestBenchmarkerCloseModeCountsNoErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBenchmarkerReportsCloseAborts: Result.CloseAborts (JSON close_aborts)
+// counts the done connections the client reset because the server's TCP FIN
+// had not come 50ms after the response. Without it, a server that ignores
+// Connection: close (lithium) looks the same in loadgen's data as one that
+// honours it, and client resets on a server that closes late cannot be
+// attributed. It is read from the Result's JSON, the form probatorium
+// stores, and counts the measured window only.
+//   - A server that keeps every connection open: nearly every request's
+//     connection is counted. Those whose 50ms had not passed when Run built
+//     the Result are not, so the test wants at least half, and no more than
+//     one per connection used (requests, errors, and at most one in-flight
+//     request per worker dropped at shutdown), plus the connections of the
+//     last 50ms of the warmup, which may end after the handoff.
+//   - A server that closes as asked (net/http): no abort, but for a server
+//     goroutine descheduled for more than 50ms (1 + 2% tolerated).
+func TestBenchmarkerReportsCloseAborts(t *testing.T) {
+	const (
+		workers = 2
+		maxRPS  = 500
+	)
+	closeAborts := func(t *testing.T, res *Result) (int64, bool) {
+		t.Helper()
+		b, err := json.Marshal(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		v, ok := m["close_aborts"].(float64)
+		return int64(v), ok
+	}
+	run := func(t *testing.T, url string, mix bool, warmup time.Duration) *Result {
+		t.Helper()
+		cfg := Config{
+			URL:              url + "/",
+			Method:           "GET",
+			Duration:         400 * time.Millisecond,
+			Warmup:           warmup,
+			Connections:      workers,
+			Workers:          workers,
+			DisableKeepAlive: true,
+			PoolSize:         1,
+			// Paced: a few hundred connections, not tens of thousands.
+			MaxRPS: maxRPS,
+		}
+		if mix {
+			cfg.Mix = &MixRatio{H1: 1}
+		}
+		b, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := b.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	for _, tc := range []struct {
+		name   string
+		mix    bool
+		warmup time.Duration
+	}{
+		{"h1", false, 0},
+		{"h1/warmup", false, 200 * time.Millisecond},
+		{"mix-h1", true, 0},
+	} {
+		t.Run(tc.name+"/server-keeps-open", func(t *testing.T) {
+			srv := startRawH1Server(t, func(_, _ int) h1Reply { return replyKeepOpen })
+			res := run(t, "http://"+net.JoinHostPort(srv.host, srv.port), tc.mix, tc.warmup)
+			a, ok := closeAborts(t, res)
+			t.Logf("requests=%d errors=%d close_aborts=%d (in the JSON: %v)", res.Requests, res.Errors, a, ok)
+			if res.Requests == 0 {
+				t.Fatal("no successful requests")
+			}
+			if !ok || a*2 < res.Requests {
+				t.Errorf("close_aborts=%d (in the JSON: %v) for %d requests to a server that keeps every connection open: "+
+					"want at least half of them counted", a, ok, res.Requests)
+			}
+			// The last 50ms of the warmup: maxRPS/20 connections.
+			if limit := res.Requests + res.Errors + workers + maxRPS/20; a > limit {
+				t.Errorf("close_aborts=%d for %d requests and %d errors: more than one per connection of the measured window (limit %d)",
+					a, res.Requests, res.Errors, limit)
+			}
+		})
+	}
+	t.Run("h1/server-closes", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("OK"))
+		}))
+		defer srv.Close()
+		res := run(t, srv.URL, false, 0)
+		a, _ := closeAborts(t, res)
+		t.Logf("requests=%d errors=%d close_aborts=%d", res.Requests, res.Errors, a)
+		if res.Requests == 0 {
+			t.Fatal("no successful requests")
+		}
+		if a > 1+res.Requests/50 {
+			t.Errorf("close_aborts=%d for %d requests to a server that closes every connection as asked", a, res.Requests)
+		}
+	})
 }
 
 // TestH1CustomConnectionHeaderIsDropped: the client writes the Connection
