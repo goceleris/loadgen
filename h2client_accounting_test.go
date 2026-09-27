@@ -1348,3 +1348,66 @@ func TestH2ResponseWithoutAReadableStatusIsNotASuccess(t *testing.T) {
 		}
 	}
 }
+
+// TestH2StreamOutlivedByLaterStreamsGetsItsResponse: a connection keeps each
+// stream's response channel in slot (streamID/2) mod 2*MaxStreams, so a
+// stream still waiting when 2*MaxStreams-1 later streams have been opened
+// shares its slot with the next one. With 2 streams (4 slots), the server
+// holds the first stream while a second worker sends 4 more; the 5th stream
+// on the connection would take the held stream's slot. The server then
+// answers both. Each worker must get its own response. On main (a89f02d)
+// and on 2930ded the 5th stream overwrote the held stream's channel: its
+// response went to the other worker, and the held stream's worker waited
+// for the rest of the run. (Found in round 1, when an h2c benchmark with no
+// deadline hung for 11 minutes on a loaded machine.)
+func TestH2StreamOutlivedByLaterStreamsGetsItsResponse(t *testing.T) {
+	firstSeen := make(chan struct{})
+	var held uint32
+	srv := startRawH2With(t, rawH2Opts{settings: []http2.Setting{{ID: http2.SettingMaxConcurrentStreams, Val: 2}}},
+		func(c *rawH2Conn, sid uint32, _ string) rawH2Action {
+			switch c.requests {
+			case 1: // hold the first stream
+				held = sid
+				close(firstSeen)
+			case 5: // the stream after 3 more: it would reuse the held stream's slot
+				c.ok(sid)
+				c.ok(held)
+			default:
+				c.ok(sid)
+			}
+			return rawKeep
+		})
+	host, port := srv.hostPort()
+	cl, err := newH2Client(host, port, "/", testH2Cfg("GET", nil, nil, 1, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	type result struct {
+		n   int
+		err error
+	}
+	first := make(chan result, 1)
+	go func() {
+		n, err := cl.DoRequest(ctx, 0)
+		first <- result{n, err}
+	}()
+	select {
+	case <-firstSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first request never reached the server")
+	}
+	for i := range 4 {
+		if n, err := cl.DoRequest(ctx, 0); err != nil || n != len(rawOKBody) {
+			t.Fatalf("second worker, request %d: bytes=%d err=%v", i+1, n, err)
+		}
+	}
+	r := <-first
+	t.Logf("held stream: bytes=%d err=%v (server streams: held=%d)", r.n, r.err, held)
+	if r.err != nil || r.n != len(rawOKBody) {
+		t.Errorf("the server answered the held stream, but its worker got bytes=%d err=%v: a later stream took its slot and its response", r.n, r.err)
+	}
+}
