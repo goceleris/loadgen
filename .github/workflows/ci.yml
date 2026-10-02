@@ -31,10 +31,13 @@ jobs:
       - name: actionlint
         # Workflow-YAML lint: catches script-injection vectors, unknown
         # runner labels, malformed shell, action input misuse — the
-        # whole class golangci-lint can't see.
+        # whole class golangci-lint can't see. actionlint is a `tool` of the
+        # .github/tools module: its go.sum pins the version that runs and
+        # Dependabot bumps it, so a new release cannot turn this job red on
+        # an unrelated PR (loadgen#103).
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@latest
-          actionlint -color
+          go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" actionlint -version
+          go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" actionlint -color
 
   test:
     name: Test

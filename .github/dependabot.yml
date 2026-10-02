@@ -24,6 +24,32 @@ updates:
         patterns:
           - "*"
 
+  # The CI tools module (actionlint, loadgen#103): its go.sum pins the
+  # actionlint that the Lint job runs. Go records every requirement of a
+  # module that only holds `tool` directives as `// indirect`,
+  # github.com/rhysd/actionlint included. Version updates cover direct
+  # dependencies only unless `allow` says otherwise, so without the rule
+  # below this entry would never move the pin. The rule names the tool's
+  # module with `dependency-type: all`. Dependabot then bumps it with
+  # `go get`, which raises the other requirements only as far as the new
+  # release itself requires. A bare `dependency-type: all` would also
+  # bump the tool's dependencies past what its release was built with:
+  # today it proposes go.yaml.in/yaml/v4 v4.0.0-rc.6, and actionlint
+  # v1.7.12 does not compile against it. A new `tool` directive needs its
+  # module added to this list. The rule is on this entry alone, so the
+  # entries above keep the direct-only default.
+  - package-ecosystem: gomod
+    directory: /.github/tools
+    allow:
+      - dependency-name: github.com/rhysd/actionlint
+        dependency-type: all
+    schedule:
+      interval: weekly
+    groups:
+      ci-tools:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
