@@ -24,6 +24,17 @@ updates:
         patterns:
           - "*"
 
+  # The CI tools module (actionlint, loadgen#103): its go.sum pins the
+  # version the Lint job runs; this entry moves the pin.
+  - package-ecosystem: gomod
+    directory: /.github/tools
+    schedule:
+      interval: weekly
+    groups:
+      all-go-deps:
+        patterns:
+          - "*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
