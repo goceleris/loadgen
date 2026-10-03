@@ -14,9 +14,26 @@ name: CodSpeed
 # root-level .go file, go.mod or go.sum changes; drafts and superseded PR pushes
 # are skipped. See goceleris/celeris#690 for the estimate.
 #
-# Until an organization owner allows public repositories in the Default runner
-# group (Organization settings > Actions > Runner groups > Default), this job
-# waits in the queue with no runner. That is expected, not a failure.
+# Prerequisites, all done on 2026-09-26 (goceleris/celeris#690): this
+# repository in the org's Default runner group with public repositories
+# allowed, CodSpeedHQ/action@* on the Actions allow-list, and the repository
+# enabled in CodSpeed. Without the first, the job waits in the queue with no
+# runner.
+#
+# Security: a macro runner is a self-hosted runner outside GitHub's sandbox.
+# The job's `if:` below skips fork pull requests, a deleted fork's included
+# (its head.repo is null, and null == the repository name is false), but it
+# is not the security boundary: on `pull_request` the workflow definition
+# comes from the pull request's merge ref, so a fork pull request can edit
+# this file, or add a workflow of its own, and target the macro runner. What
+# stops it is the fork-PR approval policy, "Require approval for all external
+# contributors" (`gh api repos/goceleris/loadgen/actions/permissions/fork-pr-contributor-approval`
+# returns all_external_contributors). That setting must stay, and a
+# maintainer must never "Approve and run" a fork pull request that touches
+# .github/. The policy does not hold an organization member's fork pull
+# request for approval, and the organization's base permission is read: a
+# member with read access here can run one on the macro runner with no
+# approval at all, which only a settings change closes (goceleris/celeris#864).
 
 on:
   push:
@@ -47,8 +64,9 @@ concurrency:
 jobs:
   benchmarks:
     name: Benchmarks (CodSpeed walltime, arm64 macro runner)
-    # A macro runner is a self-hosted runner registered in this organization:
-    # code from a fork never runs on it. Drafts wait until they are ready.
+    # Skips fork pull requests as this file is written (the approval policy
+    # in the header is what holds against a fork that edits it) and drafts,
+    # which wait until they are ready.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
