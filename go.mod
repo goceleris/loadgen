@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.3.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 )
 
 require golang.org/x/text v0.42.0 // indirect

@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.2"
       # No -race here: the Test job in ci.yml already runs the suite under the
       # race detector. atomic is the covermode that stays correct when the
       # counted code runs on many goroutines, and -coverpkg=./... credits the

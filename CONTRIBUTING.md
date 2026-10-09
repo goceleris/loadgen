@@ -8,8 +8,8 @@ changes are held to the same standard as the engine they measure.
 
 ## Prerequisites
 
-- Go **1.27.0** (the version pinned in `go.mod` and in CI)
-- [golangci-lint](https://golangci-lint.run/) v2.13+ (the CI pin)
+- Go **1.27.0** or newer (the `go.mod` minimum; CI builds with 1.27.2)
+- [golangci-lint](https://golangci-lint.run/) v2.14+ (the CI pin)
 - Linux or macOS. The client itself is portable; the process-CPU sampler
   and recv-queue probe have Linux implementations and `_other.go`
   fallbacks.
