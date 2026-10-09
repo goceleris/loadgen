@@ -14,6 +14,15 @@
 // Subprocess isolation means one flaky cell can't taint another — a lesson
 // learned from the h2c upgrade bug that surfaced as a silent pass in
 // early drafts of this suite.
+//
+// Source references to celeris in the comments below are to celeris v1.5.11,
+// the version pinned in internal/integrationtest/testserver/go.mod. They name
+// the file and the function instead of a line number, because line numbers
+// drift between releases. celeris main has since moved engine/ and resource/
+// under internal/ (goceleris/celeris#443, merged as goceleris/celeris#938),
+// so those two paths resolve only at the pinned tag; look them up again when
+// the pin moves. Nothing here depends on them: the helper imports only the
+// public root package github.com/goceleris/celeris.
 
 package loadgen_test
 
@@ -77,10 +86,11 @@ func (m loadgenMode) String() string {
 //
 // unreachableReason is a non-empty string for cells whose server config
 // cannot actually be produced by celeris — e.g. Protocol=Auto silently
-// coerces EnableH2Upgrade=true in resource/config.go:167-169, so any
-// (auto, upgrade=false, *) cell is unreachable in practice. We keep such
-// rows in the matrix (skipped with this reason) rather than delete them,
-// so the coercion stays visible in code review.
+// coerces EnableH2Upgrade=true (celeris v1.5.11 resource/config.go,
+// Config.WithDefaults), so any (auto, upgrade=false, *) cell is
+// unreachable in practice. We keep such rows in the matrix (skipped with
+// this reason) rather than delete them, so the coercion stays visible in
+// code review.
 type matrixCell struct {
 	serverProto       string // "auto", "http1", "h2c"
 	serverUpgrade     string // "default", "true", "false"
@@ -130,12 +140,12 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 
 	// autoCoercesUpgrade is the reason we skip every Protocol=Auto row with
 	// the explicit serverUpgrade="false" knob. celeris' resource layer forces
-	// EnableH2Upgrade=true whenever the resolved Protocol is Auto — see the
-	// WithDefaults block at celeris/resource/config.go:163-169 — so the
+	// EnableH2Upgrade=true whenever the resolved Protocol is Auto — see
+	// Config.WithDefaults in celeris v1.5.11 resource/config.go — so the
 	// server config this row tries to produce is unreachable in practice.
 	// We keep the rows as skips (not deletions) to surface that coercion
 	// for reviewers reading this matrix.
-	const autoCoercesUpgrade = "celeris Protocol=Auto coerces EnableH2Upgrade=true in resource/config.go:167-169; this server config is unreachable in practice"
+	const autoCoercesUpgrade = "celeris Protocol=Auto coerces EnableH2Upgrade=true in celeris v1.5.11 resource/config.go (Config.WithDefaults); this server config is unreachable in practice"
 
 	// The full matrix from issue #30. 20 cells total. stdSkipReason is
 	// non-empty for the 4 cells whose expected behaviour relies on the
@@ -149,10 +159,11 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		// Protocol=HTTP1, EnableH2Upgrade=true
 		// Prior-knowledge H2 still fails (the H1 parser never sees the PRI
 		// preface as a legal request-line), but an RFC 7540 §3.2 upgrade IS
-		// honoured by the native linux engines — celeris/internal/conn/h1.go
-		// gates the upgrade path on state.EnableH2Upgrade && req.UpgradeH2C
-		// (see line 536 there). So http1+upgrade=true+h2c-upgrade is a
-		// supported configuration, not a rejection case.
+		// honoured by the native linux engines — celeris v1.5.11
+		// internal/conn/h1.go (tryUpgradeH2C) gates the upgrade path on
+		// state.EnableH2Upgrade and req.UpgradeH2C. So
+		// http1+upgrade=true+h2c-upgrade is a supported configuration, not a
+		// rejection case.
 		// The Std (net/http) engine does NOT honour the upgrade — it replies
 		// 200 on the plain H1 socket and silently ignores the Upgrade header
 		// — so the darwin Std-only run skips this row.
@@ -170,8 +181,9 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		// to detectProtocol on first recv when Protocol=H2C and
 		// EnableH2Upgrade=true (mirroring Auto), so the listener accepts
 		// H1 plaintext, prior-knowledge H2, AND honours the H1→H2 upgrade.
-		// See celeris/engine/iouring/worker.go:782-794 and the matching
-		// deferred-commit branch in engine/epoll/loop.go acceptAll.
+		// See celeris v1.5.11 engine/iouring/worker.go (Worker.onAcceptedFD)
+		// and the matching deferred-commit branch in engine/epoll/loop.go
+		// (Loop.acceptAll).
 		// The Std (net/http) engine answers 200 on the H1 socket and never
 		// emits 101 Switching Protocols, so the modeUpgrade row would be a
 		// silent-pass there and stays gated behind stdSkipReason.
@@ -180,12 +192,13 @@ func TestIntegrationH2CMatrix(t *testing.T) {
 		{serverProto: "h2c", serverUpgrade: "true", mode: modeUpgrade, expectOK: true, stdSkipReason: "std (net/http) engine ignores H2C upgrade and answers 200 on H1 — only the native linux engines emit 101 Switching Protocols"},
 
 		// Protocol=Auto, EnableH2Upgrade=false
-		// NOTE: celeris/resource/config.go:167-169 silently coerces
-		// EnableH2Upgrade=true whenever Protocol=Auto (the toResourceConfig
-		// path at celeris/config.go:210-215 preserves the user's *bool, but
-		// WithDefaults unconditionally flips it back). So every row here is
-		// actually the same as (auto, upgrade=true, ...). We keep them
-		// skipped rather than deleted so the coercion stays visible.
+		// NOTE: celeris v1.5.11 resource/config.go (Config.WithDefaults)
+		// silently coerces EnableH2Upgrade=true whenever Protocol=Auto (the
+		// Config.toResourceConfig path in celeris v1.5.11 config.go preserves
+		// the user's *bool, but WithDefaults unconditionally flips it back).
+		// So every row here is actually the same as (auto, upgrade=true, ...).
+		// We keep them skipped rather than deleted so the coercion stays
+		// visible.
 		{serverProto: "auto", serverUpgrade: "false", mode: modeH1, expectOK: true, unreachableReason: autoCoercesUpgrade},
 		{serverProto: "auto", serverUpgrade: "false", mode: modeH2, expectOK: true, unreachableReason: autoCoercesUpgrade},
 		{serverProto: "auto", serverUpgrade: "false", mode: modeUpgrade, expectOK: false, stdSkipReason: h2cServingH1, unreachableReason: autoCoercesUpgrade},
