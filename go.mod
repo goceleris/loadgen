@@ -3,7 +3,7 @@ module github.com/goceleris/loadgen
 go 1.27.0
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.3.0
+	github.com/HdrHistogram/hdrhistogram-go v1.4.0
 	golang.org/x/net v0.60.0
 )
 
