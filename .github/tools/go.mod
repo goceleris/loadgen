@@ -5,7 +5,7 @@
 // This module is never imported or released (loadgen#103).
 module loadgen-ci-tools
 
-go 1.27.2
+go 1.27.3
 
 tool github.com/rhysd/actionlint/cmd/actionlint
 

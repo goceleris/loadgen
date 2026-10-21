@@ -49,7 +49,7 @@ framework; for scripted user journeys, use a tool built for that, such as k6.
 
 ## Quick start
 
-Install the CLI (Go 1.27.2 or newer, per [`go.mod`](go.mod)):
+Install the CLI (Go 1.27.3 or newer, per [`go.mod`](go.mod)):
 
 ```bash
 go install github.com/goceleris/loadgen/cmd/loadgen@latest
