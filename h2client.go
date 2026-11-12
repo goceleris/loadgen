@@ -113,7 +113,15 @@ type h2Client struct {
 	// New() currently fails the whole benchmark on any dial error so these
 	// are equal in the happy path.
 	upgradeAttempted int
+
+	// stamps is the client-stamp state of the current rated run (stamps.go),
+	// nil when the stamps are off, which is the default. Set by Run before
+	// the measured workers start and cleared after they stop.
+	stamps *stampSet
 }
+
+// attachStamps implements stampAttacher.
+func (c *h2Client) attachStamps(s *stampSet) { c.stamps = s }
 
 // h2ConnSlot owns one logical connection that can be re-dialed in place. cur
 // holds the live *h2Conn (swapped atomically on reconnect so other workers
@@ -136,6 +144,8 @@ type h2WriteReq struct {
 	hasBody  bool             // HEADERS: has data frames to follow
 	pingData [8]byte          // PING: response data
 	respCh   *chan h2Response // HEADERS: writeLoop registers this in the stream slot
+	stamp    *stampRec        // HEADERS: the request's stamp record, nil unless the client stamps are on
+	stampSeq uint64           // the attempt stamp names (see stampRec.seq)
 }
 
 const (
@@ -155,6 +165,10 @@ type h2Conn struct {
 	// Writer goroutine — worker requests go through writeCh.
 	// readLoop NEVER sends to writeCh to avoid deadlock.
 	writeCh chan h2WriteReq
+
+	// stampBatch holds the stamped requests written into bufWriter since the
+	// last Flush; writeLoop only. Empty unless the client stamps are on.
+	stampBatch []stampRef
 
 	// Stream management — lock-free fixed-size slot array.
 	// Index = (streamID >> 1) % len(streamSlots), sized at 2x
@@ -248,6 +262,11 @@ type h2Conn struct {
 // abandoned.
 type h2StreamSlot struct {
 	ch atomic.Pointer[chan h2Response]
+
+	// stamp and stampSeq name the stamp record of the request this slot
+	// carries, for readLoop. Both stay nil/zero unless the client stamps are on.
+	stamp    atomic.Pointer[stampRec]
+	stampSeq atomic.Uint64
 
 	streamID uint32
 	status   int  // :status of the response; 0 when absent or not parseable
@@ -825,24 +844,42 @@ func (hc *h2Conn) writeLoop() {
 					count++
 					if count%64 == 0 {
 						hc.flushWindowUpdate()
-						hc.writeFailed(hc.bufWriter.Flush()) // send WINDOW_UPDATE to the network NOW
+						hc.flushWrites() // send WINDOW_UPDATE to the network NOW
 					}
 				default:
 					break drain
 				}
 			}
 			hc.flushWindowUpdate()
-			hc.writeFailed(hc.bufWriter.Flush())
+			hc.flushWrites()
 
 		case <-ticker.C:
 			hc.flushWindowUpdate()
-			hc.writeFailed(hc.bufWriter.Flush())
+			hc.flushWrites()
 
 		case <-hc.done:
 			hc.answerQueued()
 			return
 		}
 	}
+}
+
+// flushWrites flushes the buffered frames. When stamped requests are in the
+// batch it also stamps the flush start and end into each of them.
+func (hc *h2Conn) flushWrites() {
+	if len(hc.stampBatch) == 0 {
+		hc.writeFailed(hc.bufWriter.Flush())
+		return
+	}
+	start := hc.stampBatch[0].rec.set.now()
+	err := hc.bufWriter.Flush()
+	end := hc.stampBatch[0].rec.set.now()
+	for _, ref := range hc.stampBatch {
+		ref.rec.markFlush(ref.seq, start, end)
+	}
+	clear(hc.stampBatch)
+	hc.stampBatch = hc.stampBatch[:0]
+	hc.writeFailed(err)
 }
 
 // answerQueued answers every request still queued for a closed connection's
@@ -952,6 +989,11 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 		}
 
 		slotIdx := (streamID >> 1) % numSlots
+		if req.stamp != nil {
+			req.stamp.markWdq(req.stampSeq)
+			hc.streamSlots[slotIdx].stampSeq.Store(req.stampSeq)
+			hc.streamSlots[slotIdx].stamp.Store(req.stamp)
+		}
 		hc.streamSlots[slotIdx].ch.Store(req.respCh)
 		if req.hasBody {
 			// Key the send window to this stream before its HEADERS can reach
@@ -967,6 +1009,10 @@ func (hc *h2Conn) processWriteReq(req h2WriteReq) {
 			if err == errH2BodyAbandoned {
 				return // the server ended the stream, and its worker has the answer; the connection is fine
 			}
+		}
+		if req.stamp != nil && err == nil {
+			req.stamp.markFrm(req.stampSeq)
+			hc.stampBatch = append(hc.stampBatch, stampRef{req.stamp, req.stampSeq})
 		}
 		// Whoever takes respCh out of the slot answers it, exactly once:
 		// readLoop may have taken it first (a response, a reset, or
@@ -1038,7 +1084,13 @@ func (hc *h2Conn) readLoop() {
 				st.final = st.status < 100 || st.status >= 200
 			}
 
+			if rec := st.stamp.Load(); rec != nil {
+				rec.markHdr(st.stampSeq.Load())
+			}
 			if frame.StreamEnded() {
+				if rec := st.stamp.Load(); rec != nil {
+					rec.markEnd(st.stampSeq.Load())
+				}
 				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
 					*chPtr <- h2Response{status: st.status, bytesRead: st.bytes}
@@ -1060,6 +1112,12 @@ func (hc *h2Conn) readLoop() {
 			st := hc.stream(frame.StreamID)
 			st.bytes += len(frame.Data())
 
+			if rec := st.stamp.Load(); rec != nil {
+				rec.markHdr(st.stampSeq.Load()) // a no-op once HEADERS stamped it
+				if frame.StreamEnded() {
+					rec.markEnd(st.stampSeq.Load())
+				}
+			}
 			if frame.StreamEnded() {
 				chPtr := st.ch.Swap(nil)
 				if chPtr != nil {
@@ -1160,6 +1218,10 @@ var errH2NotSent = errors.New("h2client: connection gone before the request was 
 func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 	idx := workerID % len(c.conns)
 	slot := c.conns[idx]
+	var rec *stampRec
+	if c.stamps != nil {
+		rec = c.stamps.rec(workerID)
+	}
 	for {
 		hc := slot.cur.Load()
 
@@ -1181,7 +1243,7 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 			}
 		}
 
-		n, err := c.roundTrip(ctx, hc, idx)
+		n, err := c.roundTrip(ctx, hc, idx, rec)
 		if err != errH2NotSent { // the sentinel itself, never wrapped
 			return n, err
 		}
@@ -1198,7 +1260,7 @@ func (c *h2Client) DoRequest(ctx context.Context, workerID int) (int, error) {
 // roundTrip sends one request on hc and waits for its response. It returns
 // errH2NotSent if hc ended before the request was written: before it was
 // handed to the writer, or before the writer reached it.
-func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, error) {
+func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int, rec *stampRec) (int, error) {
 	// Acquire a stream. When the connection dies, the workers queued here
 	// wake through done, or through the tokens its failed streams return.
 	select {
@@ -1224,14 +1286,19 @@ func (c *h2Client) roundTrip(ctx context.Context, hc *h2Conn, idx int) (int, err
 	// Submit to writeLoop — fire-and-forget. writeLoop assigns stream IDs
 	// in dequeue order, guaranteeing monotonic IDs by construction.
 	// On write error, writeLoop sends to *respCh directly.
-	select {
-	case hc.writeCh <- h2WriteReq{
+	req := h2WriteReq{
 		kind:    h2WriteHeaders,
 		block:   c.headerBlock,
 		data:    c.dataPayload,
 		hasBody: c.hasBody,
 		respCh:  chPtr,
-	}:
+	}
+	if rec != nil {
+		req.stamp, req.stampSeq = rec, rec.attempt()
+		rec.tSem = rec.set.now()
+	}
+	select {
+	case hc.writeCh <- req:
 	case <-hc.done:
 		hc.chanPool.Put(chPtr)
 		hc.streamSem <- struct{}{}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -175,6 +176,13 @@ type Config struct {
 	// tail latency.
 	Rate float64
 
+	// ClientStamps, when non-nil, turns on the client-side request stamps of
+	// a rated run (Rate > 0) and fills Result.ClientStamps. Default nil: OFF,
+	// and then nothing is stamped. The environment variable
+	// LOADGEN_CLIENT_STAMPS (see ClientStampsEnv) sets it without a code
+	// change. Not sent to a federation peer.
+	ClientStamps *ClientStampsConfig `json:"-"`
+
 	// Peer enables federation: the loadgen instance becomes the
 	// coordinator for a sidecar instance running at this host:port. Both
 	// instances run identical workloads against the target; at end-of-run
@@ -339,6 +347,11 @@ type Benchmarker struct {
 	// type assertion per request. Set at New() time, never mutated.
 	mix *mixClient
 
+	// stamps is the client stamp state of the current rated run; nil (the
+	// default) when the stamps are off. Set by Run before the workers start,
+	// read by the rate scheduler goroutine.
+	stamps *stampSet
+
 	// Metrics — errors use atomic (rare, no contention).
 	// Requests and bytesRead are tracked per-shard in latencies.
 	errors atomic.Int64
@@ -450,6 +463,19 @@ func New(cfg Config) (*Benchmarker, error) {
 	}
 	if cfg.MaxResponseSize == 0 {
 		cfg.MaxResponseSize = 10 << 20 // 10MB
+	}
+	if cfg.ClientStamps == nil {
+		cs, err := stampsFromEnv(cfg.Rate)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ClientStamps = cs
+		if v := os.Getenv(ClientStampsEnv); v != "" {
+			// One line per run when the variable is set: the harness's stderr
+			// then shows which runs were stamped (a rate list that matches
+			// nothing would otherwise fail silently).
+			fmt.Fprintf(os.Stderr, "loadgen: %s=%q: rate %v: client stamps %s\n", ClientStampsEnv, v, cfg.Rate, map[bool]string{true: "ON", false: "off"}[cs != nil])
+		}
 	}
 	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade || (cfg.Mix != nil && (cfg.Mix.H2 > 0 || cfg.Mix.Upgrade > 0))
 	if cfg.ReadBufferSize == 0 {
@@ -687,6 +713,16 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	// the coordinated-omission correction.
 	var slots chan time.Time
 	var schedDone chan struct{}
+	var stamps *stampSet
+	if b.config.Rate > 0 && b.config.ClientStamps != nil {
+		stamps = newStampSet(b.config.ClientStamps, b.config.Workers, start)
+		if sa, ok := b.raw.(stampAttacher); ok {
+			stamps.h2 = true
+			sa.attachStamps(stamps)
+		}
+		b.stamps = stamps
+		stamps.runtimeStart()
+	}
 	if b.config.Rate > 0 {
 		bufLen := int(b.config.Rate * 4)
 		if bufLen < 1024 {
@@ -703,7 +739,9 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	if !continuous {
 		for i := range b.config.Workers {
 			workerID := i
-			if slots != nil {
+			if slots != nil && stamps != nil {
+				b.wg.Go(func() { b.ratedWorkerStamped(runCtx, workerID, slots, stamps) })
+			} else if slots != nil {
 				b.wg.Go(func() { b.ratedWorker(runCtx, workerID, slots) })
 			} else {
 				b.wg.Go(func() { b.worker(runCtx, workerID) })
@@ -792,6 +830,15 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	}
 
 	result := b.buildResult(elapsed)
+	if stamps != nil {
+		if sa, ok := b.raw.(stampAttacher); ok {
+			sa.attachStamps(nil)
+		}
+		b.stamps = nil
+		stamps.runtimeStop()
+		result.ClientStamps = stamps.result(elapsed, start)
+		appendStampsFile(result)
+	}
 	result.ClientCPUPercent = cpuMon.Stop()
 	result.Timeseries = timeseries
 	if selfCPU != nil {
@@ -934,6 +981,7 @@ func (b *Benchmarker) rateScheduler(ctx context.Context, start time.Time, slots 
 	if period <= 0 {
 		return
 	}
+	stamps := b.stamps // nil unless the client stamps are on
 
 	next := start.Add(period)
 	for b.running.Load() {
@@ -952,6 +1000,10 @@ func (b *Benchmarker) rateScheduler(ctx context.Context, start time.Time, slots 
 				return
 			case <-t.C:
 			}
+		}
+
+		if stamps != nil {
+			stamps.tick(next)
 		}
 
 		// Enqueue the *intended* time, not the actual "now". If the buffer

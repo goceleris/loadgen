@@ -120,6 +120,13 @@ type Result struct {
 	// contains the merged distribution; Federation tracks how the
 	// merge resolved.
 	Federation *FederationStats `json:"federation,omitempty"`
+
+	// ClientStamps, when non-nil, is the client-side split of a rated run's
+	// latency (schedule lag, write, response wait, body, wake, with the
+	// per-second structure and the slow requests' segment vectors). OPT-IN,
+	// versioned by its own Schema field, and absent unless the stamps were
+	// requested (Config.ClientStamps or LOADGEN_CLIENT_STAMPS). See stamps.go.
+	ClientStamps *ClientStamps `json:"client_stamps,omitempty"`
 }
 
 // FederationStats captures the outcome of a -peer federated run.
