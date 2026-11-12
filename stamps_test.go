@@ -516,6 +516,34 @@ func TestStampsSlotQueue(t *testing.T) {
 	}
 }
 
+// TestStampsWithWarmup: the rated warmup (closed loop, workers that exit
+// before the measured window) runs unstamped, and the stamps start with the
+// measured window; under -race this also covers the attach after the warmup.
+func TestStampsWithWarmup(t *testing.T) {
+	host, port := startH2CHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	cfg := stampsH2Cfg(host, port, 500, 1500*time.Millisecond, 4)
+	cfg.Warmup = 500 * time.Millisecond
+	cfg.ClientStamps = &ClientStampsConfig{}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := res.ClientStamps
+	if cs == nil || cs.Requests != res.Requests || cs.Requests < 400 {
+		t.Fatalf("block = %+v, result requests %d", cs, res.Requests)
+	}
+	if res.Warmup == nil || res.Warmup.Requests == 0 {
+		t.Error("warmup did not run")
+	}
+	if cs.Incomplete > cs.Requests/20 {
+		t.Errorf("incomplete %d of %d", cs.Incomplete, cs.Requests)
+	}
+}
+
 // TestStampsNonH2: the HTTP/1.1 client has no writer or reader goroutine of its
 // own to stamp; the worker-level segments are filled and the rest stay empty.
 func TestStampsNonH2(t *testing.T) {
@@ -642,6 +670,9 @@ func TestStampsFinishAccounting(t *testing.T) {
 	}
 	if cs.PerSecond[0].SlotQMax != 3 || cs.PerSecond[0].BusyMax != 1 {
 		t.Errorf("per second 0 = %+v", cs.PerSecond[0])
+	}
+	if p := cs.PerSecond[0]; p.SumNS[segBody] != 13*ms || p.SumNS[segIdx(t, cs, "total")] != 27*ms || p.Incomplete != 1 {
+		t.Errorf("per second sums: body %d total %d incomplete %d", p.SumNS[segBody], p.SumNS[segIdx(t, cs, "total")], p.Incomplete)
 	}
 	if cs.PerSecond[0].DominantSlowService[segBody] != 1 || cs.PerSecond[0].DominantSlowService[segWorkerWait] != 0 {
 		t.Errorf("per second dominant_slow_service = %v", cs.PerSecond[0].DominantSlowService)

@@ -383,13 +383,15 @@ func (a *segAgg) merge(o *segAgg) {
 // up to the whole backlog (seconds) before the second it was served in.
 // intended counts the slots by their intended second (the offered load).
 type secAgg struct {
-	n        uint32
-	intended uint32
-	over     [nSeg]uint32
-	max      [nSeg]int64
-	domSvc   [nBaseSeg]uint32
-	slotqMax int32
-	busyMax  int32
+	n          uint32
+	intended   uint32
+	over       [nSeg]uint32
+	max        [nSeg]int64
+	sum        [nSeg]int64 // per-segment sum in ns: lets a reader take means and additive shares per second
+	domSvc     [nBaseSeg]uint32
+	incomplete uint32
+	slotqMax   int32
+	busyMax    int32
 }
 
 type stampShard struct {
@@ -411,7 +413,9 @@ type stampSet struct {
 	base time.Time // the measured window's start (monotonic)
 	recs []stampRec
 	sh   []stampShard
-	busy atomic.Int32
+	_    stampPad
+	busy atomic.Int32 // on its own cache line: every worker adds to it per request
+	_    stampPad
 	h2   bool
 
 	sched schedStats
@@ -553,6 +557,7 @@ func (s *stampSet) finish(w int, r *stampRec, latency time.Duration) {
 			have[segSchedLag], have[segWrite] = true, true
 		} else {
 			sh.incomplete++
+			sh.sec[s.secIdx(r.tDeq)].incomplete++
 		}
 	}
 
@@ -563,6 +568,7 @@ func (s *stampSet) finish(w int, r *stampRec, latency time.Duration) {
 			continue
 		}
 		sh.seg[i].add(seg[i], s.thr)
+		sec.sum[i] += seg[i]
 		if seg[i] > s.thr {
 			sec.over[i]++
 		}
@@ -715,6 +721,13 @@ type StampSecond struct {
 	Intended int64   `json:"intended"`
 	Over     []int64 `json:"over"`
 	MaxNS    []int64 `json:"max_ns"`
+	// SumNS is the per-segment sum over the row's requests, aligned with
+	// SegmentOrder: with Requests it gives per-second means, and over the
+	// nine consecutive segments the additive decomposition of the service
+	// time (a pure throughput deficit has no slow request to count).
+	SumNS []int64 `json:"sum_ns"`
+	// Incomplete counts the row's H2 requests that missed a goroutine stamp.
+	Incomplete int64 `json:"incomplete"`
 	// DominantSlowService is aligned with the first nine segments
 	// (worker_wait is always 0): the requests of this second whose service
 	// exceeded the threshold, by their largest consecutive segment.
@@ -858,17 +871,19 @@ func (s *stampSet) result(elapsed time.Duration, startWall time.Time) *ClientSta
 	}
 	cs.PerSecond = make([]StampSecond, 0, last+1)
 	for sec := 0; sec <= last; sec++ {
-		row := StampSecond{T: sec, Over: make([]int64, nSeg), MaxNS: make([]int64, nSeg), DominantSlowService: make([]int64, nBaseSeg)}
+		row := StampSecond{T: sec, Over: make([]int64, nSeg), MaxNS: make([]int64, nSeg), SumNS: make([]int64, nSeg), DominantSlowService: make([]int64, nBaseSeg)}
 		for i := range s.sh {
 			x := &s.sh[i].sec[sec]
 			row.Requests += int64(x.n)
 			row.Intended += int64(x.intended)
+			row.Incomplete += int64(x.incomplete)
 			for j := range nBaseSeg {
 				row.DominantSlowService[j] += int64(x.domSvc[j])
 			}
 			for j := range nSeg {
 				row.Over[j] += int64(x.over[j])
 				row.MaxNS[j] = max(row.MaxNS[j], x.max[j])
+				row.SumNS[j] += x.sum[j]
 			}
 			row.SlotQMax = max(row.SlotQMax, int(x.slotqMax))
 			row.BusyMax = max(row.BusyMax, int(x.busyMax))
