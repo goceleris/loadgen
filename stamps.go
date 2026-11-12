@@ -911,11 +911,16 @@ func (s *stampSet) result(elapsed time.Duration, startWall time.Time) *ClientSta
 
 // stampsFileLine is one line of the ClientStampsFileEnv file.
 type stampsFileLine struct {
-	LoadgenVersion string       `json:"loadgen_version"`
-	TargetRPS      float64      `json:"target_rps"`
-	Requests       int64        `json:"requests"`
-	DurationNS     int64        `json:"duration_ns"`
-	ClientStamps   ClientStamps `json:"client_stamps"`
+	LoadgenVersion string  `json:"loadgen_version"`
+	TargetRPS      float64 `json:"target_rps"`
+	Requests       int64   `json:"requests"`
+	DurationNS     int64   `json:"duration_ns"`
+	// ClientCPUPercent and CPUPctP95 are the Result's own client-load
+	// figures (whole system, and loadgen's process), for the observer-effect
+	// comparison of a stamped pass with an unstamped one.
+	ClientCPUPercent float64      `json:"client_cpu_percent"`
+	CPUPctP95        float64      `json:"cpu_pct_p95"`
+	ClientStamps     ClientStamps `json:"client_stamps"`
 }
 
 // appendStampsFile writes res.ClientStamps to the ClientStampsFileEnv file.
@@ -926,7 +931,7 @@ func appendStampsFile(res *Result) {
 	}
 	line, err := json.Marshal(stampsFileLine{
 		LoadgenVersion: res.LoadgenVersion, TargetRPS: res.TargetRPS, Requests: res.Requests,
-		DurationNS: int64(res.Duration), ClientStamps: *res.ClientStamps,
+		DurationNS: int64(res.Duration), ClientCPUPercent: res.ClientCPUPercent, CPUPctP95: res.CPUPctP95, ClientStamps: *res.ClientStamps,
 	})
 	if err == nil {
 		var f *os.File

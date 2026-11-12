@@ -837,7 +837,6 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		b.stamps = nil
 		stamps.runtimeStop()
 		result.ClientStamps = stamps.result(elapsed, start)
-		appendStampsFile(result)
 	}
 	result.ClientCPUPercent = cpuMon.Stop()
 	result.Timeseries = timeseries
@@ -882,6 +881,7 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		result.Federation = fedStats
 	}
 
+	appendStampsFile(result) // after the CPU fields are set; no-op unless the stamps ran
 	return result, nil
 }
 
