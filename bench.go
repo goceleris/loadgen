@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -175,6 +176,17 @@ type Config struct {
 	// tail latency.
 	Rate float64
 
+	// SchedulerShards is the number of scheduler goroutines that emit the
+	// intended times of a rated run (Rate > 0). Zero, the default, picks
+	// ceil(Rate / SchedulerShardRate), at most GOMAXPROCS: one goroutine up
+	// to 80k rps, more above, because on the amd64 bench client (measured,
+	// D757-SCHED) one goroutine could not keep a schedule of 300k ticks/s
+	// and its lateness was recorded as server latency; the ceiling depends
+	// on the CPU. 1 forces
+	// the single goroutine scheduler. The intended times are the same for
+	// every value; only the number of goroutines that emit them changes.
+	SchedulerShards int
+
 	// Peer enables federation: the loadgen instance becomes the
 	// coordinator for a sidecar instance running at this host:port. Both
 	// instances run identical workloads against the target; at end-of-run
@@ -281,6 +293,9 @@ func (c Config) Validate() error {
 	if c.Rate < 0 {
 		return errors.New("loadgen: Rate must be non-negative")
 	}
+	if c.SchedulerShards < 0 {
+		return errors.New("loadgen: SchedulerShards must be non-negative")
+	}
 	usesH2Pool := c.HTTP2 || c.H2CUpgrade || (c.Mix != nil && (c.Mix.H2 > 0 || c.Mix.Upgrade > 0))
 	if !usesH2Pool && c.Connections < 1 {
 		return errors.New("loadgen: Connections must be >= 1")
@@ -385,7 +400,11 @@ type Benchmarker struct {
 
 	// Control
 	running atomic.Bool
-	wg      sync.WaitGroup
+
+	// schedulerShards is the number of scheduler goroutines of a rated run
+	// (0 in saturation mode); reported on Result.SchedulerShards.
+	schedulerShards int
+	wg              sync.WaitGroup
 }
 
 // recordFatal stores the first fatal error and signals Run/warmup to stop
@@ -680,8 +699,9 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	b.running.Store(true)
 	start := time.Now()
 
-	// Rated mode: a single scheduler goroutine emits intended-dispatch
-	// timestamps into a buffered channel; workers pop slots and run requests.
+	// Rated mode: scheduler goroutine(s) (one up to 80k rps, see
+	// Config.SchedulerShards) emit intended-dispatch timestamps into a
+	// buffered channel; workers pop slots and run requests.
 	// When the server stalls, slots queue up (capacity = 4× rate) — the
 	// queueing time itself becomes part of the recorded latency, which is
 	// the coordinated-omission correction.
@@ -697,7 +717,12 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		}
 		slots = make(chan time.Time, bufLen)
 		schedDone = make(chan struct{})
-		go b.rateScheduler(runCtx, start, slots, schedDone)
+		b.schedulerShards = schedulerShards(b.config.Rate, b.config.SchedulerShards, runtime.GOMAXPROCS(0))
+		if b.schedulerShards == 1 {
+			go b.rateScheduler(runCtx, start, slots, schedDone)
+		} else {
+			go b.rateSchedulerShards(runCtx, start, slots, schedDone, b.schedulerShards)
+		}
 	}
 
 	if !continuous {
@@ -767,7 +792,7 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 	runCancel()
 
 	if schedDone != nil {
-		// rateScheduler closes slots on its own way out. Wait for it so
+		// The scheduler closes slots on its own way out (after all its goroutines return). Wait for it so
 		// ratedWorker goroutines can observe the close and exit.
 		<-schedDone
 	}
@@ -967,8 +992,8 @@ func (b *Benchmarker) rateScheduler(ctx context.Context, start time.Time, slots 
 }
 
 // closeChanIfOpen closes a chan time.Time, swallowing the "already closed"
-// panic if the close races (rateScheduler is sole sender, so this is just
-// defence-in-depth).
+// panic if the close races (the scheduler closes only after every sender has
+// returned, so this is just defence-in-depth).
 func closeChanIfOpen(ch chan<- time.Time) {
 	defer func() { _ = recover() }()
 	close(ch)
@@ -1093,16 +1118,17 @@ func (b *Benchmarker) buildResult(elapsed time.Duration) *Result {
 	throughput := float64(bytesRead) / elapsed.Seconds()
 
 	res := &Result{
-		LoadgenVersion: Version,
-		Requests:       reqs,
-		Errors:         errs,
-		Duration:       elapsed,
-		RequestsPerSec: rps,
-		ThroughputBPS:  throughput,
-		Latency:        rec.Percentiles(),
-		DialRetries:    snapshotDialRetries(),
-		ConnectErrors:  snapshotConnectErrors(),
-		Warmup:         b.warmupStats,
+		LoadgenVersion:  Version,
+		SchedulerShards: b.schedulerShards,
+		Requests:        reqs,
+		Errors:          errs,
+		Duration:        elapsed,
+		RequestsPerSec:  rps,
+		ThroughputBPS:   throughput,
+		Latency:         rec.Percentiles(),
+		DialRetries:     snapshotDialRetries(),
+		ConnectErrors:   snapshotConnectErrors(),
+		Warmup:          b.warmupStats,
 	}
 	if a := h1CloseAborts(b.raw); a != nil {
 		res.CloseAborts = a.Load()

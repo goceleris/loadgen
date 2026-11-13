@@ -51,6 +51,7 @@ func main() {
 		bodyFile    = flag.String("body-file", "", "path to file whose contents are sent as request body")
 		maxRPS      = flag.Int("max-rps", 0, "max requests per second (0 = unlimited)")
 		rate        = flag.Float64("rate", 0, "constant request rate (req/s); >0 enables rated mode with intended-time latency (Gil Tene's coordinated-omission correction)")
+		schedShards = flag.Int("sched-shards", 0, "rated mode: number of goroutines that emit the intended times (0 = automatic, ceil(rate/80000); 1 = the single goroutine scheduler)")
 		peer        = flag.String("peer", "", "federation: dial host:port of a sidecar loadgen and merge its histogram into the result")
 		sidecar     = flag.String("sidecar", "", "run as federation sidecar listening on host:port; ignores -duration etc. — settings come from the coordinator's start frame")
 		outFile     = flag.String("out", "", "write the JSON result to this file path (in addition to stdout)")
@@ -154,6 +155,7 @@ func main() {
 		InsecureSkipVerify: *insecure,
 		MaxRPS:             *maxRPS,
 		Rate:               *rate,
+		SchedulerShards:    *schedShards,
 		Peer:               *peer,
 		CPUMonitor:         *cpuMonitor,
 		RecvQProbe:         *recvqProbe,

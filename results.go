@@ -31,6 +31,12 @@ type Result struct {
 	// specific release. Stamped from Version by buildResult.
 	LoadgenVersion string `json:"loadgen_version,omitempty"`
 
+	// SchedulerShards is the number of scheduler goroutines that emitted the
+	// intended times of a rated run (1 = the single goroutine scheduler).
+	// Omitted in saturation mode. A rated Result is comparable only with
+	// another one made with the same LoadgenVersion and SchedulerShards rule.
+	SchedulerShards int `json:"scheduler_shards,omitempty"`
+
 	ClientCPUPercent float64           `json:"client_cpu_percent,omitempty"`
 	Timeseries       []TimeseriesPoint `json:"timeseries,omitempty"`
 

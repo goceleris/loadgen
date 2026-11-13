@@ -38,14 +38,15 @@ const federationMaxFrame = 16 << 20 // 16MB cap; histograms are ~few KB
 // fedFrame describes a single JSON message exchanged between primary
 // and sidecar.
 type fedFrame struct {
-	Op            string  `json:"op"`
-	StartAtUnixNS int64   `json:"start_at_unix_nano,omitempty"`
-	DurationSec   float64 `json:"duration_sec,omitempty"`
-	URL           string  `json:"url,omitempty"`
-	Rate          float64 `json:"rate,omitempty"`
-	Connections   int     `json:"connections,omitempty"`
-	Workers       int     `json:"workers,omitempty"`
-	HTTP2         bool    `json:"http2,omitempty"`
+	Op              string  `json:"op"`
+	StartAtUnixNS   int64   `json:"start_at_unix_nano,omitempty"`
+	DurationSec     float64 `json:"duration_sec,omitempty"`
+	URL             string  `json:"url,omitempty"`
+	Rate            float64 `json:"rate,omitempty"`
+	SchedulerShards int     `json:"scheduler_shards,omitempty"`
+	Connections     int     `json:"connections,omitempty"`
+	Workers         int     `json:"workers,omitempty"`
+	HTTP2           bool    `json:"http2,omitempty"`
 
 	// Result-side fields
 	Requests  int64  `json:"requests,omitempty"`
@@ -150,14 +151,15 @@ func (c *FederationCoordinator) Start(startAt time.Time, cfg Config) error {
 	}
 	_ = tc.SetWriteDeadline(time.Now().Add(c.timeout))
 	frame := fedFrame{
-		Op:            "start",
-		StartAtUnixNS: startAt.UnixNano(),
-		DurationSec:   cfg.Duration.Seconds(),
-		URL:           cfg.URL,
-		Rate:          cfg.Rate,
-		Connections:   cfg.Connections,
-		Workers:       cfg.Workers,
-		HTTP2:         cfg.HTTP2,
+		Op:              "start",
+		StartAtUnixNS:   startAt.UnixNano(),
+		DurationSec:     cfg.Duration.Seconds(),
+		URL:             cfg.URL,
+		Rate:            cfg.Rate,
+		SchedulerShards: cfg.SchedulerShards,
+		Connections:     cfg.Connections,
+		Workers:         cfg.Workers,
+		HTTP2:           cfg.HTTP2,
 	}
 	if err := writeFrame(tc, frame); err != nil {
 		return fmt.Errorf("federation: write start: %w", err)
@@ -293,6 +295,9 @@ func (s *FederationSidecar) Serve(ctx context.Context, base Config, runFn func(c
 	}
 	if frame.DurationSec > 0 {
 		cfg.Duration = time.Duration(frame.DurationSec * float64(time.Second))
+	}
+	if frame.SchedulerShards > 0 {
+		cfg.SchedulerShards = frame.SchedulerShards
 	}
 	if frame.Rate > 0 {
 		cfg.Rate = frame.Rate
