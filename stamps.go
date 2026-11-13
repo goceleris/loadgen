@@ -418,7 +418,8 @@ type stampSet struct {
 	_    stampPad
 	h2   bool
 
-	sched schedStats
+	sched     schedStats
+	schedSelf *SchedSelf // set once by the scheduler goroutines on exit
 
 	mu      sync.Mutex
 	slowSvc []StampVector
@@ -758,6 +759,8 @@ type SchedulerStats struct {
 	LateOver  int64 `json:"late_over"`
 	LateP99NS int64 `json:"late_p99_ns"`
 	LateMaxNS int64 `json:"late_max_ns"`
+	// Self is the scheduler's own timing, present only with LOADGEN_SCHED=self.
+	Self *SchedSelf `json:"self,omitempty"`
 }
 
 // StampVector is the full segment vector of one slow request. SegsNS is aligned
@@ -900,6 +903,7 @@ func (s *stampSet) result(elapsed time.Duration, startWall time.Time) *ClientSta
 		Ticks: s.sched.agg.n, LateOver: s.sched.agg.over,
 		LateP99NS: s.sched.agg.quantile(0.99), LateMaxNS: s.sched.agg.max,
 	}
+	cs.Scheduler.Self = s.schedSelf
 	cs.Runtime = s.runtimeDelta()
 
 	s.mu.Lock()
@@ -1124,4 +1128,11 @@ func (b *Benchmarker) ratedWorkerStamped(ctx context.Context, workerID int, slot
 			set.finish(workerID, rec, latency)
 		}
 	}
+}
+
+// setSchedSelf stores the scheduler self-timing block (LOADGEN_SCHED=self).
+func (s *stampSet) setSchedSelf(v *SchedSelf) {
+	s.mu.Lock()
+	s.schedSelf = v
+	s.mu.Unlock()
 }

@@ -351,6 +351,8 @@ type Benchmarker struct {
 	// default) when the stamps are off. Set by Run before the workers start,
 	// read by the rate scheduler goroutine.
 	stamps *stampSet
+	// schedMode is the parsed LOADGEN_SCHED (#757 D757-SCHED); zero = the original scheduler.
+	schedMode schedMode
 
 	// Metrics — errors use atomic (rare, no contention).
 	// Requests and bytesRead are tracked per-shard in latencies.
@@ -477,6 +479,13 @@ func New(cfg Config) (*Benchmarker, error) {
 			fmt.Fprintf(os.Stderr, "loadgen: %s=%q: rate %v: client stamps %s\n", ClientStampsEnv, v, cfg.Rate, map[bool]string{true: "ON", false: "off"}[cs != nil])
 		}
 	}
+	sm, err := parseSchedMode(os.Getenv(SchedEnv))
+	if err != nil {
+		return nil, err
+	}
+	if v := os.Getenv(SchedEnv); v != "" && cfg.Rate > 0 {
+		fmt.Fprintf(os.Stderr, "loadgen: %s=%q: rate %v: scheduler self=%v shards=%d\n", SchedEnv, v, cfg.Rate, sm.self, sm.shards)
+	}
 	useH2Defaults := cfg.HTTP2 || cfg.H2CUpgrade || (cfg.Mix != nil && (cfg.Mix.H2 > 0 || cfg.Mix.Upgrade > 0))
 	if cfg.ReadBufferSize == 0 {
 		if useH2Defaults {
@@ -512,6 +521,7 @@ func New(cfg Config) (*Benchmarker, error) {
 			raw:           cfg.Client,
 			flushInterval: flushInterval,
 			fatalCh:       make(chan struct{}),
+			schedMode:     sm,
 		}
 		b.latencies.Store(NewShardedLatencyRecorder(cfg.Workers, flushInterval))
 		return b, nil
@@ -557,6 +567,7 @@ func New(cfg Config) (*Benchmarker, error) {
 		raw:           raw,
 		flushInterval: flushInterval,
 		fatalCh:       make(chan struct{}),
+		schedMode:     sm,
 	}
 	b.latencies.Store(NewShardedLatencyRecorder(cfg.Workers, flushInterval))
 	if mc, ok := raw.(*mixClient); ok {
@@ -733,7 +744,11 @@ func (b *Benchmarker) Run(ctx context.Context) (*Result, error) {
 		}
 		slots = make(chan time.Time, bufLen)
 		schedDone = make(chan struct{})
-		go b.rateScheduler(runCtx, start, slots, schedDone)
+		if sm := b.schedMode; sm.self || sm.shards > 1 {
+			go b.rateSchedulerShards(runCtx, start, slots, schedDone, sm)
+		} else {
+			go b.rateScheduler(runCtx, start, slots, schedDone)
+		}
 	}
 
 	if !continuous {
