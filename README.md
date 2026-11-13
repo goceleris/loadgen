@@ -221,11 +221,14 @@ a client that simply slowed down to match. Rated runs set `rated_mode: true`, `t
 The intended times are emitted by `ceil(rate / 80000)` scheduler goroutines (`-sched-shards`,
 `Config.SchedulerShards`; 0 = automatic, 1 = a single goroutine): each goroutine emits every k-th tick of
 the same arithmetic schedule, so the set of intended times is identical for every count. One goroutine
-pays a wake-up of a parked worker per tick and cannot keep a schedule much above 280k ticks/s on the
-bench client: its lateness then grows linearly and is recorded as latency the server did not cause.
+pays a wake-up of a parked worker per tick; on the amd64 bench client it could not keep a 300k ticks/s
+schedule (measured; the ceiling depends on the CPU): its lateness then grows linearly and is recorded as latency the server did not cause.
 Rated results carry `scheduler_shards`; compare rated results only between runs of the same
 `loadgen_version` and shard rule. Slots reach the workers in an order that may differ from the intended
-order by up to k-1 periods; each worker measures `time.Since(intended)` of the slot it holds.
+order (by up to k-1 periods while every goroutine is on time, by its lateness otherwise); each worker
+measures `time.Since(intended)` of the slot it holds. The automatic count is capped at GOMAXPROCS. In a
+federated run the sidecar takes the coordinator's explicit `-sched-shards` and otherwise decides its own
+count from its rate.
 
 `-rate` (constant rate, coordinated-omission corrected) and `-max-rps` are independent rate controls.
 `-max-rps` only paces each closed-loop worker on its own to at most `max(1, max-rps / workers)` req/s

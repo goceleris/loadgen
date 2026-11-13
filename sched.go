@@ -2,17 +2,19 @@ package loadgen
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 )
 
 // SchedulerShardRate is the highest intended-dispatch rate one scheduler
-// goroutine is asked to carry. A single goroutine pays a wake-up of a parked
-// worker on every tick (about 3.5 us measured on the amd64 bench client), so
-// above roughly 280k ticks/s it cannot keep its own schedule: the lateness
-// grows linearly and shows up as tail latency that the server did not cause
-// (goceleris/celeris#757, D757-SCHED). 80k/s leaves a 3.5x margin and is the
-// per-goroutine rate the verifying cluster run used (300321 rps over 4).
+// goroutine is asked to carry. On the amd64 bench client one goroutine could
+// not keep a 300k ticks/s schedule (D757-SCHED: it emitted about 288k/s, its
+// lateness grew linearly and showed up as tail latency the server did not
+// cause, goceleris/celeris#757); the cost per tick is dominated by waking a
+// parked worker (about 3.5 us, inferred from that slope). The ceiling depends
+// on the CPU. 80k/s is a conservative margin and is the per-goroutine rate
+// the verifying cluster run used (300321 rps over 4).
 const SchedulerShardRate = 80000
 
 // SchedulerShardMax bounds the number of scheduler goroutines.
@@ -20,20 +22,22 @@ const SchedulerShardMax = 32
 
 // schedulerShards returns how many scheduler goroutines a rated run uses.
 // configured == 0 selects the automatic count, ceil(rate / SchedulerShardRate)
-// (1 at and below 80k rps, so low-rate runs are exactly the old single
-// goroutine); configured >= 1 forces that count (1 is the legacy scheduler).
-func schedulerShards(rate float64, configured int) int {
-	k := configured
-	if k <= 0 {
-		k = int((rate + SchedulerShardRate - 1) / SchedulerShardRate)
+// capped at procs (1 at and below 80k rps, so low-rate runs are exactly the old
+// single goroutine); configured >= 1 forces that count (1 is the legacy
+// scheduler). Both are clamped to SchedulerShardMax.
+func schedulerShards(rate float64, configured, procs int) int {
+	if configured > 0 {
+		return min(configured, SchedulerShardMax)
 	}
-	if k < 1 {
-		k = 1
+	c := math.Ceil(rate / SchedulerShardRate)
+	if c > float64(SchedulerShardMax) {
+		c = SchedulerShardMax
 	}
-	if k > SchedulerShardMax {
-		k = SchedulerShardMax
+	k := int(c)
+	if procs >= 1 && k > procs {
+		k = procs
 	}
-	return k
+	return max(k, 1)
 }
 
 // rateSchedulerShards runs k scheduler goroutines over the one slot channel
@@ -44,8 +48,9 @@ func schedulerShards(rate float64, configured int) int {
 // goroutine version a late wake-up never skips a slot (coordinated-omission
 // semantics): the intended time is enqueued and the lateness is measured by
 // the worker. Slots reach the channel in an order that can differ from the
-// intended order by up to k-1 periods; nothing downstream depends on that
-// order (a worker measures time.Since(intended) of the slot it holds).
+// intended order (by up to k-1 periods while every shard is on time, by a late
+// shard's lateness otherwise); nothing downstream depends on that order (a
+// worker measures time.Since(intended) of the slot it holds).
 func (b *Benchmarker) rateSchedulerShards(ctx context.Context, start time.Time, slots chan<- time.Time, done chan<- struct{}, k int) {
 	defer close(done)
 	period := time.Duration(float64(time.Second) / b.config.Rate)

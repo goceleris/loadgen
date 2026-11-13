@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+
 	"testing"
 	"time"
 )
@@ -13,22 +13,27 @@ func TestSchedulerShardsCount(t *testing.T) {
 	cases := []struct {
 		rate       float64
 		configured int
+		procs      int
 		want       int
 	}{
-		{100, 0, 1},
-		{80000, 0, 1},  // at the shard rate: still one goroutine
-		{80001, 0, 2},  // just above
-		{300321, 0, 4}, // the rate verified on the cluster (D757-SCHED)
-		{450481, 0, 6},
-		{1e9, 0, SchedulerShardMax},
-		{300321, 1, 1}, // explicit single goroutine
-		{100, 4, 4},    // explicit count at a low rate
-		{100, 1000, SchedulerShardMax},
-		{0.5, 0, 1},
+		{100, 0, 64, 1},
+		{80000, 0, 64, 1},   // at the shard rate: still one goroutine
+		{80000.5, 0, 64, 2}, // non-integer rate just above
+		{80001, 0, 64, 2},
+		{300321, 0, 64, 4}, // the rate verified on the cluster (D757-SCHED)
+		{450481, 0, 64, 6},
+		{450481, 0, 4, 4}, // capped at GOMAXPROCS
+		{450481, 0, 0, 6}, // procs unknown: no cap
+		{1e18, 0, 64, SchedulerShardMax},
+		{300321, 1, 64, 1}, // explicit single goroutine
+		{100, 4, 64, 4},    // explicit count at a low rate, not capped by procs
+		{100, 4, 2, 4},
+		{100, 1000, 64, SchedulerShardMax},
+		{0.5, 0, 64, 1},
 	}
 	for _, c := range cases {
-		if got := schedulerShards(c.rate, c.configured); got != c.want {
-			t.Errorf("schedulerShards(%v, %d) = %d, want %d", c.rate, c.configured, got, c.want)
+		if got := schedulerShards(c.rate, c.configured, c.procs); got != c.want {
+			t.Errorf("schedulerShards(%v, %d, %d) = %d, want %d", c.rate, c.configured, c.procs, got, c.want)
 		}
 	}
 }
@@ -39,90 +44,167 @@ func TestNewRejectsNegativeSchedulerShards(t *testing.T) {
 	}
 }
 
-// TestShardedSchedulerSameSchedule: k scheduler goroutines emit exactly the same
-// set of intended times as the single scheduler would (start + n*period, n >= 1),
-// and the channel is closed once all are done.
+// drain collects slots until the channel is closed or the timeout hits (a
+// missing close is a failure, not a hang).
+func drain(t *testing.T, slots <-chan time.Time) []time.Time {
+	t.Helper()
+	var got []time.Time
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case in, ok := <-slots:
+			if !ok {
+				return got
+			}
+			got = append(got, in)
+		case <-deadline:
+			t.Fatal("slot channel not closed after the scheduler returned")
+		}
+	}
+}
+
+// tickIndex maps an intended time to its tick number n (start + n*period) and
+// reports whether it lies exactly on the schedule.
+func tickIndex(in, start time.Time, period time.Duration) (int, bool) {
+	d := in.Sub(start)
+	n := int(d / period)
+	return n, d%period == 0
+}
+
+// TestShardedSchedulerSameSchedule: k scheduler goroutines emit exactly the
+// intended times of the single scheduler (start + n*period, n >= 1) at a rate
+// whose period is truncated (300321/s: 3329 ns, not a divisor of a second), the
+// same set the k=1 path emits: every tick below the lowest tick any shard has
+// not reached is present exactly once, and every slot lies on the schedule.
 func TestShardedSchedulerSameSchedule(t *testing.T) {
+	rate := 300321.0
+	period := time.Duration(float64(time.Second) / rate)
 	for _, k := range []int{1, 2, 4, 7} {
-		b := &Benchmarker{config: Config{Rate: 20000}}
+		b := &Benchmarker{config: Config{Rate: rate}}
 		b.running.Store(true)
 		ctx, cancel := context.WithCancel(context.Background())
-		slots := make(chan time.Time, 1<<16)
+		slots := make(chan time.Time, 1<<18)
 		done := make(chan struct{})
 		start := time.Now()
 		go b.rateSchedulerShards(ctx, start, slots, done, k)
 		time.Sleep(300 * time.Millisecond)
 		b.running.Store(false)
 		cancel()
-		<-done
-		var got []time.Time
-		for in := range slots { // ends only if the channel was closed
-			got = append(got, in)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("k=%d: scheduler did not return", k)
 		}
-		if len(got) < 3000 {
-			t.Fatalf("k=%d: only %d slots in 300ms at 20000/s", k, len(got))
+		got := drain(t, slots)
+		if len(got) < 10000 {
+			t.Fatalf("k=%d: only %d slots in 300ms at %v/s", k, len(got), rate)
 		}
-		sort.Slice(got, func(i, j int) bool { return got[i].Before(got[j]) })
-		period := time.Second / 20000
-		// The sorted set must be start+period*(1..n) with no gap and no duplicate,
-		// except a ragged tail of at most k slots (a shard stopped a few ticks
-		// before another).
-		n := len(got)
-		for i := 0; i < n; i++ {
-			want := start.Add(period * time.Duration(i+1))
-			if !got[i].Equal(want) {
-				if i >= n-k {
-					break
+		seen := make(map[int]int, len(got))
+		perShard := make([][]int, k)
+		maxN := 0
+		for _, in := range got {
+			n, exact := tickIndex(in, start, period)
+			if !exact || n < 1 {
+				t.Fatalf("k=%d: slot %v is not start + n*period (n=%d)", k, in.Sub(start), n)
+			}
+			seen[n]++
+			if seen[n] > 1 {
+				t.Fatalf("k=%d: tick %d emitted twice", k, n)
+			}
+			perShard[(n-1)%k] = append(perShard[(n-1)%k], n)
+			if n > maxN {
+				maxN = n
+			}
+		}
+		// each shard's own sequence has no gap: ticks j+1, j+1+k, ... in order
+		for j, seq := range perShard {
+			for i, n := range seq {
+				if want := j + 1 + i*k; n != want {
+					t.Fatalf("k=%d shard %d: element %d is tick %d, want %d (a tick was skipped)", k, j, i, n, want)
 				}
-				t.Fatalf("k=%d: slot %d = %v want %v", k, i, got[i].Sub(start), want.Sub(start))
+			}
+		}
+		// across shards the union is gapless up to the shortest shard's last tick
+		low := maxN
+		for _, seq := range perShard {
+			if len(seq) > 0 && seq[len(seq)-1] < low {
+				low = seq[len(seq)-1]
+			}
+		}
+		for n := 1; n <= low; n++ {
+			if seen[n] != 1 {
+				t.Fatalf("k=%d: tick %d missing below %d", k, n, low)
 			}
 		}
 	}
 }
 
 // TestShardedSchedulerKeepsLateSlots: a shard that wakes late still enqueues the
-// intended time (no slot is skipped), so the lateness is visible to the worker.
-// The channel is unread for 200 ms; afterwards every intended time up to "now"
-// is in it.
+// intended time (no slot is skipped). The schedule starts 100 ms in the past, so
+// every shard is late from its first tick; ticks 1..500 must all arrive, once.
 func TestShardedSchedulerKeepsLateSlots(t *testing.T) {
-	b := &Benchmarker{config: Config{Rate: 5000}}
-	b.running.Store(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	slots := make(chan time.Time, 1<<14)
-	done := make(chan struct{})
-	start := time.Now()
-	go b.rateSchedulerShards(ctx, start, slots, done, 3)
-	time.Sleep(200 * time.Millisecond)
-	b.running.Store(false)
-	cancel()
-	<-done
-	if len(slots) < 900 {
-		t.Errorf("%d slots after 200ms at 5000/s, want about 1000", len(slots))
+	for _, k := range []int{1, 3} {
+		b := &Benchmarker{config: Config{Rate: 5000}}
+		b.running.Store(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		slots := make(chan time.Time, 1<<14)
+		done := make(chan struct{})
+		start := time.Now().Add(-100 * time.Millisecond)
+		period := time.Duration(float64(time.Second) / 5000)
+		go b.rateSchedulerShards(ctx, start, slots, done, k)
+		seen := map[int]bool{}
+		deadline := time.After(2 * time.Second)
+		have := 0 // ticks 1..500 seen so far
+		for have < 500 {
+			select {
+			case in := <-slots:
+				n, exact := tickIndex(in, start, period)
+				if !exact || n < 1 {
+					t.Fatalf("k=%d: slot not on the schedule: %v", k, in.Sub(start))
+				}
+				if seen[n] {
+					t.Fatalf("k=%d: tick %d twice", k, n)
+				}
+				seen[n] = true
+				if n <= 500 {
+					have++
+				}
+			case <-deadline:
+				t.Fatalf("k=%d: only %d of the first 500 late ticks arrived", k, have)
+			}
+		}
+		for n := 1; n <= 500; n++ {
+			if !seen[n] {
+				t.Fatalf("k=%d: late tick %d was skipped", k, n)
+			}
+		}
+		b.running.Store(false)
+		cancel()
+		<-done
 	}
 }
 
 // TestShardedSchedulerStopsOnCancel: shards blocked on a full channel return when
-// the context is cancelled, and the channel is then closed.
+// the context is cancelled, and the channel is then closed. Covers the legacy
+// path's neighbour k=1 as well.
 func TestShardedSchedulerStopsOnCancel(t *testing.T) {
-	b := &Benchmarker{config: Config{Rate: 100000}}
-	b.running.Store(true)
-	ctx, cancel := context.WithCancel(context.Background())
-	slots := make(chan time.Time, 1) // nobody reads: every shard blocks on the send
-	done := make(chan struct{})
-	go b.rateSchedulerShards(ctx, time.Now(), slots, done, 4)
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("scheduler did not stop after cancel")
-	}
-	n := 0
-	for range slots {
-		n++
-	}
-	if n > 1 {
-		t.Errorf("%d slots in a channel of capacity 1", n)
+	for _, k := range []int{1, 4} {
+		b := &Benchmarker{config: Config{Rate: 100000}}
+		b.running.Store(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		slots := make(chan time.Time, 1) // nobody reads: every shard blocks on the send
+		done := make(chan struct{})
+		go b.rateSchedulerShards(ctx, time.Now(), slots, done, k)
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("k=%d: scheduler did not stop after cancel", k)
+		}
+		if n := len(drain(t, slots)); n != 1 {
+			t.Errorf("k=%d: %d slots left in a channel of capacity 1 that was full, want 1", k, n)
+		}
 	}
 }
 
