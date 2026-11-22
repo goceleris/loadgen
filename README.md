@@ -25,6 +25,21 @@
   <a href="https://goceleris.dev/benchmarks/">Benchmarks it measures</a>
 </p>
 
+## At a glance
+
+**What it is.** loadgen generates HTTP/1.1 and HTTP/2 load for benchmarking web servers. It has its own protocol clients instead of `net/http`, and reports latency percentiles from a per-worker histogram.
+
+**Run it.**
+
+```bash
+go install github.com/goceleris/loadgen/cmd/loadgen@latest
+loadgen -url http://localhost:8080/ -duration 10s -connections 64
+```
+
+The result is one JSON object on stdout: request and error counts, requests per second, latency percentiles, a per-second timeseries and the full histogram. `-h2` switches to HTTP/2, `-rate` runs at a fixed rate with coordinated-omission correction.
+
+**Where the results are.** loadgen itself keeps no results. The benchmark load of the celeris project comes from it, driven by [probatorium](https://github.com/goceleris/probatorium), and those results are published in the [goceleris/docs results tree](https://github.com/goceleris/docs/tree/main/results) and on [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks/).
+
 ## Why loadgen
 
 - **Its own H1 and H2 clients.** No `net/http` on the request path: request bytes are pre-formatted,
