@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/cover.png" alt="goceleris / loadgen cover: loadgen, zero-alloc HTTP/1.1 and HTTP/2 load generator (http/1.1, http/2, tls, sharded-latency, p99.99)">
+  <img src=".github/cover.png" alt="goceleris / loadgen cover: loadgen, HTTP/1.1 and HTTP/2 load generator (http/1.1, http/2, tls, sharded-latency, p99.99)">
 </p>
 
 <p align="center">
@@ -13,26 +13,42 @@
 </p>
 
 <p align="center">
-  <strong>A measurement-grade HTTP/1.1 and HTTP/2 load generator for benchmarking web servers.</strong><br>
-  It ships its own protocol clients instead of <code>net/http</code>, so the numbers describe the server, not the client.
+  <strong>An HTTP/1.1 and HTTP/2 load generator for benchmarking web servers, with its own protocol clients instead of <code>net/http</code>, so that the numbers describe the server and not the client.</strong>
 </p>
 
 <p align="center">
+  <a href="#why-loadgen">Why</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#cli-reference">CLI reference</a> ·
+  <a href="#status-and-stability">Status and stability</a> ·
   <a href="https://pkg.go.dev/github.com/goceleris/loadgen">API reference</a> ·
   <a href="https://goceleris.dev/benchmarks/">Benchmarks it measures</a>
 </p>
+
+## At a glance
+
+**What it is.** loadgen generates HTTP/1.1 and HTTP/2 load for benchmarking web servers. It has its own protocol clients instead of `net/http`, and reports latency percentiles from a per-worker histogram.
+
+**Run it.**
+
+```bash
+go install github.com/goceleris/loadgen/cmd/loadgen@latest
+loadgen -url http://localhost:8080/ -duration 10s -connections 64
+```
+
+The result is one JSON object on stdout: request and error counts, requests per second, latency percentiles, a per-second timeseries and the full histogram. `-h2` switches to HTTP/2, `-rate` runs at a fixed rate with coordinated-omission correction.
+
+**Where the results are.** loadgen itself keeps no results. The benchmark load of the celeris project comes from it, driven by [probatorium](https://github.com/goceleris/probatorium), and those results are published in the [goceleris/docs results tree](https://github.com/goceleris/docs/tree/main/results) and on [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks/).
 
 ## Why loadgen
 
 - **Its own H1 and H2 clients.** No `net/http` on the request path: request bytes are pre-formatted,
   HPACK headers are pre-encoded, and H2 status codes are read from the header block without decoding
   it.
-- **Near-zero allocations.** In a local run of v1.4.13 against a server in another process, the
-  loadgen process made 7,771 heap allocations in total over 792,576 HTTP/1.1 requests and 9,702 over
-  966,623 HTTP/2 requests, about 0.01 per request. A run a quarter as long made nearly as many, so
-  they are per-run setup, not per-request cost.
+- **Few allocations per request.** The goal is an allocation-free request/response cycle. Measured
+  locally, the loadgen process made about 0.01 heap allocations per request over a 10 s run, nearly
+  all of them per-run setup ([how it was measured](#allocations-measured-and-how-to-reproduce)). No test
+  enforces it, and the WebSocket and SSE drivers allocate per message.
 - **HTTP/1.1, HTTP/2 and more.** Prior-knowledge h2c or h2 over TLS (ALPN), the RFC 7540 §3.2 h2c
   upgrade, a weighted per-worker mix of all three, and built-in WebSocket and Server-Sent Events
   drivers.
@@ -45,7 +61,8 @@
   flag runs where the client, not the server, limited the result.
 
 loadgen measures one server with minimal client overhead. It is not a general-purpose load-testing
-framework; for scripted user journeys, use a tool built for that, such as k6.
+framework; for scripted user journeys, use a tool built for that, such as k6. It is also young: read
+[Status and stability](#status-and-stability) before relying on a number.
 
 ## Quick start
 
@@ -110,6 +127,9 @@ func main() {
 }
 ```
 
+`Config.Warmup` is zero unless you set it; `DefaultConfig()` returns a 5 s warmup, and the CLI defaults
+to 2 s.
+
 More library examples:
 
 <details>
@@ -117,6 +137,8 @@ More library examples:
 
 ```go
 // HTTP/2 prior knowledge: the workers share 16 connections, up to 100 streams each.
+// New multiplies Workers by 4 in the HTTP/2, h2c-upgrade and mix modes, so this
+// run has 256 workers.
 cfg := loadgen.Config{
 	URL:      "http://localhost:8080/",
 	Duration: 15 * time.Second,
@@ -169,14 +191,19 @@ cfg := loadgen.Config{
 ## How the goceleris projects use it
 
 - **[probatorium](https://github.com/goceleris/probatorium)**, the benchmark and validation harness,
-  imports loadgen as a library. Its bench runner drives every cell with `loadgen.New(...).Run`, runs the
-  rated latency-at-SLO sweep through `Config.Rate`, and merges the exported histograms across runs
-  before publishing.
+  imports loadgen as a library: the load of its bench tier comes from loadgen. Its runner drives every
+  cell with `loadgen.New(...).Run`, runs the rated latency-at-SLO passes through `Config.Rate`, records
+  `loadgen_version` with each pass, and merges the exported histograms across runs before publishing
+  (it decodes the V2 payload with the HdrHistogram library directly).
 - **[celeris](https://github.com/goceleris/celeris)**: the numbers on the
-  [goceleris.dev benchmark dashboard](https://goceleris.dev/benchmarks/) are those probatorium runs, so
-  every published celeris figure was measured by loadgen. In the other direction, loadgen's own
-  integration test drives a live celeris server over H1, H2, h2c upgrade and mixed traffic
-  (`internal/integrationtest/testserver`).
+  [goceleris.dev benchmark dashboard](https://goceleris.dev/benchmarks/) are probatorium runs, so the
+  load behind them came from loadgen. In the other direction, loadgen's own integration matrix
+  (`go test -tags integration`, run in CI) drives a live celeris server over H1, H2, h2c upgrade and
+  mixed traffic through `internal/integrationtest/testserver`, a nested module that pins celeris
+  v1.5.11.
+- **The version behind the v1.6.0 numbers.** Every result records the loadgen version that produced it
+  (`loadgen_version`); the v1.6.0 benches used
+  [[PLACEHOLDER: loadgen version used by the v1.6.0 benches, run id]].
 
 ## Load modes
 
@@ -189,21 +216,27 @@ streaming drivers (`-mode`) are mutually exclusive: a run is one or the other.
 | --- | --- | --- |
 | **HTTP/1.1** (default) | *(none)* | Baseline request/response throughput. One persistent TCP connection per worker, pre-formatted request bytes written with a single write call. With `-close`, every request carries `Connection: close` and travels on a connection of its own: after the response the server closes the connection (over TLS the client answers the server's `close_notify` with its own; a server that still keeps the TCP connection open is reset by the client after 50 ms, so the loadgen host keeps no `TIME_WAIT`), and the next request dials a fresh one, a dial that counts in that request's latency, including any SYN retransmission (1 s or more) when the server's accept queue is full. The expected close is never counted as an error. |
 | **HTTP/2** | `-h2` | Multiplexed throughput. Prior-knowledge h2c, or h2 over TLS (ALPN offers `h2`): workers share connections and dispatch streams lock-free, with pre-encoded HPACK headers and batched `WINDOW_UPDATE`. |
-| **h2c upgrade** | `-h2c-upgrade` | The RFC 7540 §3.2 cleartext upgrade path. Each connection starts as HTTP/1.1 carrying `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c`, reads `101 Switching Protocols`, then switches to HTTP/2 on the same socket. Exercises the handshake that `-h2` skips. Cleartext only: TLS servers negotiate H2 via ALPN. |
-| **Protocol mix** | `-mix h1:h2:upgrade=N:N:N` | A traffic blend. Each worker is assigned a protocol by a weighted draw (seeded from the weights, so repeated runs assign the same way) and keeps it for the whole run. |
+| **h2c upgrade** | `-h2c-upgrade` | The RFC 7540 §3.2 cleartext upgrade path. Each connection starts as HTTP/1.1 carrying `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c`, reads `101 Switching Protocols`, then switches to HTTP/2 on the same socket. Exercises the handshake that `-h2` skips. Cleartext only: TLS servers negotiate H2 via ALPN, and an `https` URL is rejected. The result includes an `upgrade` block and stderr prints `h2c upgrade: X/Y conns upgraded successfully`. |
+| **Protocol mix** | `-mix h1:h2:upgrade=N:N:N` | A traffic blend. Each worker is assigned a protocol by a weighted draw (seeded from the weights, so repeated runs assign the same way) and keeps it for the whole run; the H2 and upgrade sub-clients each open `-h2-conns` connections. The `h1:h2:upgrade=` prefix is optional (a bare `N:N:N` parses too), weights are non-negative integers, `0:0:0` is rejected, and a non-zero upgrade weight needs an `http` URL. The `mix` block in the result and a stderr breakdown report per-protocol connection, request and error counts. |
+
+`-h2`, `-h2c-upgrade` and `-mix` are mutually exclusive.
 
 ### Streaming drivers
 
 Set `-mode` (or `Config.Mode`) to drive a non-HTTP protocol. One long-lived connection is held open per
 worker; each unit of work flows through the same worker, latency and timeseries pipeline as an HTTP
-request.
+request. `https` URLs use TLS and verify the certificate unless `-insecure` is set; `Config.TLSConfig`
+is not used by these drivers.
 
 | Mode | What it measures |
 | --- | --- |
 | `ws-echo` | RFC 6455 WebSocket echo round-trip latency (small text frame). |
 | `ws-large-echo` | Echo round trip with a 64 KiB payload; exercises framing and buffering under large frames. |
 | `ws-hub` | Broadcast fan-out: the worker only reads, and each unit is the wait for the server's next broadcast frame (frames carry no timestamp, so this is inter-frame time). No outbound write per unit. |
-| `sse-fanout` | Server-Sent Events delivery. One `GET` stream per worker; each unit blocks until the next event arrives, so inter-event delivery time *is* the recorded latency. |
+| `sse-fanout` | Server-Sent Events delivery. One `GET` stream per worker on the URL's path; each unit blocks until the next event arrives, so inter-event delivery time *is* the recorded latency. |
+
+These drivers count frames and events without checking their content: a wrong or corrupted echo is
+counted as a success ([#106](https://github.com/goceleris/loadgen/issues/106)).
 
 ## Rated mode (coordinated-omission correction)
 
@@ -216,25 +249,31 @@ worker pool. Latency is measured from the request's *intended* dispatch time, no
 it actually left: Gil Tene's coordinated-omission correction. When the server stalls, the backlog of
 intended-but-unsent requests accumulates and surfaces as honest tail latency, instead of being hidden by
 a client that simply slowed down to match. Rated runs set `rated_mode: true`, `target_rps` and
-`mode: "rated"` in the result.
+`mode: "rated"` in the result. Compare `requests_per_sec` with `target_rps`: a run that fell short of
+its rate carries the unsent backlog in its tail latency.
 
-The intended times are emitted by `ceil(rate / 80000)` scheduler goroutines (`-sched-shards`,
-`Config.SchedulerShards`; 0 = automatic, 1 = a single goroutine): each goroutine emits every k-th tick of
-the same arithmetic schedule, so the set of intended times is identical for every count. One goroutine
-pays a wake-up of a parked worker per tick; on the amd64 bench client it could not keep a 300k ticks/s
-schedule (measured; the ceiling depends on the CPU): its lateness then grows linearly and is recorded as latency the server did not cause.
+The intended times are emitted by several scheduler goroutines (`-sched-shards`,
+`Config.SchedulerShards`; 0 = automatic, which is `ceil(rate / 80000)` capped at `GOMAXPROCS` and 32;
+1 = a single goroutine): each goroutine emits
+every k-th tick of the same arithmetic schedule, so the set of intended times is identical for every
+count. One goroutine pays a wake-up of a parked worker per tick; on the amd64 bench client it could not
+keep a 300k ticks/s schedule (measured on the bench cluster, see the
+[v1.4.15 release notes](https://github.com/goceleris/loadgen/releases/tag/v1.4.15) and
+[celeris#757](https://github.com/goceleris/celeris/issues/757); the ceiling depends on the CPU), and
+its lateness then grew linearly and was recorded as latency the server did not cause.
 Rated results carry `scheduler_shards`; compare rated results only between runs of the same
-`loadgen_version` and shard rule. Slots reach the workers in an order that may differ from the intended
+`loadgen_version` and shard rule (rated results above 80k req/s from v1.4.14 and earlier are
+single-goroutine results). Slots reach the workers in an order that may differ from the intended
 order (by up to k-1 periods while every goroutine is on time, by its lateness otherwise); each worker
-measures `time.Since(intended)` of the slot it holds. The automatic count is capped at GOMAXPROCS. In a
-federated run the sidecar takes the coordinator's explicit `-sched-shards` and otherwise decides its own
-count from its rate.
+measures `time.Since(intended)` of the slot it holds. In a federated run the sidecar takes the
+coordinator's explicit `-sched-shards` and otherwise decides its own count from its rate.
 
 `-rate` (constant rate, coordinated-omission corrected) and `-max-rps` are independent rate controls.
 `-max-rps` only paces each closed-loop worker on its own to at most `max(1, max-rps / workers)` req/s
 (no shared cap, so with more workers than `max-rps` the total exceeds it); latency is still measured
 from the actual send, and it does not apply in rated mode. `-rate` is the right one for
-latency-SLO measurement.
+latency-SLO measurement. One known limit of the rated path is tracked in
+[#102](https://github.com/goceleris/loadgen/issues/102); see [Status and stability](#status-and-stability).
 
 ## Federation
 
@@ -243,21 +282,25 @@ measurements client-side.
 
 - Start a **sidecar** on the second host: `loadgen -sidecar :9099`. It binds, waits for one
   coordinator, and takes the run's settings from the coordinator's start frame: URL, duration, rate,
-  connection and worker counts, and the HTTP/2 switch. Other settings (method, headers, body, `-close`,
-  `-mode`, `-mix`, `-h2c-upgrade`, `-insecure`, `-max-rps`, warmup) are not forwarded, and the
-  sidecar runs without a warmup.
+  scheduler shards, connection and worker counts, and the HTTP/2 switch. Other settings (method,
+  headers, body, `-close`, `-mode`, `-mix`, `-h2c-upgrade`, `-insecure`, `-max-rps`, warmup) are not
+  forwarded, and the sidecar runs without a warmup.
 - Start the **coordinator** with `-peer <sidecar-host>:9099` plus the usual flags. It dials the sidecar,
   both sides start against the target at an agreed time (so their clocks must agree), and at the end of
   the run the coordinator pulls the sidecar's V2-compressed HdrHistogram and merges it into its own. The
   latency percentiles come from the merged histogram; request and error counts stay local, with the
   sidecar's reported as `federation.peer_requests` and `federation.peer_errors`.
 
+Each side runs the full workload, so the target sees the sum of the two. With `-rate R` each side
+paces `R`: a local run of `-rate 5000 -duration 3s` with a sidecar gave 14,994 requests on the
+coordinator and 14,975 on the sidecar. `requests`, `requests_per_sec` and the throughput fields in a
+federated result describe the coordinator alone; add `federation.peer_requests` for the total.
+
 The wire protocol is deliberately minimal: a `loadgen-fed-v1` magic handshake followed by
 length-prefixed JSON frames (`start` / `ack` / `result` / `err`) over one TCP connection, with no
 retries. It is best-effort: if any step fails, the coordinator records
 `federation.merge_succeeded = false` (with `federation.merge_error`) and reports its local-only
-histogram. Merge outcomes appear in the
-`federation` block of the result.
+histogram. Merge outcomes appear in the `federation` block of the result.
 
 ## HdrHistogram export
 
@@ -265,9 +308,9 @@ Every result carries the full latency distribution, not just the summary percent
 
 - `Result.Histogram` is a V2-compressed HdrHistogram (base64 in JSON) of nanosecond latencies, up to
   30 s at three significant digits. It is empty when no samples were recorded.
-- `loadgen.DecodeHistogram([]byte)` and the recorder's `EncodeHistogram()` are exported so downstream
-  tools (the probatorium aggregator) can decode, re-merge across cells and recompute percentiles without
-  re-running the benchmark.
+- `loadgen.DecodeHistogram([]byte)` (a thin wrapper around `hdrhistogram.Decode`) and the recorder's
+  `EncodeHistogram()` are exported so downstream tools can decode, re-merge across cells and recompute
+  percentiles without re-running the benchmark.
 
 This is the same encoding federation uses on the wire, so a merged multi-host distribution round-trips
 losslessly.
@@ -281,8 +324,8 @@ Two probes flag the runs where loadgen, not the server, was the limiting factor:
   compute-bound and the throughput number is a client ceiling, not a server ceiling.
 - **Receive-queue probe** (`-recvq-probe`, on by default, Linux only). Reads per-socket receive-queue
   depths from `/proc/net/tcp` and `/proc/net/tcp6` every 5 s. If the median across loadgen's sockets
-  stays above 64 KB for 10 s or more it latches `recvq_high: true`: the client couldn't drain responses fast enough, so the observed tail
-  latency is loadgen-side. A no-op on other platforms.
+  stays above 64 KB for 10 s or more it latches `recvq_high: true`: the client couldn't drain responses
+  fast enough, so the observed tail latency is loadgen-side. A no-op on other platforms.
 
 ## CLI reference
 
@@ -292,33 +335,26 @@ loadgen [flags] -url <target>
 
 ### Flags
 
+`loadgen -h` lists every flag with its default. The ones whose behaviour needs more than the help text:
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-url string` | *(required)* | Target URL, with an `http` or `https` scheme. |
-| `-duration duration` | `15s` | Measured benchmark duration (excludes warmup). |
-| `-warmup duration` | `2s` | Warmup phase before measurement. `0` to skip. |
 | `-connections int` | `256` | Default worker count for H1; each H1 worker holds one connection (or a `PoolSize` pool with `-close`). |
 | `-workers int` | `0` | Concurrent workers. `0` → `-connections` for H1, `NumCPU*4` for multiplexed modes. Multiplexed modes (`-h2`, `-h2c-upgrade`, `-mix`) then run 4 workers per configured worker. |
-| `-method string` | `GET` | HTTP method. |
-| `-H "Key: Value"` | | Custom header, repeatable. |
-| `-body-file string` | | Read the request body from a file. |
-| `-close` | `false` | Send `Connection: close` (H1 only). |
-| `-h2` | `false` | HTTP/2 prior knowledge (h2c), or h2 over TLS. |
-| `-h2c-upgrade` | `false` | HTTP/2 via the RFC 7540 §3.2 h2c upgrade handshake. |
-| `-mix string` | | Per-worker protocol mix, e.g. `h1:h2:upgrade=4:4:1`. |
-| `-h2-conns int` | `16` | H2 connections. |
-| `-h2-streams int` | `100` | Max concurrent H2 streams per connection. |
+| `-warmup duration` | `2s` | Warmup before measurement, excluded from the result's counts and latencies (reported under `warmup`). `0` to skip. |
+| `-method string` | `GET` | One of `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`. |
+| `-H "Key: Value"` | | Custom header, repeatable. The separator is a colon and one space. |
 | `-mode string` | | Streaming driver: `ws-echo` \| `ws-large-echo` \| `ws-hub` \| `sse-fanout`. Mutually exclusive with `-h2` / `-h2c-upgrade` / `-mix`. |
-| `-insecure` | `false` | Skip TLS certificate verification. |
-| `-max-rps int` | `0` | Paces each worker on its own to `max(1, max-rps / workers)` req/s (integer division). There is no shared cap: with more workers than `max-rps` the total exceeds it. `0` = unlimited; ignored in rated mode. |
+| `-max-rps int` | `0` | Paces each worker on its own to `max(1, max-rps / workers)` req/s (integer division, `workers` after the 4x scaling of the multiplexed modes). There is no shared cap: with more workers than `max-rps` the total exceeds it. `0` = unlimited; ignored in rated mode. |
 | `-rate float` | `0` | Constant request rate (req/s). `>0` enables rated mode with coordinated-omission correction. |
-| `-peer host:port` | | Federation coordinator: dial a sidecar and merge its histogram. |
-| `-sidecar host:port` | | Run as a federation sidecar; all workload settings come from the coordinator. |
+| `-sched-shards int` | `0` | Rated mode: number of goroutines that emit the intended times. `0` = automatic, `1` = a single goroutine. See [Rated mode](#rated-mode-coordinated-omission-correction). |
+| `-peer host:port` / `-sidecar host:port` | | Federation coordinator and sidecar. A sidecar takes its workload settings from the coordinator. See [Federation](#federation). |
 | `-out string` | | Also write the JSON result to this file (in addition to stdout). |
-| `-cpu-monitor` | `true` | Enable the 1 Hz process-CPU sampler (`cpu_pct_p95`). |
-| `-recvq-probe` | `true` | Enable the per-socket receive-queue probe (Linux only; `recvq_high`). |
+| `-cpu-monitor` / `-recvq-probe` | `true` | The two [self-instrumentation](#self-instrumentation) probes (Linux only). |
 
-> The CLI's `-warmup` default is `2s`; the library's `DefaultConfig()` uses `5s`.
+The remaining flags are `-url` (required, `http` or `https`), `-duration` (15s, excludes warmup),
+`-body-file`, `-close` (H1 only), `-h2`, `-h2c-upgrade`, `-mix`, `-h2-conns` (16), `-h2-streams` (100,
+per connection) and `-insecure`; [Load modes](#load-modes) covers their behaviour.
 
 ### Examples
 
@@ -327,8 +363,14 @@ loadgen [flags] -url <target>
 loadgen -url http://localhost:8080/api -duration 30s -connections 512 \
   -H "Authorization: Bearer token" -H "Content-Type: application/json"
 
-# H2 prior knowledge.
+# H2 prior knowledge, browser-style fan-out.
 loadgen -url http://localhost:8080/ -h2 -h2-conns 16 -h2-streams 200 -duration 30s
+
+# h2c upgrade (RFC 7540 §3.2).
+loadgen -url http://localhost:8080/ -h2c-upgrade -duration 30s
+
+# A traffic mix: H2-heavy, with a trickle of H1 and upgrade connections.
+loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=1:4:1 -duration 60s
 
 # Rated latency measurement at 20k req/s.
 loadgen -url http://localhost:8080/ -rate 20000 -duration 60s
@@ -338,45 +380,11 @@ loadgen -url http://localhost:8080/ws -mode ws-echo -duration 30s
 
 # HTTPS with paced workers and a result file.
 loadgen -url https://api.example.com/health -max-rps 5000 -duration 60s -out result.json
+
+# Federation: a sidecar on the second host, then the coordinator.
+loadgen -sidecar :9099
+loadgen -url http://target:8080/ -peer second-host:9099 -rate 50000 -duration 60s
 ```
-
-### `-h2c-upgrade` (RFC 7540 §3.2)
-
-Starts each connection as HTTP/1.1 carrying `Connection: Upgrade, HTTP2-Settings` + `Upgrade: h2c`,
-reads a `101 Switching Protocols` response, then switches to HTTP/2 on the same TCP socket. This
-exercises the cleartext upgrade path that `-h2` skips (prior knowledge sends the H2 preface directly).
-Mutually exclusive with `-h2` and `-mix`. Only defined over cleartext HTTP: TLS servers negotiate H2 via
-ALPN.
-
-```bash
-# Basic h2c upgrade run.
-loadgen -url http://localhost:8080/ -h2c-upgrade -duration 30s
-
-# h2c upgrade with browser-style fan-out.
-loadgen -url http://localhost:8080/ -h2c-upgrade -h2-conns 16 -h2-streams 200 -duration 30s
-```
-
-The result includes an `upgrade` block (also present for a `-mix` with a non-zero upgrade weight), and
-stderr prints `h2c upgrade: X/Y conns upgraded successfully`.
-
-### `-mix`: traffic mixtures
-
-Assigns each worker to a protocol by a weighted draw across H1, H2 prior knowledge and h2c upgrade,
-seeded from the weights so the assignment repeats run to run. Workers keep their protocol for the whole
-run; the H2 and upgrade sub-clients each open `-h2-conns` connections. Mutually exclusive with `-h2` and
-`-h2c-upgrade`. Format: `h1:h2:upgrade=N:N:N` (the `h1:h2:upgrade=` prefix is optional; a bare `N:N:N`
-also parses). Weights are non-negative integers; `0:0:0` is rejected.
-
-```bash
-# Equal fan-out across all three protocols.
-loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=1:1:1 -duration 30s
-
-# Browser-heavy H2 with a trickle of legacy upgrades.
-loadgen -url http://localhost:8080/ -mix h1:h2:upgrade=4:4:1 -duration 60s
-```
-
-The `mix` block in the result reports per-protocol connection, request and error counts; stderr prints a
-matching breakdown.
 
 ## Cluster-bench integration contract
 
@@ -409,6 +417,7 @@ empty (`omitempty`).
 | `mode` | string | `"saturation"` or `"rated"`. *(optional)* |
 | `rated_mode` | bool | True when driven by the constant-rate scheduler. *(optional)* |
 | `target_rps` | float64 | Requested rate; meaningful only when `rated_mode`. *(optional)* |
+| `scheduler_shards` | int | Number of goroutines that emitted a rated run's intended times. *(optional)* |
 | `histogram` | base64 bytes | V2-compressed HdrHistogram of the full distribution (ns, up to 30 s, 3 significant digits). *(optional)* |
 | `client_cpu_percent` | float64 | Whole-host CPU% over the run, from `/proc/stat` (Linux only). *(optional)* |
 | `cpu_pct_p95` | float64 | P95 of the 1 Hz process-CPU sampler. *(optional)* |
@@ -416,15 +425,16 @@ empty (`omitempty`).
 | `dial_retries` | uint64 | TCP SYN retries after an RST (listener-replacement / engine-switch window). *(optional)* |
 | `connect_errors` | uint64 | Dial/handshake failures (TCP, TLS, WS/SSE upgrade, H1 reconnect). *(optional)* |
 | `close_aborts` | uint64 | H1 connections that were done (`-close`, or a response with `Connection: close`) and that the client reset because the server's FIN had not come 50 ms after the response: about one per request for a server that ignores `Connection: close`. *(optional)* |
-| `timeseries` | array | 1-second snapshots: `{t, rps, p99_ms, errors, connect_errors}`. *(optional)* |
+| `timeseries` | array | 1-second snapshots: `{t, rps, p99_ms, errors, connect_errors}`. On a slow run `rps` is quantised by the 256-request per-worker flush and many seconds read 0 ([#107](https://github.com/goceleris/loadgen/issues/107)); use the top-level `requests_per_sec` there. *(optional)* |
 | `warmup` | object | Warmup-phase `{requests, errors, connect_errors}`; a zero-request, nonzero-error warmup means the target was never healthy. *(optional)* |
-| `upgrade` | object | h2c-upgrade handshake tally (`-h2c-upgrade`). *(optional)* |
+| `upgrade` | object | h2c-upgrade handshake tally `{attempted, succeeded}` (`-h2c-upgrade`). *(optional)* |
 | `mix` | object | Per-protocol connection/request/error counts (`-mix`). *(optional)* |
 | `federation` | object | Federated-run outcome (`role`, `peer`, `peer_requests`, `peer_errors`, `merge_succeeded`, `merge_error`). *(optional)* |
 
 ### Pre-built binary releases
 
-GitHub Releases ship platform tarballs that orchestrators can fetch directly:
+GitHub Releases ship platform tarballs (linux and darwin, amd64 and arm64) that orchestrators can fetch
+directly:
 
 ```bash
 TAG=v1.4.15
@@ -503,12 +513,41 @@ batched into plain locals and flushed to atomics every 256 requests (H1, WebSock
 HTTP/2 modes) to keep ARM64 memory-barrier overhead off the hot path. Shards merge once at completion for percentiles and the
 exported histogram.
 
-> **On "zero allocation."** The design goal is an allocation-free request/response cycle: request bytes
-> are pre-formatted, HPACK headers are pre-encoded, and H2 status codes are extracted from the encoded
-> header block with no allocation. The measurement under [Why loadgen](#why-loadgen) shows the result
-> for HTTP/1.1 and HTTP/2 (about 0.01 allocations per request, nearly all of them per-run setup), but it
-> is a design target, not an invariant a test enforces. The WebSocket and SSE drivers do allocate per
-> message.
+### Allocations: measured, and how to reproduce
+
+The design goal is an allocation-free request/response cycle: request bytes are pre-formatted, HPACK
+headers are pre-encoded, and H2 status codes are extracted from the encoded header block with no
+allocation. It is a design target, not an invariant a test enforces. The Go benchmarks
+(`go test -run '^$' -bench . -benchmem .`, in `bench_perf_test.go`, `h2status_test.go` and
+`latency_test.go`) show 0 allocs/op for the mix dispatch and the HPACK status extraction, and cover the
+h2c-upgrade request builder and the latency recorder, but not a full request cycle. The WebSocket and
+SSE drivers allocate per message (a frame buffer per WebSocket write and read, a string per SSE line).
+
+The whole-process figure in [Why loadgen](#why-loadgen) counts `runtime.MemStats.Mallocs` around `Run`,
+against a server in another process. Measured on 22 November 2026 with v1.4.15, Go 1.27.3, an Apple M5
+laptop (macOS, arm64) and a Go `net/http` server answering `ok` on the same host, with 64 H1
+connections or 16 H2 workers (64 after the 4x scaling), a 2 s warmup and a 10 s run:
+780,957 HTTP/1.1 requests with 12,251 mallocs (0.016 per request), and 1,021,955 HTTP/2 requests with
+11,149 (0.011). The warmup's allocations are inside the count and its requests are not, and the host
+was shared and loaded, so repeat runs vary: thirteen 10 s runs in all made 11,100 to 13,200 mallocs for
+130,000 to 1,170,000 requests (0.01 to 0.09 per request), and four 2.5 s runs made 9,600 to 10,600. The
+count is a roughly fixed setup cost, so the per-request ratio falls as throughput rises. To repeat it:
+
+Take the [library example](#as-a-library), set `Warmup: 2 * time.Second`, `Connections: 64`,
+`Workers: 64` and a `URL` served by another process, and wrap the `Run` call:
+
+```go
+var before, after runtime.MemStats
+runtime.ReadMemStats(&before)
+result, err := b.Run(context.Background())
+runtime.ReadMemStats(&after)
+if err != nil {
+	panic(err)
+}
+fmt.Printf("requests=%d mallocs=%d\n", result.Requests, after.Mallocs-before.Mallocs)
+```
+
+For HTTP/2 add `HTTP2: true` and use `Workers: 16`.
 
 ## HTTP/2 flow control
 
@@ -541,7 +580,9 @@ preventing flow-control stalls.
 ### Stream concurrency
 
 A semaphore sized to `min(server MAX_CONCURRENT_STREAMS, configured MaxStreams)` gates in-flight streams;
-stream slots are allocated at 2× that size for wrap-around headroom during bursts.
+stream slots are allocated at 2× that size for wrap-around headroom during bursts. The server's value is
+the one from its initial `SETTINGS`: a lower value it sends later is acknowledged but not applied
+([#99](https://github.com/goceleris/loadgen/issues/99)).
 
 ### Tuning guidance
 
@@ -591,6 +632,54 @@ Even with a custom `Client`, `Config.URL` must be a valid `http`/`https` URL: `C
 it before your client runs, and your client is free to reinterpret the target however it needs.
 WebSocket and SSE are built in; reach for `-mode` / `Config.Mode` rather than a custom client for those.
 
+## Status and stability
+
+loadgen is young: the first commit is from March 2026, the latest release is v1.4.15, and its main
+user is the celeris benchmark cluster. Releases are `vX.Y.Z` tags; no compatibility policy is written
+down beyond that, and the API has had little use outside goceleris.
+
+- **Versioning and comparability.** Releases are `vX.Y.Z` tags with release notes. Every result carries
+  `loadgen_version`, and rated results carry `scheduler_shards`: compare numbers only between runs of
+  the same version, and of the same shard rule for rated runs.
+- **What is checked.** CI runs `go test -race`, `govulncheck` and the celeris integration matrix on
+  `ubuntu-latest`, and the root package's Go benchmarks run on
+  [CodSpeed](https://codspeed.io/goceleris/loadgen) on every push to `main` and on pull requests that
+  change the root package's Go files, `go.mod` or `go.sum`. The CodSpeed report is informational, and
+  two of its benchmarks swing on identical code ([#109](https://github.com/goceleris/loadgen/issues/109)).
+- **What is not covered.** CI runs on Linux only, and release binaries are built for Linux and macOS only (nothing
+  for Windows); the CPU sampler and receive-queue probe work on Linux only. The H1 and H2 clients
+  are written for benchmarking, not for general use: the open
+  [bug issues](https://github.com/goceleris/loadgen/issues?q=is%3Aopen+label%3Abug) include edge cases of
+  H1 response framing ([#93](https://github.com/goceleris/loadgen/issues/93)), H2 GOAWAY, late frames
+  and late SETTINGS handling ([#92](https://github.com/goceleris/loadgen/issues/92),
+  [#98](https://github.com/goceleris/loadgen/issues/98),
+  [#99](https://github.com/goceleris/loadgen/issues/99)), no retry of an idempotent request on a
+  connection the server closed while idle ([#94](https://github.com/goceleris/loadgen/issues/94)) and
+  a dial that cannot be cancelled at the end of a run, which can deflate `requests_per_sec`
+  ([#95](https://github.com/goceleris/loadgen/issues/95)). There is one URL per run (weighted paths are
+  [#22](https://github.com/goceleris/loadgen/issues/22)), no gRPC
+  ([#21](https://github.com/goceleris/loadgen/issues/21)) and no HTML report
+  ([#23](https://github.com/goceleris/loadgen/issues/23)).
+- **Known apparatus issue: rated mode ([#102](https://github.com/goceleris/loadgen/issues/102), open).**
+  A rated run is paced by scheduler goroutines feeding one shared channel, which can cap the rate one
+  process delivers, and its sub-millisecond waits are rounded up to about 1 ms by the Go runtime when the
+  process is otherwise idle. v1.4.15 emits the schedule from several goroutines above 80k req/s
+  (amd64 evidence only, see the release notes); the issue stays open, so read a rated result against
+  its `target_rps` and `requests_per_sec` (probatorium reports the achieved ratio per pass).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, test and pull-request flow.
+
+## Security
+
+Report a vulnerability privately as described in [SECURITY.md](SECURITY.md); please do not open a public
+issue for it.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
+
 ## Related projects
 
 | Project | What it is |
@@ -598,14 +687,3 @@ WebSocket and SSE are built in; reach for `-mode` / `Config.Mode` rather than a 
 | [celeris](https://github.com/goceleris/celeris) | The HTTP engine for Go whose published benchmarks loadgen measures |
 | [probatorium](https://github.com/goceleris/probatorium) | The benchmark and validation harness that drives loadgen on the bench cluster |
 | [docs](https://github.com/goceleris/docs) | The source of [goceleris.dev](https://goceleris.dev): documentation and the benchmark dashboard |
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, test and pull-request flow, and
-[SECURITY.md](SECURITY.md) to report a vulnerability. The root package's Go benchmarks run on
-[CodSpeed](https://codspeed.io/goceleris/loadgen) on every push to `main` and on pull requests that
-change the root package's Go files, `go.mod` or `go.sum`.
-
-## License
-
-Apache License 2.0; see [LICENSE](LICENSE).
